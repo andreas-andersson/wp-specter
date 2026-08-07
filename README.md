@@ -11,14 +11,10 @@ Static analysis tool for WordPress projects. Finds unused functions, unmatched h
 
 wp-specter is published on [Packagist](https://packagist.org/packages/andreas-andersson/wp-specter).
 
-> No tagged release yet — only `dev-master` is available, so the version constraint below is
-> required for now. Plain `composer require --dev andreas-andersson/wp-specter` (no constraint)
-> will fail with a minimum-stability error until a first version tag is pushed.
-
 ### As a project dev-dependency
 
 ```bash
-composer require --dev andreas-andersson/wp-specter:dev-master
+composer require --dev andreas-andersson/wp-specter
 ```
 
 Run it via `vendor/bin/wp-specter scan ...`.
@@ -26,7 +22,7 @@ Run it via `vendor/bin/wp-specter scan ...`.
 ### Globally (one `wp-specter` command everywhere)
 
 ```bash
-composer global require andreas-andersson/wp-specter:dev-master
+composer global require andreas-andersson/wp-specter
 ```
 
 Make sure Composer's global bin dir is on your `PATH` (`composer global config bin-dir --absolute` prints it — usually `~/.config/composer/vendor/bin` or `~/.composer/vendor/bin`).
