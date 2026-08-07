@@ -106,13 +106,18 @@ add_action("init", [$this, "my_handler"]);
         self::assertEmpty($this->analyzer->analyze([$file]));
     }
 
-    public function testClassScopeArrayCallbackCountsAsCall(): void
+    public function testClassConstArrayCallbackDoesNotCountAsStandaloneFunctionCall(): void
     {
+        // [MyClass::class, 'my_static'] always calls MyClass's static method, never a global
+        // function of the same name — so it must NOT suppress this standalone function's
+        // unused-function finding.
         $file = $this->write('<?php
 function my_static() {}
 add_action("init", [MyClass::class, "my_static"]);
 ');
-        self::assertEmpty($this->analyzer->analyze([$file]));
+        $findings = $this->analyzer->analyze([$file]);
+        self::assertCount(1, $findings);
+        self::assertSame('my_static', $findings[0]->name);
     }
 
     public function testClassMethodAfterStringInterpolationNotReported(): void

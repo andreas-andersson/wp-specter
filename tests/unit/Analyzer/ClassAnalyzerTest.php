@@ -236,6 +236,41 @@ My_Class::helper();
         self::assertEmpty(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod));
     }
 
+    public function testArrayCallbackScopingDoesNotLeakBetweenUnrelatedClasses(): void
+    {
+        // Both classes have a same-named "on_init" hook callback method. Only Used_Hooks's is
+        // actually wired up via [Used_Hooks::class, 'on_init'] — before array-callback scoping,
+        // the bare-name "on_init" call would have suppressed both findings.
+        $file = $this->write('<?php
+class Used_Hooks {
+    public function on_init() {}
+}
+class Dead_Hooks {
+    public function on_init() {}
+}
+add_action("init", [Used_Hooks::class, "on_init"]);
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertContains('on_init', $unusedMethods);
+        self::assertCount(1, $unusedMethods, 'Only Dead_Hooks::on_init should be flagged, not Used_Hooks::on_init');
+    }
+
+    public function testDoesNotReportMethodCalledViaThisArrayCallback(): void
+    {
+        $file = $this->write('<?php
+class My_Plugin {
+    public function boot() {
+        add_action("init", [$this, "on_init"]);
+    }
+    public function on_init() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('on_init', $unusedMethods);
+    }
+
     public function testExcludesWpWidgetContractMethods(): void
     {
         // WP core calls widget()/form()/update() by reflection on any WP_Widget subclass —

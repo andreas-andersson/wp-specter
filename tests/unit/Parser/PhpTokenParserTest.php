@@ -362,13 +362,40 @@ add_action("init", [$this, "my_method"]);
         self::assertContains('my_method', $names);
     }
 
-    public function testArrayCallbackClassMethodIsRecordedAsFunctionCall(): void
+    public function testArrayCallbackWithClassConstReceiverIsScopedNotGeneric(): void
     {
+        // [MyClass::class, 'method'] always refers to MyClass's static method in real PHP
+        // semantics — never a global function of the same name — so it resolves to a scoped
+        // call, not the generic bare-name pool.
         $result = $this->parse('<?php
 add_action("init", [MyClass::class, "static_method"]);
 ');
+        $calls = array_map(fn($c) => $c->receiverClass . '::' . $c->method, $result->scopedMethodCalls);
+        self::assertContains('MyClass::static_method', $calls);
+
         $names = array_column($result->functionCalls, 'name');
-        self::assertContains('static_method', $names);
+        self::assertNotContains('static_method', $names);
+    }
+
+    public function testArrayCallbackWithLiteralStringReceiverIsScopedNotGeneric(): void
+    {
+        $result = $this->parse('<?php
+add_action("init", ["MyClass", "static_method"]);
+');
+        $calls = array_map(fn($c) => $c->receiverClass . '::' . $c->method, $result->scopedMethodCalls);
+        self::assertContains('MyClass::static_method', $calls);
+    }
+
+    public function testArrayCallbackWithUnresolvableVariableReceiverStaysGeneric(): void
+    {
+        // $obj isn't $this, so its type can't be resolved — must fall back to the generic pool,
+        // same as before this scoping existed.
+        $result = $this->parse('<?php
+add_action("init", [$obj, "handler_method"]);
+');
+        self::assertEmpty($result->scopedMethodCalls);
+        $names = array_column($result->functionCalls, 'name');
+        self::assertContains('handler_method', $names);
     }
 
     public function testGetHeaderWithNameBuildsCorrectPath(): void

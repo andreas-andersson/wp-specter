@@ -271,7 +271,18 @@ final class PhpTokenParser
             if ($type === T_CONSTANT_ENCAPSED_STRING) {
                 $stringVal = $this->stripQuotes($value);
                 if ($this->looksLikeCallback($stringVal)) {
-                    $functionCalls[] = new FunctionCall($stringVal, $line, $file);
+                    // [$this, 'method'] / [self::class, 'method'] / [Foo::class, 'method'] /
+                    // ['Foo', 'method'] — the common add_action/add_filter array-callback shape
+                    // — has a resolvable receiver often enough to be worth checking here, same
+                    // as the $this->/self::/parent::/Foo:: call scoping above. Anything else
+                    // (a plain variable receiver, or not an array callback at all) falls back to
+                    // the existing name-only pool.
+                    $receiverClass = $this->arrayCallbackReceiverClass($tokens, $i, $classNameStack, $classParentStack);
+                    if ($receiverClass !== null) {
+                        $scopedMethodCalls[] = new ScopedMethodCall($receiverClass, $stringVal);
+                    } else {
+                        $functionCalls[] = new FunctionCall($stringVal, $line, $file);
+                    }
                 }
                 // Any ".php"-suffixed literal is a plausible file reference — e.g. ACF's
                 // 'render_template' => get_template_directory() . '/blocks/foo.php', page
@@ -742,6 +753,103 @@ final class PhpTokenParser
         }
 
         return [$nameToken[1], $nameIndex];
+    }
+
+    private function peekPrevMeaningfulIndex(array $tokens, int $i): ?int
+    {
+        $j = $i - 1;
+        while ($j >= 0) {
+            if (is_array($tokens[$j]) && $tokens[$j][0] === T_WHITESPACE) {
+                $j--;
+                continue;
+            }
+            return $j;
+        }
+        return null;
+    }
+
+    private function isArrayOpenAt(array $tokens, int $index): bool
+    {
+        if (($tokens[$index] ?? null) === '[') {
+            return true;
+        }
+        if (($tokens[$index] ?? null) === '(') {
+            // Long array syntax: array( ... ) — the '(' must belong to an `array` keyword, not
+            // an ordinary function call.
+            $arrIndex = $this->peekPrevMeaningfulIndex($tokens, $index);
+            return $arrIndex !== null && is_array($tokens[$arrIndex]) && $tokens[$arrIndex][0] === T_ARRAY;
+        }
+        return false;
+    }
+
+    /**
+     * Given the index of a string token that looks like a method/function name, checks whether
+     * it's the second element of an array-callback literal — [receiver, 'method'] or
+     * array(receiver, 'method') — with a receiver wp-specter can resolve to a concrete class:
+     * $this, self::class, parent::class, Foo::class, or a literal 'Foo' string. Returns the
+     * resolved class name, or null if this isn't that shape at all (an arbitrary variable
+     * receiver like [$obj, 'method'], more/fewer than two elements, no array literal here).
+     *
+     * @param list<?string> $classNameStack
+     * @param list<?string> $classParentStack
+     */
+    private function arrayCallbackReceiverClass(array $tokens, int $i, array $classNameStack, array $classParentStack): ?string
+    {
+        $commaIndex = $this->peekPrevMeaningfulIndex($tokens, $i);
+        if ($commaIndex === null || $tokens[$commaIndex] !== ',') {
+            return null;
+        }
+
+        $receiverEndIndex = $this->peekPrevMeaningfulIndex($tokens, $commaIndex);
+        if ($receiverEndIndex === null) {
+            return null;
+        }
+        $receiverEndToken = $tokens[$receiverEndIndex];
+
+        // [$this, 'method']
+        if (is_array($receiverEndToken) && $receiverEndToken[0] === T_VARIABLE && $receiverEndToken[1] === '$this') {
+            $openIndex = $this->peekPrevMeaningfulIndex($tokens, $receiverEndIndex);
+            if ($openIndex === null || !$this->isArrayOpenAt($tokens, $openIndex)) {
+                return null;
+            }
+            return empty($classNameStack) ? null : end($classNameStack);
+        }
+
+        // [Foo::class, 'method'] / [self::class, 'method'] / [parent::class, 'method']
+        // Note: under TOKEN_PARSE (used throughout this parser), the "class" in "Foo::class"
+        // always tokenizes as T_STRING with value "class" — T_CLASS is only the `class`
+        // *keyword* (declarations, `new class {}`), never this magic-constant access.
+        if (is_array($receiverEndToken) && $receiverEndToken[0] === T_STRING && $receiverEndToken[1] === 'class') {
+            $dcIndex = $this->peekPrevMeaningfulIndex($tokens, $receiverEndIndex);
+            if ($dcIndex === null || !is_array($tokens[$dcIndex]) || $tokens[$dcIndex][0] !== T_DOUBLE_COLON) {
+                return null;
+            }
+            $nameIndex = $this->peekPrevMeaningfulIndex($tokens, $dcIndex);
+            if ($nameIndex === null || !is_array($tokens[$nameIndex]) || $tokens[$nameIndex][0] !== T_STRING) {
+                return null;
+            }
+            $openIndex = $this->peekPrevMeaningfulIndex($tokens, $nameIndex);
+            if ($openIndex === null || !$this->isArrayOpenAt($tokens, $openIndex)) {
+                return null;
+            }
+            return match ($tokens[$nameIndex][1]) {
+                'self' => empty($classNameStack) ? null : end($classNameStack),
+                'parent' => empty($classParentStack) ? null : end($classParentStack),
+                default => $tokens[$nameIndex][1],
+            };
+        }
+
+        // ['Foo', 'method']
+        if (is_array($receiverEndToken) && $receiverEndToken[0] === T_CONSTANT_ENCAPSED_STRING) {
+            $openIndex = $this->peekPrevMeaningfulIndex($tokens, $receiverEndIndex);
+            if ($openIndex === null || !$this->isArrayOpenAt($tokens, $openIndex)) {
+                return null;
+            }
+            $literal = $this->stripQuotes($receiverEndToken[1]);
+            return $literal !== '' ? $literal : null;
+        }
+
+        return null;
     }
 
     private function stripQuotes(string $value): string
