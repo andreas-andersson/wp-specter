@@ -7,7 +7,6 @@ namespace WpSpecter\Analyzer;
 use WpSpecter\Finding\Finding;
 use WpSpecter\Finding\FindingCertainty;
 use WpSpecter\Finding\FindingType;
-use WpSpecter\Parser\ParseResult;
 use WpSpecter\Parser\PhpTokenParser;
 
 final class FunctionAnalyzer
@@ -65,10 +64,7 @@ final class FunctionAnalyzer
 
     private function isExcluded(string $name): bool
     {
-        if (str_starts_with($name, '__')) {
-            return true;
-        }
-        foreach (self::WP_PREFIXES as $prefix) {
+        foreach ([...self::MAGIC_PREFIXES, ...self::WP_PREFIXES] as $prefix) {
             if (str_starts_with($name, $prefix)) {
                 return true;
             }

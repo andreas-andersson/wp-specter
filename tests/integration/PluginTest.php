@@ -24,6 +24,7 @@ final class PluginTest extends TestCase
         ob_start();
         $exit = $this->app->run(['wp-specter', 'scan', $this->fixture, '--no-color', '--target=plugin']);
         $output = ob_get_clean();
+        self::assertIsString($output);
 
         self::assertSame(1, $exit);
         self::assertStringContainsString('stdwp_plugin_orphan', $output);
@@ -34,6 +35,7 @@ final class PluginTest extends TestCase
         ob_start();
         $this->app->run(['wp-specter', 'scan', $this->fixture, '--no-color', '--target=plugin', '--type=functions']);
         $output = ob_get_clean();
+        self::assertIsString($output);
 
         self::assertStringNotContainsString('stdwp_plugin_used_func', $output);
     }
@@ -43,6 +45,7 @@ final class PluginTest extends TestCase
         ob_start();
         $this->app->run(['wp-specter', 'scan', $this->fixture, '--no-color', '--target=plugin']);
         $output = ob_get_clean();
+        self::assertIsString($output);
 
         self::assertStringNotContainsString('Unused Templates', $output);
     }
@@ -52,6 +55,7 @@ final class PluginTest extends TestCase
         ob_start();
         $this->app->run(['wp-specter', 'scan', $this->fixture, '--no-color']);
         $output = ob_get_clean();
+        self::assertIsString($output);
 
         self::assertStringContainsString('Plugin', $output);
     }
@@ -61,6 +65,7 @@ final class PluginTest extends TestCase
         ob_start();
         $this->app->run(['wp-specter', 'scan', $this->fixture, '--no-color', '--target=plugin']);
         $output = ob_get_clean();
+        self::assertIsString($output);
 
         self::assertStringNotContainsString('Layout', $output);
     }

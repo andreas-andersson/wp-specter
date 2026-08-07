@@ -87,7 +87,7 @@ final class ComposerProjectDetector
         return $targets;
     }
 
-    /** @param list<mixed> $rules */
+    /** @param array<mixed> $rules */
     private function isWpInstallerRule(array $rules): bool
     {
         foreach ($rules as $rule) {

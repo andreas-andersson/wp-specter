@@ -4,6 +4,11 @@ declare(strict_types=1);
 
 namespace WpSpecter\Parser;
 
+/**
+ * @phpstan-type Token array{0: int, 1: string, 2: int}|string
+ *   token_get_all()'s element shape: either a single-character token (a plain string) or
+ *   [token type, token text, line number] for everything else.
+ */
 final class PhpTokenParser
 {
     private const HOOK_REGISTER_FUNCS = ['add_action', 'add_filter'];
@@ -60,6 +65,15 @@ final class PhpTokenParser
         // interpolation but is NOT a code-level brace. Track depth so we skip those.
         $interpolationDepth = 0;
 
+        // Local variable type tracking: $var = new ClassName(...) is remembered for the rest of
+        // that function/method's body, so $var->method() can be scoped the same way $this->
+        // already is. $varTypesStack runs in lockstep with function-body brace depth (a fresh,
+        // empty scope per function/closure — PHP variables don't leak into nested closures
+        // without an explicit `use()`, and this parser doesn't attempt to track those either).
+        $expectingFunctionOpen = false;
+        $functionDepthStack = [];
+        $varTypesStack = [[]];
+
         for ($i = 0; $i < $count; $i++) {
             $token = $tokens[$i];
 
@@ -74,6 +88,11 @@ final class PhpTokenParser
                         $pendingClassName = null;
                         $pendingClassParent = null;
                     }
+                    if ($expectingFunctionOpen) {
+                        $functionDepthStack[] = $braceDepth;
+                        $varTypesStack[] = [];
+                        $expectingFunctionOpen = false;
+                    }
                 } elseif ($token === '}') {
                     if ($interpolationDepth > 0) {
                         $interpolationDepth--;
@@ -83,10 +102,19 @@ final class PhpTokenParser
                             array_pop($classNameStack);
                             array_pop($classParentStack);
                         }
+                        if (!empty($functionDepthStack) && end($functionDepthStack) === $braceDepth) {
+                            array_pop($functionDepthStack);
+                            array_pop($varTypesStack);
+                        }
                         $braceDepth--;
                     }
                 } elseif ($token === '&' && $skipNextString) {
                     // & in "function &foo()" — skip following function name too
+                } elseif ($token === ';') {
+                    // Abstract/interface method declarations end in `;`, never open a body —
+                    // clear a pending function-scope push so it doesn't wrongly latch onto
+                    // whatever brace comes next (e.g. a sibling method's own body).
+                    $expectingFunctionOpen = false;
                 }
                 continue;
             }
@@ -115,7 +143,7 @@ final class PhpTokenParser
                 // a brace context; only declarations get a ClassDef.
                 if ($this->nextMeaningfulIsIdentifier($tokens, $i)) {
                     $expectingClassOpen = true;
-                    $def = $this->parseClassDef($tokens, $i, $line, $file);
+                    $def = $this->parseClassDef($tokens, $i, $file);
                     if ($def !== null) {
                         $classDefs[] = $def;
                         $pendingClassName = $def->name;
@@ -150,27 +178,59 @@ final class PhpTokenParser
             if ($type === T_FUNCTION) {
                 $insideClass = !empty($classDepthStack);
                 $ownerClass = empty($classNameStack) ? null : end($classNameStack);
-                $def = $this->parseFunctionDef($tokens, $i, $line, $file, $insideClass, $ownerClass);
+                $def = $this->parseFunctionDef($tokens, $i, $file, $insideClass, $ownerClass);
                 if ($def !== null) {
                     $functionDefs[] = $def;
                 }
                 $skipNextString = true;
+                // Every function/method/closure opens its own variable scope — including
+                // anonymous ones ($def === null for those), which need this exactly as much.
+                $expectingFunctionOpen = true;
                 continue;
             }
 
-            // $this->method() — the one case where an object's exact class is always known
-            // without any type inference: it's whichever class this code is physically inside.
-            if ($type === T_VARIABLE && $value === '$this') {
-                $target = $this->findScopedCallTarget($tokens, $i);
-                if ($target !== null) {
-                    $receiverClass = empty($classNameStack) ? null : end($classNameStack);
-                    if ($receiverClass !== null) {
-                        [$methodName, $methodNameIndex] = $target;
-                        $scopedMethodCalls[] = new ScopedMethodCall($receiverClass, $methodName);
-                        $i = $methodNameIndex;
+            if ($type === T_VARIABLE) {
+                $scopeTop = count($varTypesStack) - 1;
+
+                if ($value === '$this') {
+                    // The one case where an object's exact class is always known without any
+                    // type inference: it's whichever class this code is physically inside.
+                    $target = $this->findScopedCallTarget($tokens, $i);
+                    if ($target !== null) {
+                        $receiverClass = empty($classNameStack) ? null : end($classNameStack);
+                        if ($receiverClass !== null) {
+                            [$methodName, $methodNameIndex] = $target;
+                            $scopedMethodCalls[] = new ScopedMethodCall($receiverClass, $methodName);
+                            $i = $methodNameIndex;
+                        }
+                    }
+                } elseif (($equalsIndex = $this->peekNextMeaningfulIndex($tokens, $i)) !== null && $tokens[$equalsIndex] === '=') {
+                    // $var = new ClassName(...) — remember it for the rest of this scope. Any
+                    // other RHS invalidates a previous tracked type rather than leaving it
+                    // stale (e.g. $var = new Foo(); ... $var = some_call(); — $var's type is no
+                    // longer known, so a later $var->method() must fall back to unscoped).
+                    // No control-flow awareness: `if ($c) { $x = new A(); } else { $x = new B(); }`
+                    // just tracks whichever assignment comes last in source order, not "could be
+                    // either" — an approximation, same spirit as the rest of this parser, and
+                    // still strictly more precise than the unscoped fallback it replaces.
+                    $newClass = $this->assignedNewClassName($tokens, $equalsIndex, $classNameStack, $classParentStack);
+                    if ($newClass !== null) {
+                        $varTypesStack[$scopeTop][$value] = $newClass;
+                    } else {
+                        unset($varTypesStack[$scopeTop][$value]);
+                    }
+                } else {
+                    $trackedClass = $varTypesStack[$scopeTop][$value] ?? null;
+                    if ($trackedClass !== null) {
+                        $target = $this->findScopedCallTarget($tokens, $i);
+                        if ($target !== null) {
+                            [$methodName, $methodNameIndex] = $target;
+                            $scopedMethodCalls[] = new ScopedMethodCall($trackedClass, $methodName);
+                            $i = $methodNameIndex;
+                        }
                     }
                 }
-                // No `continue` — $this is used in plenty of other ways (property access,
+                // No `continue` — variables are used in plenty of other ways (property access,
                 // passed as an argument, ...) that need no special handling here.
             }
 
@@ -209,11 +269,7 @@ final class PhpTokenParser
                     // Foo::class, Foo::$prop — findScopedCallTarget only matches an actual call).
                     $target = $this->findScopedCallTarget($tokens, $i);
                     if ($target !== null) {
-                        $receiverClass = match ($name) {
-                            'self' => empty($classNameStack) ? null : end($classNameStack),
-                            'parent' => empty($classParentStack) ? null : end($classParentStack),
-                            default => $name,
-                        };
+                        $receiverClass = $this->resolveClassNameToken($name, $classNameStack, $classParentStack);
                         if ($receiverClass !== null) {
                             [$methodName, $methodNameIndex] = $target;
                             $scopedMethodCalls[] = new ScopedMethodCall($receiverClass, $methodName);
@@ -229,34 +285,22 @@ final class PhpTokenParser
                 }
 
                 if (in_array($name, self::HOOK_REGISTER_FUNCS, true)) {
-                    $reg = $this->parseHookRegistration($tokens, $i, $line, $file, $name);
-                    if ($reg !== null) {
-                        $hookRegistrations[] = $reg;
-                    }
+                    $hookRegistrations[] = $this->parseHookRegistration($tokens, $i, $line, $file, $name);
                     continue;
                 }
 
                 if (in_array($name, self::HOOK_INVOKE_FUNCS, true)) {
-                    $inv = $this->parseHookInvocation($tokens, $i, $line, $file, $name);
-                    if ($inv !== null) {
-                        $hookInvocations[] = $inv;
-                    }
+                    $hookInvocations[] = $this->parseHookInvocation($tokens, $i, $line, $file, $name);
                     continue;
                 }
 
                 if (array_key_exists($name, self::CRON_SCHEDULE_FUNCS)) {
-                    $inv = $this->parseCronScheduleHook($tokens, $i, $line, $file, $name);
-                    if ($inv !== null) {
-                        $hookInvocations[] = $inv;
-                    }
+                    $hookInvocations[] = $this->parseCronScheduleHook($tokens, $i, $line, $file, $name);
                     continue;
                 }
 
                 if (in_array($name, self::TEMPLATE_FUNCS, true)) {
-                    $ref = $this->parseTemplateRef($tokens, $i, $line, $file, $name);
-                    if ($ref !== null) {
-                        $templateRefs[] = $ref;
-                    }
+                    $templateRefs[] = $this->parseTemplateRef($tokens, $i, $line, $file, $name);
                     continue;
                 }
 
@@ -316,7 +360,8 @@ final class PhpTokenParser
         );
     }
 
-    private function parseFunctionDef(array $tokens, int $i, int $line, string $file, bool $isMethod = false, ?string $ownerClass = null): ?FunctionDef
+    /** @param list<Token> $tokens */
+    private function parseFunctionDef(array $tokens, int $i, string $file, bool $isMethod = false, ?string $ownerClass = null): ?FunctionDef
     {
         // function [whitespace] <name> (
         $j = $i + 1;
@@ -348,10 +393,11 @@ final class PhpTokenParser
             return null;
         }
 
-        return new FunctionDef($next[1], $next[2] ?? $line, $file, $isMethod, $ownerClass);
+        return new FunctionDef($next[1], $next[2], $file, $isMethod, $ownerClass);
     }
 
-    private function parseHookRegistration(array $tokens, int $i, string|int $line, string $file, string $funcName): ?HookRegistration
+    /** @param list<Token> $tokens */
+    private function parseHookRegistration(array $tokens, int $i, string|int $line, string $file, string $funcName): HookRegistration
     {
         // add_action( 'tag', callback )
         $arg = $this->extractStringArgAt($tokens, $i, 0);
@@ -362,7 +408,8 @@ final class PhpTokenParser
         return new HookRegistration($tag, $funcName, (int) $line, $file, $isDynamic);
     }
 
-    private function parseHookInvocation(array $tokens, int $i, string|int $line, string $file, string $funcName): ?HookInvocation
+    /** @param list<Token> $tokens */
+    private function parseHookInvocation(array $tokens, int $i, string|int $line, string $file, string $funcName): HookInvocation
     {
         $arg = $this->extractStringArgAt($tokens, $i, 0);
         if ($arg === null) {
@@ -372,7 +419,8 @@ final class PhpTokenParser
         return new HookInvocation($tag, $funcName, (int) $line, $file, $isDynamic, $prefix);
     }
 
-    private function parseCronScheduleHook(array $tokens, int $i, string|int $line, string $file, string $funcName): ?HookInvocation
+    /** @param list<Token> $tokens */
+    private function parseCronScheduleHook(array $tokens, int $i, string|int $line, string $file, string $funcName): HookInvocation
     {
         $argIndex = self::CRON_SCHEDULE_FUNCS[$funcName];
         $arg = $this->extractStringArgAt($tokens, $i, $argIndex);
@@ -383,7 +431,8 @@ final class PhpTokenParser
         return new HookInvocation($tag, $funcName, (int) $line, $file, $isDynamic, $prefix);
     }
 
-    private function parseTemplateRef(array $tokens, int $i, string|int $line, string $file, string $funcName): ?TemplateRef
+    /** @param list<Token> $tokens */
+    private function parseTemplateRef(array $tokens, int $i, string|int $line, string $file, string $funcName): TemplateRef
     {
         // Unlike hook tags, a template ref keeps a usable value even when the arg is a dynamic
         // interpolated string — e.g. get_template_part("variants/$variant") still tells us
@@ -407,6 +456,7 @@ final class PhpTokenParser
         return new TemplateRef($path, $funcName, (int) $line, $file);
     }
 
+    /** @param list<Token> $tokens */
     private function parseIncludeRef(array $tokens, int $i, string|int $line, string $file, string $keyword): ?TemplateRef
     {
         // include 'path/to/file.php';
@@ -430,7 +480,7 @@ final class PhpTokenParser
                 } elseif ($depth === 0 && ($t === ';' || $t === ',')) {
                     break;
                 }
-            } elseif (is_array($t) && $t[0] === T_CONSTANT_ENCAPSED_STRING) {
+            } elseif ($t[0] === T_CONSTANT_ENCAPSED_STRING) {
                 $lastString = $this->stripQuotes($t[1]);
             }
 
@@ -450,6 +500,7 @@ final class PhpTokenParser
      * many arguments.
      *
      * @return array{string, bool, string}|null  [exact tag or '', isDynamic, literal prefix]
+     * @param list<Token> $tokens
      */
     private function extractStringArgAt(array $tokens, int $i, int $argIndex): ?array
     {
@@ -542,6 +593,7 @@ final class PhpTokenParser
         return ['', true, ''];
     }
 
+    /** @param list<Token> $tokens */
     private function nextMeaningfulIsIdentifier(array $tokens, int $i): bool
     {
         $j = $i + 1;
@@ -551,7 +603,8 @@ final class PhpTokenParser
         return isset($tokens[$j]) && is_array($tokens[$j]) && $tokens[$j][0] === T_STRING;
     }
 
-    private function parseClassDef(array $tokens, int $i, int $line, string $file): ?ClassDef
+    /** @param list<Token> $tokens */
+    private function parseClassDef(array $tokens, int $i, string $file): ?ClassDef
     {
         $j = $i + 1;
         while (isset($tokens[$j]) && is_array($tokens[$j]) && $tokens[$j][0] === T_WHITESPACE) {
@@ -565,7 +618,7 @@ final class PhpTokenParser
 
         [$extends, $implements] = $this->findClassHierarchy($tokens, $j);
 
-        return new ClassDef($next[1], $next[2] ?? $line, $file, $extends, $implements);
+        return new ClassDef($next[1], $next[2], $file, $extends, $implements);
     }
 
     /**
@@ -577,6 +630,7 @@ final class PhpTokenParser
      * these same tokens afterwards, same as parseFunctionDef's lookahead does for T_STRING.
      *
      * @return array{list<string>, list<string>}
+     * @param list<Token> $tokens
      */
     private function findClassHierarchy(array $tokens, int $nameIndex): array
     {
@@ -612,6 +666,7 @@ final class PhpTokenParser
         return [$extends, $implements];
     }
 
+    /** @param list<Token> $tokens */
     private function isPrecededByNew(array $tokens, int $i): bool
     {
         $j = $i - 1;
@@ -625,6 +680,7 @@ final class PhpTokenParser
      * Reads the class name following `new` or `instanceof`. Skips non-name cases such as
      * `new class {}` (anonymous — next token is T_CLASS) and `new static()` (T_STATIC, a
      * late-static-binding placeholder, not a literal class name).
+     * @param list<Token> $tokens
      */
     private function captureClassNameAfter(array $tokens, int $i): ?string
     {
@@ -647,6 +703,7 @@ final class PhpTokenParser
      * end of an interface-only declaration, or a following `implements` clause.
      *
      * @return list<string>
+     * @param list<Token> $tokens
      */
     private function captureClassNameList(array $tokens, int $i): array
     {
@@ -689,6 +746,7 @@ final class PhpTokenParser
         return $pos === false ? $name : substr($name, $pos + 1);
     }
 
+    /** @param list<Token> $tokens */
     private function peekNextMeaningful(array $tokens, int $i): string
     {
         $j = $i + 1;
@@ -698,11 +756,12 @@ final class PhpTokenParser
                 $j++;
                 continue;
             }
-            return is_string($t) ? $t : ($t[1] ?? '');
+            return is_string($t) ? $t : $t[1];
         }
         return '';
     }
 
+    /** @param list<Token> $tokens */
     private function peekNextMeaningfulIndex(array $tokens, int $i): ?int
     {
         $j = $i + 1;
@@ -725,6 +784,7 @@ final class PhpTokenParser
      * by `::`, so it must not be mistaken for `static::foo(`.
      *
      * @return array{string, int}|null  [method name, its token index] or null if this isn't a call.
+     * @param list<Token> $tokens
      */
     private function findScopedCallTarget(array $tokens, int $receiverIndex): ?array
     {
@@ -733,7 +793,7 @@ final class PhpTokenParser
             return null;
         }
         $sepToken = $tokens[$sepIndex];
-        $sepValue = is_string($sepToken) ? $sepToken : ($sepToken[1] ?? '');
+        $sepValue = is_string($sepToken) ? $sepToken : $sepToken[1];
         if ($sepValue !== '::' && $sepValue !== '->') {
             return null;
         }
@@ -755,6 +815,58 @@ final class PhpTokenParser
         return [$nameToken[1], $nameIndex];
     }
 
+    /**
+     * Resolves a receiver identifier's raw text ("self", "parent", or a literal class name) to
+     * the class it actually refers to. "self" and "parent" depend on where this code physically
+     * is; anything else is already a concrete name (namespace-qualified names get shortened).
+     *
+     * @param list<?string> $classNameStack
+     * @param list<?string> $classParentStack
+     */
+    private function resolveClassNameToken(string $name, array $classNameStack, array $classParentStack): ?string
+    {
+        return match ($name) {
+            'self' => empty($classNameStack) ? null : end($classNameStack),
+            'parent' => empty($classParentStack) ? null : end($classParentStack),
+            default => $this->shortClassName($name),
+        };
+    }
+
+    /**
+     * Given the index of an assignment's `=` token, checks whether the right-hand side is
+     * `new ClassName(...)` (or `new self()`/`new parent()`/`new static()`) and resolves it to a
+     * concrete class name. Returns null for anything else — `new class {}` (anonymous),
+     * `new $dynamicClass()`, or a non-`new` expression entirely.
+     *
+     * @param list<?string> $classNameStack
+     * @param list<?string> $classParentStack
+     * @param list<Token> $tokens
+     */
+    private function assignedNewClassName(array $tokens, int $equalsIndex, array $classNameStack, array $classParentStack): ?string
+    {
+        $newIndex = $this->peekNextMeaningfulIndex($tokens, $equalsIndex);
+        if ($newIndex === null || !is_array($tokens[$newIndex]) || $tokens[$newIndex][0] !== T_NEW) {
+            return null;
+        }
+
+        $nameIndex = $this->peekNextMeaningfulIndex($tokens, $newIndex);
+        if ($nameIndex === null) {
+            return null;
+        }
+        $nameToken = $tokens[$nameIndex];
+
+        if (is_array($nameToken) && $nameToken[0] === T_STATIC) {
+            return empty($classNameStack) ? null : end($classNameStack);
+        }
+
+        if (!is_array($nameToken) || !in_array($nameToken[0], self::CLASS_NAME_TOKENS, true)) {
+            return null;
+        }
+
+        return $this->resolveClassNameToken($nameToken[1], $classNameStack, $classParentStack);
+    }
+
+    /** @param list<Token> $tokens */
     private function peekPrevMeaningfulIndex(array $tokens, int $i): ?int
     {
         $j = $i - 1;
@@ -768,6 +880,7 @@ final class PhpTokenParser
         return null;
     }
 
+    /** @param list<Token> $tokens */
     private function isArrayOpenAt(array $tokens, int $index): bool
     {
         if (($tokens[$index] ?? null) === '[') {
@@ -792,6 +905,7 @@ final class PhpTokenParser
      *
      * @param list<?string> $classNameStack
      * @param list<?string> $classParentStack
+     * @param list<Token> $tokens
      */
     private function arrayCallbackReceiverClass(array $tokens, int $i, array $classNameStack, array $classParentStack): ?string
     {
@@ -832,11 +946,7 @@ final class PhpTokenParser
             if ($openIndex === null || !$this->isArrayOpenAt($tokens, $openIndex)) {
                 return null;
             }
-            return match ($tokens[$nameIndex][1]) {
-                'self' => empty($classNameStack) ? null : end($classNameStack),
-                'parent' => empty($classParentStack) ? null : end($classParentStack),
-                default => $tokens[$nameIndex][1],
-            };
+            return $this->resolveClassNameToken($tokens[$nameIndex][1], $classNameStack, $classParentStack);
         }
 
         // ['Foo', 'method']

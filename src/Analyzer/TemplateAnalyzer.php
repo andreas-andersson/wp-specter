@@ -170,7 +170,8 @@ final class TemplateAnalyzer
                 continue;
             }
 
-            $json = json_decode(file_get_contents($file->getPathname()), true);
+            $raw = file_get_contents($file->getPathname());
+            $json = $raw !== false ? json_decode($raw, true) : null;
             if (!is_array($json)) {
                 continue;
             }

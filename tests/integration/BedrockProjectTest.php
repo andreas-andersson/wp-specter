@@ -23,6 +23,7 @@ final class BedrockProjectTest extends TestCase
         ob_start();
         $exit = $this->app->run(['wp-specter', 'scan', $this->fixture, '--no-color']);
         $output = ob_get_clean();
+        self::assertIsString($output);
 
         self::assertSame(1, $exit);
         self::assertStringContainsString('composer-managed', $output);
@@ -36,6 +37,7 @@ final class BedrockProjectTest extends TestCase
         ob_start();
         $this->app->run(['wp-specter', 'scan', $this->fixture, '--no-color']);
         $output = ob_get_clean();
+        self::assertIsString($output);
 
         self::assertStringContainsString('bedrock_orphaned_func', $output);       // theme
         self::assertStringContainsString('bedrock_plugin_orphan', $output);       // plugin
@@ -50,6 +52,7 @@ final class BedrockProjectTest extends TestCase
         $output = null;
         $this->app->run(['wp-specter', 'scan', $this->fixture, '--no-color']);
         $output = ob_get_clean();
+        self::assertIsString($output);
 
         // vendor-theme is declared in vendor/composer/installed.json as composer-installed —
         // its content must never be scanned or listed as a discovered target.
@@ -65,6 +68,7 @@ final class BedrockProjectTest extends TestCase
         ob_start();
         $exit = $this->app->run(['wp-specter', 'scan', $this->fixture, '--no-color', '--type=hooks']);
         $output = ob_get_clean();
+        self::assertIsString($output);
 
         self::assertSame(1, $exit); // only bedrock_unused_hook, which is genuinely unfired
         self::assertStringContainsString('bedrock_unused_hook', $output);
@@ -78,6 +82,7 @@ final class BedrockProjectTest extends TestCase
             'wp-specter', 'scan', $this->fixture . '/web/app/themes/test-theme', '--no-color',
         ]);
         $output = ob_get_clean();
+        self::assertIsString($output);
 
         self::assertSame(1, $exit);
         self::assertStringNotContainsString('composer-managed', $output); // single-target header, not project header

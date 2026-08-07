@@ -10,14 +10,15 @@ use WpSpecter\Analyzer\FunctionAnalyzer;
 use WpSpecter\Analyzer\HookAnalyzer;
 use WpSpecter\Analyzer\TemplateAnalyzer;
 use WpSpecter\Composer\ComposerProjectDetector;
-use WpSpecter\ProjectConfig\ProjectConfigLoader;
-use WpSpecter\Scan\ScanTarget;
 use WpSpecter\Detector\WpModeDetector;
 use WpSpecter\Enum\WpMode;
 use WpSpecter\Parser\PhpTokenParser;
-use WpSpecter\Stubs\StubRegistry;
+use WpSpecter\ProjectConfig\ProjectConfigLoader;
 use WpSpecter\Reporter\TerminalReporter;
+use WpSpecter\Scan\ProjectInfo;
+use WpSpecter\Scan\ScanTarget;
 use WpSpecter\Scanner\FileScanner;
+use WpSpecter\Stubs\StubRegistry;
 
 class Application
 {
@@ -90,7 +91,7 @@ class Application
     {
         try {
             $config = $this->parseArgs($args);
-        } catch (\InvalidArgumentException $e) {
+        } catch (\InvalidArgumentException | \RuntimeException $e) {
             return $this->error($e->getMessage());
         }
 
@@ -108,7 +109,7 @@ class Application
         // Stubs load additively: the project convention file (or the config's override of it),
         // then whatever --stubs= adds on top. Order doesn't matter — loadFile only ever adds
         // suppressions, never removes any.
-        $autoStubsPath = $projectConfig?->stubsPath ?? $configLoader->findDefaultStubsFile($config->path);
+        $autoStubsPath = $projectConfig->stubsPath ?? $configLoader->findDefaultStubsFile($config->path);
         if ($autoStubsPath !== null) {
             try {
                 StubRegistry::loadFile($autoStubsPath);
@@ -131,9 +132,7 @@ class Application
         // (hundreds of vendored files) can true-positive on someone else's block.json and
         // misclassify the entire tree as one giant "theme". Composer detection sidesteps that:
         // it only trusts what composer.json + vendor/composer/installed.json actually say.
-        $projectRoot = null;
-        $projectSourceLabel = null;
-        $projectTargetsNote = null;
+        $projectInfo = null;
         $targets = null;
 
         if ($config->target === null) {
@@ -153,9 +152,11 @@ class Application
                     $targets = [$matched];
                 } else {
                     $targets = $configuredTargets;
-                    $projectRoot = $projectConfig->configDir;
-                    $projectSourceLabel = 'configured via ' . ProjectConfigLoader::CONFIG_FILENAME;
-                    $projectTargetsNote = 'theme/plugin dir(s) from config';
+                    $projectInfo = new ProjectInfo(
+                        $projectConfig->configDir,
+                        'configured via ' . ProjectConfigLoader::CONFIG_FILENAME,
+                        'theme/plugin dir(s) from config',
+                    );
                 }
             }
 
@@ -172,9 +173,11 @@ class Application
                         $targets = [$matched];
                     } elseif (!empty($discovered)) {
                         $targets = $discovered;
-                        $projectRoot = $root;
-                        $projectSourceLabel = 'composer-managed';
-                        $projectTargetsNote = 'custom theme/plugin dir(s), vendor packages excluded';
+                        $projectInfo = new ProjectInfo(
+                            $root,
+                            'composer-managed',
+                            'custom theme/plugin dir(s), vendor packages excluded',
+                        );
                     }
                 }
             }
@@ -200,8 +203,8 @@ class Application
         }
 
         $reporter = new TerminalReporter($config->noColor);
-        if ($projectRoot !== null) {
-            $reporter->printProjectHeader($projectRoot, $targets, count($allFiles), $projectSourceLabel, $projectTargetsNote);
+        if ($projectInfo !== null) {
+            $reporter->printProjectHeader($projectInfo->root, $targets, count($allFiles), $projectInfo->sourceLabel, $projectInfo->targetsNote);
         } else {
             $reporter->printHeader($config->path, $targets[0]->mode, count($allFiles));
         }
@@ -275,7 +278,7 @@ class Application
             // project can just run `generate-stubs` with no arguments and get every declared
             // vendor/plugins source scanned in one shot instead of one --stubs invocation per dir.
             try {
-                $projectConfig = (new ProjectConfigLoader())->load(getcwd());
+                $projectConfig = (new ProjectConfigLoader())->load($this->requireCwd());
             } catch (\RuntimeException $e) {
                 return $this->error($e->getMessage());
             }
@@ -291,7 +294,11 @@ class Application
                     $output = $projectConfig->stubsPath ?? ($projectConfig->configDir . '/' . ProjectConfigLoader::STUBS_FILENAME);
                 }
             } else {
-                $sources[] = getcwd();
+                try {
+                    $sources[] = $this->requireCwd();
+                } catch (\RuntimeException $e) {
+                    return $this->error($e->getMessage());
+                }
             }
         }
 
@@ -427,8 +434,10 @@ class Application
             }
         }
 
+        $cwd = $path ?? $this->requireCwd();
+
         return new Config(
-            path: realpath($path ?? getcwd()) ?: ($path ?? getcwd()),
+            path: realpath($cwd) ?: $cwd,
             target: $target,
             types: array_values($types),
             ignoreGlobs: array_values($ignoreGlobs),
@@ -463,6 +472,16 @@ class Application
             }
         }
         return false;
+    }
+
+    /** getcwd() can fail (deleted/inaccessible cwd) — every caller needs a real path, not that edge case. */
+    private function requireCwd(): string
+    {
+        $cwd = getcwd();
+        if ($cwd === false) {
+            throw new \RuntimeException('Cannot determine current working directory.');
+        }
+        return $cwd;
     }
 
     private function error(string $message): int

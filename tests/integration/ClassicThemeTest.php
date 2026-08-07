@@ -23,6 +23,7 @@ final class ClassicThemeTest extends TestCase
         ob_start();
         $exit = $this->app->run(['wp-specter', 'scan', $this->fixture, '--no-color']);
         $output = ob_get_clean();
+        self::assertIsString($output);
 
         self::assertSame(1, $exit);
         self::assertStringContainsString('classic_orphaned_helper', $output);
@@ -35,6 +36,7 @@ final class ClassicThemeTest extends TestCase
         ob_start();
         $exit = $this->app->run(['wp-specter', 'scan', $this->fixture, '--no-color', '--type=functions']);
         $output = ob_get_clean();
+        self::assertIsString($output);
 
         self::assertSame(1, $exit);
         self::assertStringContainsString('classic_orphaned_helper', $output);
@@ -47,6 +49,7 @@ final class ClassicThemeTest extends TestCase
         ob_start();
         $exit = $this->app->run(['wp-specter', 'scan', $this->fixture, '--no-color', '--type=hooks']);
         $output = ob_get_clean();
+        self::assertIsString($output);
 
         self::assertSame(1, $exit);
         self::assertStringContainsString('classic_unused_hook', $output);
@@ -59,6 +62,7 @@ final class ClassicThemeTest extends TestCase
         ob_start();
         $exit = $this->app->run(['wp-specter', 'scan', $this->fixture, '--no-color', '--type=templates']);
         $output = ob_get_clean();
+        self::assertIsString($output);
 
         self::assertSame(1, $exit);
         self::assertStringContainsString('template-parts/orphaned-card', $output);
@@ -71,6 +75,7 @@ final class ClassicThemeTest extends TestCase
         ob_start();
         $this->app->run(['wp-specter', 'scan', $this->fixture, '--no-color']);
         $output = ob_get_clean();
+        self::assertIsString($output);
 
         self::assertStringNotContainsString("\e[", $output);
     }
@@ -80,6 +85,7 @@ final class ClassicThemeTest extends TestCase
         ob_start();
         $this->app->run(['wp-specter', 'scan', $this->fixture]);
         $output = ob_get_clean();
+        self::assertIsString($output);
 
         self::assertStringContainsString("\e[", $output);
     }
@@ -89,6 +95,7 @@ final class ClassicThemeTest extends TestCase
         ob_start();
         $this->app->run(['wp-specter', 'scan', $this->fixture, '--no-color', '--type=functions']);
         $output = ob_get_clean();
+        self::assertIsString($output);
 
         self::assertStringNotContainsString('classic_theme_setup', $output);
         self::assertStringNotContainsString('classic_enqueue_scripts', $output);
@@ -99,6 +106,7 @@ final class ClassicThemeTest extends TestCase
         ob_start();
         $this->app->run(['wp-specter', 'scan', $this->fixture, '--no-color', '--type=templates']);
         $output = ob_get_clean();
+        self::assertIsString($output);
 
         // loop.php and nav.php are referenced via get_template_part in index.php
         self::assertStringNotContainsString('loop', $output);
@@ -110,6 +118,7 @@ final class ClassicThemeTest extends TestCase
         ob_start();
         $this->app->run(['wp-specter', 'scan', $this->fixture, '--no-color']);
         $output = ob_get_clean();
+        self::assertIsString($output);
 
         self::assertStringContainsString('Classic theme', $output);
     }

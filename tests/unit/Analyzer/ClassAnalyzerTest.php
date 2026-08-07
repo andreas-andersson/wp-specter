@@ -181,6 +181,30 @@ $d->boot();
         self::assertCount(1, $unusedMethods, 'Only Dead_Service::render should be flagged, not Used_Service::render');
     }
 
+    public function testLocalVariableScopingDoesNotLeakBetweenUnrelatedClasses(): void
+    {
+        // Both classes have a "render" method. Used_Service's is called through a local
+        // variable known to hold that exact class ($s = new Used_Service()); Dead_Service's
+        // never is — before local-variable type tracking, the bare-name "render" call would
+        // have suppressed both findings.
+        $file = $this->write('<?php
+class Used_Service {
+    public function render() {}
+}
+class Dead_Service {
+    public function render() {}
+}
+function boot() {
+    $s = new Used_Service();
+    $s->render();
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertContains('render', $unusedMethods);
+        self::assertCount(1, $unusedMethods, 'Only Dead_Service::render should be flagged, not Used_Service::render');
+    }
+
     public function testDoesNotReportMethodCalledViaSelf(): void
     {
         // "boot" itself is never called anywhere in this fixture, so it's legitimately
@@ -353,9 +377,13 @@ standalone_func();
 
     private function removeDir(string $dir): void
     {
-        if (!is_dir($dir)) return;
+        if (!is_dir($dir)) {
+            return;
+        }
         foreach (scandir($dir) as $entry) {
-            if ($entry === '.' || $entry === '..') continue;
+            if ($entry === '.' || $entry === '..') {
+                continue;
+            }
             $path = $dir . '/' . $entry;
             is_dir($path) ? $this->removeDir($path) : unlink($path);
         }

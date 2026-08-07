@@ -125,7 +125,9 @@ acf_register_block_type(array(
     {
         $path = $this->tmp . '/' . $relative;
         $dir = dirname($path);
-        if (!is_dir($dir)) mkdir($dir, 0755, true);
+        if (!is_dir($dir)) {
+            mkdir($dir, 0755, true);
+        }
         file_put_contents($path, '<?php');
         return $path;
     }
@@ -134,7 +136,9 @@ acf_register_block_type(array(
     {
         // Keep non-template PHP files in a subdirectory that won't be scanned as templates
         $dir = $this->tmp . '/src';
-        if (!is_dir($dir)) mkdir($dir, 0755, true);
+        if (!is_dir($dir)) {
+            mkdir($dir, 0755, true);
+        }
         $file = $dir . '/test_' . uniqid() . '.php';
         file_put_contents($file, $code);
         return $file;
@@ -142,9 +146,13 @@ acf_register_block_type(array(
 
     private function removeDir(string $dir): void
     {
-        if (!is_dir($dir)) return;
+        if (!is_dir($dir)) {
+            return;
+        }
         foreach (scandir($dir) as $entry) {
-            if ($entry === '.' || $entry === '..') continue;
+            if ($entry === '.' || $entry === '..') {
+                continue;
+            }
             $path = $dir . '/' . $entry;
             is_dir($path) ? $this->removeDir($path) : unlink($path);
         }

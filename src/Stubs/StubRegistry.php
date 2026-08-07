@@ -62,7 +62,9 @@ final class StubRegistry
         if (isset(self::$hookIndex[$hook])) {
             return true;
         }
-        foreach (self::$prefixes as $prefix) {
+        // self::build() above always initializes this to at least [] — PHPStan can't see that
+        // invariant across a static method call, hence the null coalesce.
+        foreach (self::$prefixes ?? [] as $prefix) {
             if (str_starts_with($hook, $prefix)) {
                 return true;
             }

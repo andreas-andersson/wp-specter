@@ -85,7 +85,9 @@ final class WpModeDetectorTest extends TestCase
         self::assertTrue($this->detector->isHierarchyTemplate($basename));
     }
 
-    /** @return array<string, array{string}> */
+    // Note the return type is array<int|string, ...>, not array<string, ...>: PHP coerces the
+    // numeric-looking '404' key to an int at runtime, same as any other numeric string key.
+    /** @return array<int|string, array{string}> */
     public static function exactHierarchyTemplates(): array
     {
         return [
@@ -144,9 +146,13 @@ final class WpModeDetectorTest extends TestCase
 
     private function removeDir(string $dir): void
     {
-        if (!is_dir($dir)) return;
+        if (!is_dir($dir)) {
+            return;
+        }
         foreach (scandir($dir) as $entry) {
-            if ($entry === '.' || $entry === '..') continue;
+            if ($entry === '.' || $entry === '..') {
+                continue;
+            }
             $path = $dir . '/' . $entry;
             is_dir($path) ? $this->removeDir($path) : unlink($path);
         }

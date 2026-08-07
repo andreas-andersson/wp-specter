@@ -123,6 +123,7 @@ final class ComposerProjectDetectorTest extends TestCase
         file_put_contents($dir . '/plugin.php', "<?php\n/*\nPlugin Name: Test\n*/");
     }
 
+    /** @param array<mixed> $data */
     private function writeJson(string $relative, array $data): void
     {
         $path = $this->tmp . '/' . $relative;
@@ -132,9 +133,13 @@ final class ComposerProjectDetectorTest extends TestCase
 
     private function removeDir(string $dir): void
     {
-        if (!is_dir($dir)) return;
+        if (!is_dir($dir)) {
+            return;
+        }
         foreach (scandir($dir) as $entry) {
-            if ($entry === '.' || $entry === '..') continue;
+            if ($entry === '.' || $entry === '..') {
+                continue;
+            }
             $path = $dir . '/' . $entry;
             is_dir($path) ? $this->removeDir($path) : unlink($path);
         }

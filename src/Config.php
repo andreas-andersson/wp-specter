@@ -6,8 +6,10 @@ namespace WpSpecter;
 
 final class Config
 {
-    /** @param list<string> $types */
-    /** @param list<string> $ignoreGlobs */
+    /**
+     * @param list<string> $types
+     * @param list<string> $ignoreGlobs
+     */
     public function __construct(
         public readonly string $path,
         public readonly ?string $target,

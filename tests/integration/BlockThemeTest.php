@@ -23,6 +23,7 @@ final class BlockThemeTest extends TestCase
         ob_start();
         $exit = $this->app->run(['wp-specter', 'scan', $this->fixture, '--no-color']);
         $output = ob_get_clean();
+        self::assertIsString($output);
 
         self::assertSame(1, $exit);
         self::assertStringContainsString('block_theme_orphaned_util', $output);
@@ -35,6 +36,7 @@ final class BlockThemeTest extends TestCase
         ob_start();
         $this->app->run(['wp-specter', 'scan', $this->fixture, '--no-color', '--type=templates']);
         $output = ob_get_clean();
+        self::assertIsString($output);
 
         // parts/my-block-render.php is declared in block.json render field
         self::assertStringNotContainsString('my-block-render', $output);
@@ -45,6 +47,7 @@ final class BlockThemeTest extends TestCase
         ob_start();
         $exit = $this->app->run(['wp-specter', 'scan', $this->fixture, '--no-color', '--type=functions']);
         $output = ob_get_clean();
+        self::assertIsString($output);
 
         self::assertSame(1, $exit);
         self::assertStringContainsString('block_theme_orphaned_util', $output);
@@ -55,6 +58,7 @@ final class BlockThemeTest extends TestCase
         ob_start();
         $exit = $this->app->run(['wp-specter', 'scan', $this->fixture, '--no-color', '--type=hooks']);
         $output = ob_get_clean();
+        self::assertIsString($output);
 
         self::assertSame(1, $exit);
         self::assertStringContainsString('block_theme_unused_hook', $output);
@@ -65,6 +69,7 @@ final class BlockThemeTest extends TestCase
         ob_start();
         $this->app->run(['wp-specter', 'scan', $this->fixture, '--no-color']);
         $output = ob_get_clean();
+        self::assertIsString($output);
 
         // block-theme has both theme.json and functions.php → Hybrid
         self::assertStringContainsString('Hybrid', $output);

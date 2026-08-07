@@ -330,6 +330,92 @@ class My_Class {
         self::assertEmpty($result->scopedMethodCalls);
     }
 
+    public function testLocalVariableAssignedFromNewIsScoped(): void
+    {
+        $result = $this->parse('<?php
+class My_Service {
+    public function render() {}
+}
+function boot() {
+    $s = new My_Service();
+    $s->render();
+}
+');
+        $calls = array_map(fn($c) => $c->receiverClass . '::' . $c->method, $result->scopedMethodCalls);
+        self::assertContains('My_Service::render', $calls);
+    }
+
+    public function testReassignedLocalVariableInvalidatesTrackedType(): void
+    {
+        $result = $this->parse('<?php
+class My_Service {
+    public function render() {}
+}
+function boot() {
+    $s = new My_Service();
+    $s = some_factory();
+    $s->render();
+}
+');
+        self::assertEmpty($result->scopedMethodCalls);
+        $names = array_column($result->functionCalls, 'name');
+        self::assertContains('render', $names);
+    }
+
+    public function testLocalVariableTypeDoesNotLeakAcrossFunctions(): void
+    {
+        $result = $this->parse('<?php
+class My_Service {
+    public function render() {}
+}
+function first() {
+    $x = new My_Service();
+}
+function second() {
+    $x->render();
+}
+');
+        self::assertEmpty($result->scopedMethodCalls);
+    }
+
+    public function testLocalVariableTypeDoesNotLeakIntoSiblingMethod(): void
+    {
+        $result = $this->parse('<?php
+class My_Service {
+    public function render() {}
+}
+class My_Plugin {
+    public function boot() {
+        $y = new My_Service();
+    }
+    public function other($y) {
+        $y->render();
+    }
+}
+');
+        self::assertEmpty($result->scopedMethodCalls);
+    }
+
+    public function testLocalVariableAssignedFromSelfAndParentIsScoped(): void
+    {
+        $result = $this->parse('<?php
+class Base_Service {
+    public function base_render() {}
+}
+class My_Service extends Base_Service {
+    public function boot() {
+        $a = new self();
+        $a->boot();
+        $b = new parent();
+        $b->base_render();
+    }
+}
+');
+        $calls = array_map(fn($c) => $c->receiverClass . '::' . $c->method, $result->scopedMethodCalls);
+        self::assertContains('My_Service::boot', $calls);
+        self::assertContains('Base_Service::base_render', $calls);
+    }
+
     public function testStringInterpolationDoesNotCorruptClassContext(): void
     {
         // "{{$k}}" emits a STRING "}" from the interpolation — must not corrupt brace depth.
@@ -449,9 +535,10 @@ class MyClass {
         // 'init' as a standalone string should not become a FunctionCall.
         $result = $this->parse("<?php \$x = 'init';");
         $names = array_column($result->functionCalls, 'name');
-        // 'init' looks like a valid callback name but has no () — it IS added as string callback
-        // this is a known trade-off per spec (acceptable false positives)
-        self::assertIsArray($names); // just asserts no crash
+        // 'init' looks like a valid callback name but has no () — it IS added as string callback;
+        // this is a known trade-off per spec (acceptable false positives), asserted explicitly
+        // here so a future tightening of looksLikeCallback() shows up as an intentional change.
+        self::assertContains('init', $names);
     }
 
     private function parse(string $code): \WpSpecter\Parser\ParseResult
@@ -463,9 +550,13 @@ class MyClass {
 
     private function removeDir(string $dir): void
     {
-        if (!is_dir($dir)) return;
+        if (!is_dir($dir)) {
+            return;
+        }
         foreach (scandir($dir) as $entry) {
-            if ($entry === '.' || $entry === '..') continue;
+            if ($entry === '.' || $entry === '..') {
+                continue;
+            }
             $path = $dir . '/' . $entry;
             is_dir($path) ? $this->removeDir($path) : unlink($path);
         }

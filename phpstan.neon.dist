@@ -1,0 +1,11 @@
+parameters:
+    level: 8
+    paths:
+        - src
+        - tests
+        - bin/wp-specter
+    excludePaths:
+        # Fake WP theme/plugin files used as scan targets in integration tests — call undefined
+        # WP core functions by design, not real code to type-check.
+        - tests/fixtures/*
+    tmpDir: .phpstan-cache

@@ -59,6 +59,7 @@ final class ProjectConfigLoaderTest extends TestCase
 
         $config = $this->loader->load($this->tmp);
 
+        self::assertNotNull($config);
         self::assertSame([$this->tmp . '/vendor-plugins'], $config->stubsFrom);
     }
 
@@ -68,6 +69,7 @@ final class ProjectConfigLoaderTest extends TestCase
 
         $config = $this->loader->load($this->tmp);
 
+        self::assertNotNull($config);
         self::assertSame($this->tmp . '/custom-stubs.json', $config->stubsPath);
     }
 
@@ -77,6 +79,7 @@ final class ProjectConfigLoaderTest extends TestCase
 
         $config = $this->loader->load($this->tmp);
 
+        self::assertNotNull($config);
         self::assertNull($config->stubsPath);
     }
 
@@ -105,6 +108,7 @@ final class ProjectConfigLoaderTest extends TestCase
         self::assertNull($this->loader->findDefaultStubsFile($this->tmp));
     }
 
+    /** @param array<mixed> $data */
     private function writeConfig(array $data): void
     {
         file_put_contents(
@@ -115,9 +119,13 @@ final class ProjectConfigLoaderTest extends TestCase
 
     private function removeDir(string $dir): void
     {
-        if (!is_dir($dir)) return;
+        if (!is_dir($dir)) {
+            return;
+        }
         foreach (scandir($dir) as $entry) {
-            if ($entry === '.' || $entry === '..') continue;
+            if ($entry === '.' || $entry === '..') {
+                continue;
+            }
             $path = $dir . '/' . $entry;
             is_dir($path) ? $this->removeDir($path) : unlink($path);
         }

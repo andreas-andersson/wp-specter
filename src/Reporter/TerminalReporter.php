@@ -4,11 +4,11 @@ declare(strict_types=1);
 
 namespace WpSpecter\Reporter;
 
-use WpSpecter\Scan\ScanTarget;
 use WpSpecter\Enum\WpMode;
 use WpSpecter\Finding\Finding;
 use WpSpecter\Finding\FindingCertainty;
 use WpSpecter\Finding\FindingType;
+use WpSpecter\Scan\ScanTarget;
 
 final class TerminalReporter
 {

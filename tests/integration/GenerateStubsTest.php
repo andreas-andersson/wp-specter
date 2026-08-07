@@ -39,8 +39,7 @@ apply_filters('my_plugin_content', \$content);
         self::assertSame(0, $exit);
         self::assertFileExists($output_file);
 
-        $data = json_decode(file_get_contents($output_file), true);
-        self::assertIsArray($data);
+        $data = $this->readJson($output_file);
         self::assertArrayHasKey('hooks', $data);
         self::assertContains('my_plugin_init', $data['hooks']);
         self::assertContains('my_plugin_content', $data['hooks']);
@@ -59,7 +58,7 @@ do_action('middle_hook');
         $this->app->run(['wp-specter', 'generate-stubs', $this->tmp, "--output={$output_file}"]);
         ob_get_clean();
 
-        $data = json_decode(file_get_contents($output_file), true);
+        $data = $this->readJson($output_file);
         $hooks = $data['hooks'];
         $sorted = $hooks;
         sort($sorted);
@@ -75,7 +74,7 @@ do_action('middle_hook');
         $this->app->run(['wp-specter', 'generate-stubs', $this->tmp, "--output={$output_file}"]);
         ob_get_clean();
 
-        $data = json_decode(file_get_contents($output_file), true);
+        $data = $this->readJson($output_file);
         self::assertArrayHasKey('generated', $data);
         self::assertArrayHasKey('source', $data);
         self::assertMatchesRegularExpression('/^\d{4}-\d{2}-\d{2}$/', $data['generated']);
@@ -94,7 +93,7 @@ do_action('repeated_hook');
         $this->app->run(['wp-specter', 'generate-stubs', $this->tmp, "--output={$output_file}"]);
         ob_get_clean();
 
-        $data = json_decode(file_get_contents($output_file), true);
+        $data = $this->readJson($output_file);
         self::assertSame(1, count(array_filter($data['hooks'], fn($h) => $h === 'repeated_hook')));
     }
 
@@ -111,7 +110,7 @@ do_action('literal_hook');
         $this->app->run(['wp-specter', 'generate-stubs', $this->tmp, "--output={$output_file}"]);
         ob_get_clean();
 
-        $data = json_decode(file_get_contents($output_file), true);
+        $data = $this->readJson($output_file);
         self::assertNotContains('dynamic_hook', $data['hooks']);
         self::assertContains('literal_hook', $data['hooks']);
     }
@@ -127,6 +126,7 @@ do_action('hook_two');
         ob_start();
         $this->app->run(['wp-specter', 'generate-stubs', $this->tmp, "--output={$output_file}"]);
         $output = ob_get_clean();
+        self::assertIsString($output);
 
         self::assertStringContainsString('2', $output);
         self::assertStringContainsString($output_file, $output);
@@ -147,7 +147,7 @@ function acf_get_setting($name, $value = null) {
         $this->app->run(['wp-specter', 'generate-stubs', $this->tmp, "--output={$output_file}"]);
         ob_get_clean();
 
-        $data = json_decode(file_get_contents($output_file), true);
+        $data = $this->readJson($output_file);
         self::assertArrayHasKey('prefixes', $data);
         self::assertContains('acf/settings/', $data['prefixes']);
         self::assertEmpty($data['hooks']);
@@ -181,10 +181,12 @@ function acf_get_setting($name, $value = null) {
         ob_start();
         $this->app->run(['wp-specter', 'scan', $themeDir, '--no-color', '--type=hooks']);
         $outputWithout = ob_get_clean();
+        self::assertIsString($outputWithout);
 
         ob_start();
         $this->app->run(['wp-specter', 'scan', $themeDir, '--no-color', '--type=hooks', "--stubs={$stubsFile}"]);
         $outputWith = ob_get_clean();
+        self::assertIsString($outputWith);
 
         self::assertStringContainsString('acf/settings/save_json', $outputWithout);
         self::assertStringNotContainsString('acf/settings/save_json', $outputWith);
@@ -225,14 +227,26 @@ do_action('plugin_fires_this');
         ob_start();
         $this->app->run(['wp-specter', 'scan', $themeDir, '--no-color', '--type=hooks']);
         $outputWithout = ob_get_clean();
+        self::assertIsString($outputWithout);
 
         // Scan theme WITH stubs — hook should be suppressed
         ob_start();
         $this->app->run(['wp-specter', 'scan', $themeDir, '--no-color', '--type=hooks', "--stubs={$stubsFile}"]);
         $outputWith = ob_get_clean();
+        self::assertIsString($outputWith);
 
         self::assertStringContainsString('plugin_fires_this', $outputWithout);
         self::assertStringNotContainsString('plugin_fires_this', $outputWith);
+    }
+
+    /** @return array<mixed> */
+    private function readJson(string $path): array
+    {
+        $raw = file_get_contents($path);
+        self::assertIsString($raw);
+        $data = json_decode($raw, true);
+        self::assertIsArray($data);
+        return $data;
     }
 
     private function removeDir(string $dir): void
