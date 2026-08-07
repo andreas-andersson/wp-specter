@@ -11,5 +11,8 @@ final class FunctionDef
         public readonly int $line,
         public readonly string $file,
         public readonly bool $isMethod = false,
+        // Declaring class's short name, set only when $isMethod. Null for interface/trait/enum
+        // bodies and anonymous classes, which have no ClassDef to attribute the method to.
+        public readonly ?string $ownerClass = null,
     ) {}
 }

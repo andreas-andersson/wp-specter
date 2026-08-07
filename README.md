@@ -77,7 +77,7 @@ fires isn't reported as unmatched.
 | Option | Description |
 |---|---|
 | `--target=theme\|plugin` | Declare the target type (default: auto-detect) |
-| `--type=<types>` | Comma-separated list of checks to run: `functions`, `hooks`, `templates`, `files` (default: all) |
+| `--type=<types>` | Comma-separated list of checks to run: `functions`, `hooks`, `templates`, `files`, `classes` (default: all) |
 | `--stubs=<file>` | JSON stubs file of known hooks to suppress (see [generate-stubs](#generate-stubs)) |
 | `--ignore=<globs>` | Comma-separated glob patterns to exclude from scanning |
 | `--verbose` | Show extra detail alongside findings |
@@ -216,6 +216,23 @@ Template files (in `template-parts/`, `templates/`, `parts/`) that are never ref
 WordPress template hierarchy files (`single.php`, `archive.php`, `page.php`, etc.) and their custom variants (`single-{post-type}.php`, `page-{slug}.php`, `archive-{cpt}.php`) are automatically exempt since WordPress loads them directly based on URL routing.
 
 In block/FSE themes, templates declared in `block.json` `render` fields are also treated as referenced.
+
+### Unused classes
+
+Classes defined anywhere in the scanned directory that are never referenced — no `new Foo()`, `Foo::method()`/`Foo::CONST`/`Foo::class`, `instanceof Foo`, or `extends`/`implements Foo` anywhere in the scanned files.
+
+A class only ever instantiated dynamically (`$class = 'Foo'; new $class()`) or referenced purely as a string (`register_widget('Foo')`) won't be recognized as used — this check only sees syntactic references, not string literals.
+
+### Unused methods
+
+Class methods that are never called by name anywhere in the scanned directory — `$obj->method()`, `Class::method()`, and `[$obj, 'method']` / `[Class::class, 'method']` callables (the common `add_action`/`add_filter` callback shape) all count as a call.
+
+This match is by method name only, not scoped to a specific object's type — two unrelated classes that happen to share a method name (e.g. `render()`) will each look "used" if either one is called anywhere. Findings are reported at `Warning` certainty (not `Error`) to reflect that lower confidence.
+
+Magic methods (`__construct`, `__toString`, etc.) are always excluded. Methods required by a handful of common contracts are excluded too, but only when the *declaring* class itself directly `implements`/`extends` that contract — not further up an inheritance chain:
+
+- **PHP SPL interfaces**: `ArrayAccess`, `Iterator`, `IteratorAggregate`, `Countable`, `JsonSerializable`, `Serializable`
+- **WordPress base classes**: `WP_Widget` (`widget`/`form`/`update`), `WP_REST_Controller` (`register_routes`), `Walker` (`start_lvl`/`end_lvl`/`start_el`/`end_el`)
 
 ---
 

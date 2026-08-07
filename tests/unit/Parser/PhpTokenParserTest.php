@@ -245,6 +245,30 @@ function standalone() {}
         self::assertCount(1, $standalones);
     }
 
+    public function testExtractsClassExtendsAndImplements(): void
+    {
+        $result = $this->parse('<?php
+class My_Widget extends WP_Widget implements Countable {
+    public function widget($args, $instance) {}
+    public function count(): int { return 0; }
+}
+');
+        self::assertCount(1, $result->classDefs);
+        self::assertSame('My_Widget', $result->classDefs[0]->name);
+        self::assertSame(['WP_Widget'], $result->classDefs[0]->extends);
+        self::assertSame(['Countable'], $result->classDefs[0]->implements);
+
+        $methods = array_column($result->functionDefs, 'ownerClass', 'name');
+        self::assertSame('My_Widget', $methods['widget']);
+        self::assertSame('My_Widget', $methods['count']);
+    }
+
+    public function testStandaloneFunctionHasNoOwnerClass(): void
+    {
+        $result = $this->parse('<?php function standalone() {}');
+        self::assertNull($result->functionDefs[0]->ownerClass);
+    }
+
     public function testStringInterpolationDoesNotCorruptClassContext(): void
     {
         // "{{$k}}" emits a STRING "}" from the interpolation — must not corrupt brace depth.

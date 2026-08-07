@@ -154,6 +154,57 @@ add_action("init", [My_Class::class, "static_callback_method"]);
         self::assertEmpty(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod));
     }
 
+    public function testExcludesWpWidgetContractMethods(): void
+    {
+        // WP core calls widget()/form()/update() by reflection on any WP_Widget subclass —
+        // never by a visible name reference anywhere in project code.
+        $file = $this->write('<?php
+class My_Widget extends WP_Widget {
+    public function widget($args, $instance) {}
+    public function form($instance) {}
+    public function update($new_instance, $old_instance) { return $new_instance; }
+    public function truly_unused() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('widget', $unusedMethods);
+        self::assertNotContains('form', $unusedMethods);
+        self::assertNotContains('update', $unusedMethods);
+        self::assertContains('truly_unused', $unusedMethods);
+    }
+
+    public function testExcludesInterfaceContractMethods(): void
+    {
+        $file = $this->write('<?php
+class My_Collection implements Countable, Iterator {
+    public function count(): int { return 0; }
+    public function current(): mixed { return null; }
+    public function key(): mixed { return null; }
+    public function next(): void {}
+    public function rewind(): void {}
+    public function valid(): bool { return false; }
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        self::assertEmpty(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod));
+    }
+
+    public function testContractMethodExemptionDoesNotLeakToUnrelatedClasses(): void
+    {
+        // A method literally named "widget" on a class that has nothing to do with WP_Widget
+        // should still be reported — the exemption is scoped to the declaring class's own
+        // extends/implements, not the method name in isolation.
+        $file = $this->write('<?php
+class Not_A_Widget {
+    public function widget() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertContains('widget', $unusedMethods);
+    }
+
     public function testExcludesMagicMethodsFromUnusedMethods(): void
     {
         $file = $this->write('<?php

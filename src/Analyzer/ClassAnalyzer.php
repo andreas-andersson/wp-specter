@@ -7,11 +7,33 @@ namespace WpSpecter\Analyzer;
 use WpSpecter\Finding\Finding;
 use WpSpecter\Finding\FindingCertainty;
 use WpSpecter\Finding\FindingType;
+use WpSpecter\Parser\ClassDef;
 use WpSpecter\Parser\ParseResult;
 use WpSpecter\Parser\PhpTokenParser;
 
 final class ClassAnalyzer
 {
+    // Methods PHP or WordPress core calls by contract (interface/base-class requirement), never
+    // by a visible name reference anywhere in project code. Keyed by the interface/base class's
+    // short name; only checked against a method's *own* declaring class's extends/implements
+    // (see findClassHierarchy in PhpTokenParser) — not the whole inheritance chain, so a
+    // grandchild class (extends My_Widget, which itself extends WP_Widget) won't get the
+    // exemption. That's a known gap, not a silent one: it just falls back to normal matching.
+    private const INTERFACE_CONTRACT_METHODS = [
+        'ArrayAccess' => ['offsetExists', 'offsetGet', 'offsetSet', 'offsetUnset'],
+        'Iterator' => ['current', 'key', 'next', 'rewind', 'valid'],
+        'IteratorAggregate' => ['getIterator'],
+        'Countable' => ['count'],
+        'JsonSerializable' => ['jsonSerialize'],
+        'Serializable' => ['serialize', 'unserialize'],
+    ];
+
+    private const BASE_CLASS_CONTRACT_METHODS = [
+        'WP_Widget' => ['widget', 'form', 'update'],
+        'WP_REST_Controller' => ['register_routes'],
+        'Walker' => ['start_lvl', 'end_lvl', 'start_el', 'end_el'],
+    ];
+
     public function __construct(private readonly PhpTokenParser $parser) {}
 
     /**
@@ -22,8 +44,15 @@ final class ClassAnalyzer
     {
         $parseResults = array_map(fn(string $f) => $this->parser->parse($f), $files);
 
-        $findings = $this->findUnusedClasses($parseResults);
-        array_push($findings, ...$this->findUnusedMethods($parseResults));
+        $classDefsByName = [];
+        foreach ($parseResults as $result) {
+            foreach ($result->classDefs as $def) {
+                $classDefsByName[$def->name] = $def;
+            }
+        }
+
+        $findings = $this->findUnusedClasses($parseResults, $classDefsByName);
+        array_push($findings, ...$this->findUnusedMethods($parseResults, $classDefsByName));
 
         usort($findings, fn(Finding $a, Finding $b) => $a->file <=> $b->file ?: $a->line <=> $b->line);
 
@@ -32,17 +61,11 @@ final class ClassAnalyzer
 
     /**
      * @param list<ParseResult> $parseResults
+     * @param array<string,ClassDef> $classDefsByName
      * @return list<Finding>
      */
-    private function findUnusedClasses(array $parseResults): array
+    private function findUnusedClasses(array $parseResults, array $classDefsByName): array
     {
-        $classDefs = [];
-        foreach ($parseResults as $result) {
-            foreach ($result->classDefs as $def) {
-                $classDefs[$def->name] = $def;
-            }
-        }
-
         $referenced = [];
         foreach ($parseResults as $result) {
             foreach ($result->classReferences as $ref) {
@@ -51,7 +74,7 @@ final class ClassAnalyzer
         }
 
         $findings = [];
-        foreach ($classDefs as $name => $def) {
+        foreach ($classDefsByName as $name => $def) {
             if (!isset($referenced[$name])) {
                 $findings[] = new Finding(
                     type: FindingType::UnusedClass,
@@ -68,9 +91,10 @@ final class ClassAnalyzer
 
     /**
      * @param list<ParseResult> $parseResults
+     * @param array<string,ClassDef> $classDefsByName
      * @return list<Finding>
      */
-    private function findUnusedMethods(array $parseResults): array
+    private function findUnusedMethods(array $parseResults, array $classDefsByName): array
     {
         // Method calls aren't tracked separately from function calls — $obj->method(),
         // Class::method(), and [$obj, 'method'] callables all land in functionCalls under the
@@ -88,7 +112,12 @@ final class ClassAnalyzer
         $findings = [];
         foreach ($parseResults as $result) {
             foreach ($result->functionDefs as $def) {
-                if (!$def->isMethod || $this->isMagicMethod($def->name) || isset($called[$def->name])) {
+                if (
+                    !$def->isMethod
+                    || $this->isMagicMethod($def->name)
+                    || isset($called[$def->name])
+                    || $this->isContractMethod($def->name, $def->ownerClass, $classDefsByName)
+                ) {
                     continue;
                 }
                 $findings[] = new Finding(
@@ -102,6 +131,33 @@ final class ClassAnalyzer
         }
 
         return $findings;
+    }
+
+    /** @param array<string,ClassDef> $classDefsByName */
+    private function isContractMethod(string $methodName, ?string $ownerClass, array $classDefsByName): bool
+    {
+        if ($ownerClass === null) {
+            return false;
+        }
+
+        $def = $classDefsByName[$ownerClass] ?? null;
+        if ($def === null) {
+            return false;
+        }
+
+        foreach ($def->implements as $interface) {
+            if (in_array($methodName, self::INTERFACE_CONTRACT_METHODS[$interface] ?? [], true)) {
+                return true;
+            }
+        }
+
+        foreach ($def->extends as $base) {
+            if (in_array($methodName, self::BASE_CLASS_CONTRACT_METHODS[$base] ?? [], true)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private function isMagicMethod(string $name): bool

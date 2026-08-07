@@ -43,9 +43,14 @@ final class PhpTokenParser
         $skipNextString = false;
 
         // Class context tracking: push brace depth when a class body opens, pop when it closes.
+        // $classNameStack runs in lockstep with $classDepthStack, tracking which class a method
+        // belongs to (null for interface/trait/enum/anonymous-class bodies, which have no
+        // ClassDef) — needed so a method's contract (implements/extends) can be checked later.
         $braceDepth = 0;
         $classDepthStack = [];
+        $classNameStack = [];
         $expectingClassOpen = false;
+        $pendingClassName = null;
         // String interpolation `{$var}` and `${var}` emit a STRING "}" token that closes the
         // interpolation but is NOT a code-level brace. Track depth so we skip those.
         $interpolationDepth = 0;
@@ -58,7 +63,9 @@ final class PhpTokenParser
                     $braceDepth++;
                     if ($expectingClassOpen) {
                         $classDepthStack[] = $braceDepth;
+                        $classNameStack[] = $pendingClassName;
                         $expectingClassOpen = false;
+                        $pendingClassName = null;
                     }
                 } elseif ($token === '}') {
                     if ($interpolationDepth > 0) {
@@ -66,6 +73,7 @@ final class PhpTokenParser
                     } else {
                         if (!empty($classDepthStack) && end($classDepthStack) === $braceDepth) {
                             array_pop($classDepthStack);
+                            array_pop($classNameStack);
                         }
                         $braceDepth--;
                     }
@@ -102,6 +110,7 @@ final class PhpTokenParser
                     $def = $this->parseClassDef($tokens, $i, $line, $file);
                     if ($def !== null) {
                         $classDefs[] = $def;
+                        $pendingClassName = $def->name;
                     }
                 } else {
                     $expectingClassOpen = $this->isPrecededByNew($tokens, $i);
@@ -131,7 +140,8 @@ final class PhpTokenParser
 
             if ($type === T_FUNCTION) {
                 $insideClass = !empty($classDepthStack);
-                $def = $this->parseFunctionDef($tokens, $i, $line, $file, $insideClass);
+                $ownerClass = empty($classNameStack) ? null : end($classNameStack);
+                $def = $this->parseFunctionDef($tokens, $i, $line, $file, $insideClass, $ownerClass);
                 if ($def !== null) {
                     $functionDefs[] = $def;
                 }
@@ -237,7 +247,7 @@ final class PhpTokenParser
         );
     }
 
-    private function parseFunctionDef(array $tokens, int $i, int $line, string $file, bool $isMethod = false): ?FunctionDef
+    private function parseFunctionDef(array $tokens, int $i, int $line, string $file, bool $isMethod = false, ?string $ownerClass = null): ?FunctionDef
     {
         // function [whitespace] <name> (
         $j = $i + 1;
@@ -269,7 +279,7 @@ final class PhpTokenParser
             return null;
         }
 
-        return new FunctionDef($next[1], $next[2] ?? $line, $file, $isMethod);
+        return new FunctionDef($next[1], $next[2] ?? $line, $file, $isMethod, $ownerClass);
     }
 
     private function parseHookRegistration(array $tokens, int $i, string|int $line, string $file, string $funcName): ?HookRegistration
@@ -484,7 +494,53 @@ final class PhpTokenParser
             return null;
         }
 
-        return new ClassDef($next[1], $next[2] ?? $line, $file);
+        [$extends, $implements] = $this->findClassHierarchy($tokens, $j);
+
+        return new ClassDef($next[1], $next[2] ?? $line, $file, $extends, $implements);
+    }
+
+    /**
+     * Looks ahead from the class-name token, past any `extends`/`implements` clauses, to the
+     * declaration's opening brace — used to know which known interfaces/base classes a class
+     * commits to, e.g. so `implements Iterator` can exempt current()/next()/etc. from being
+     * flagged as unused methods. Doesn't advance the main token loop; the main loop's own
+     * T_EXTENDS/T_IMPLEMENTS handling (which feeds the flat classReferences list) still sees
+     * these same tokens afterwards, same as parseFunctionDef's lookahead does for T_STRING.
+     *
+     * @return array{list<string>, list<string>}
+     */
+    private function findClassHierarchy(array $tokens, int $nameIndex): array
+    {
+        $extends = [];
+        $implements = [];
+        $j = $nameIndex + 1;
+
+        while (isset($tokens[$j])) {
+            $t = $tokens[$j];
+
+            if (is_string($t)) {
+                if ($t === '{' || $t === ';') {
+                    break;
+                }
+                $j++;
+                continue;
+            }
+
+            if ($t[0] === T_WHITESPACE) {
+                $j++;
+                continue;
+            }
+
+            if ($t[0] === T_EXTENDS) {
+                $extends = $this->captureClassNameList($tokens, $j);
+            } elseif ($t[0] === T_IMPLEMENTS) {
+                $implements = $this->captureClassNameList($tokens, $j);
+            }
+
+            $j++;
+        }
+
+        return [$extends, $implements];
     }
 
     private function isPrecededByNew(array $tokens, int $i): bool
