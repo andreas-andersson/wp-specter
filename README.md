@@ -198,13 +198,9 @@ Functions with common WordPress prefixes (`wp_`, `get_`, `the_`, `is_`, `has_`, 
 
 `add_action` / `add_filter` registrations whose hook tag is never fired by `do_action` / `apply_filters` within the scanned directory.
 
-Hooks from WordPress core and popular plugins are silently ignored via built-in stubs:
+WordPress core hooks (~400 known actions and filters) are silently ignored via a built-in stub list — core is never part of what you scan, so there's no other way to know about them.
 
-- **WordPress core** — ~400 known actions and filters
-- **Advanced Custom Fields Pro** — all `acf/*` hooks
-- **ElasticPress** — all `ep_*` hooks
-
-Use `generate-stubs` to suppress hooks fired by any other plugins in your project.
+Third-party plugin hooks (ACF, ElasticPress, WooCommerce, etc.) aren't hardcoded — if wp-specter can scan the plugin's actual code (composer project mode already does this for anything under your project's `plugins/` directory), it sees the `do_action`/`apply_filters` calls directly and matches them for real. For plugins outside the scan (bundled/vendored elsewhere, or you're scanning just a theme), use `generate-stubs` against their source, or a `stubsFrom` entry in [`.wp-specter.config.json`](#project-config-wp-specterconfigjson) to keep it current automatically.
 
 Dynamic hook tags (variables, concatenated strings) are skipped — only literal string tags are analysed.
 
@@ -240,7 +236,7 @@ src/
   Parser/         PhpTokenParser and value objects
   Reporter/       TerminalReporter
   Scanner/        FileScanner, ScanResult
-  Stubs/          WpCoreHooks, AcfProHooks, ElasticPressHooks, StubRegistry
+  Stubs/          WpCoreHooks, StubRegistry
   Application.php
   Config.php
 bin/

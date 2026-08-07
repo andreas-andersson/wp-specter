@@ -9,8 +9,6 @@ final class StubRegistry
     /** @var list<class-string<HookStub>> */
     private const STUBS = [
         WpCoreHooks::class,
-        AcfProHooks::class,
-        ElasticPressHooks::class,
     ];
 
     /** @var array<string,true>|null */

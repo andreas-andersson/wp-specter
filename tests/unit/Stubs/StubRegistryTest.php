@@ -46,6 +46,18 @@ final class StubRegistryTest extends TestCase
         self::assertFalse(StubRegistry::contains('my_totally_custom_action_xyz'));
     }
 
+    // ── plugin hooks are no longer built in ─────────────────────────────────
+    // Composer-project scanning and generate-stubs/stubsFrom can now produce accurate,
+    // up-to-date stubs from the plugin's actual installed code — hardcoded per-plugin lists
+    // (formerly ACF Pro, ElasticPress) would just go stale, so they were removed. Third-party
+    // plugin hooks are only known if the project generates stubs for them.
+
+    public function testThirdPartyPluginHookIsNotKnownByDefault(): void
+    {
+        self::assertFalse(StubRegistry::contains('acf/init'));
+        self::assertFalse(StubRegistry::contains('ep_formatted_args'));
+    }
+
     // ── WP core prefix matching ────────────────────────────────────────────
 
     public function testWpAjaxPrefixIsKnown(): void
@@ -71,41 +83,6 @@ final class StubRegistryTest extends TestCase
     public function testPublishPrefixIsKnown(): void
     {
         self::assertTrue(StubRegistry::contains('publish_post'));
-    }
-
-    // ── ACF Pro stubs ──────────────────────────────────────────────────────
-
-    public function testAcfInitIsKnown(): void
-    {
-        self::assertTrue(StubRegistry::contains('acf/init'));
-    }
-
-    public function testAcfSavePostIsKnown(): void
-    {
-        self::assertTrue(StubRegistry::contains('acf/save_post'));
-    }
-
-    public function testAcfLoadFieldPrefixIsKnown(): void
-    {
-        self::assertTrue(StubRegistry::contains('acf/load_field/my_field_name'));
-    }
-
-    public function testAcfFieldGroupPrefixIsKnown(): void
-    {
-        self::assertTrue(StubRegistry::contains('acf/field_group/admin_head'));
-    }
-
-    // ── ElasticPress stubs ─────────────────────────────────────────────────
-
-    public function testElasticPressFormattedArgsIsKnown(): void
-    {
-        self::assertTrue(StubRegistry::contains('ep_formatted_args'));
-    }
-
-    public function testElasticPressPrefixIsKnown(): void
-    {
-        self::assertTrue(StubRegistry::contains('ep_index_name'));
-        self::assertTrue(StubRegistry::contains('ep_any_arbitrary_hook'));
     }
 
     // ── loadFile ───────────────────────────────────────────────────────────
