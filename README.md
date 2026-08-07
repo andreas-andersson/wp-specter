@@ -71,10 +71,6 @@ Unused Methods
 Found: 3 unused function(s), 1 unmatched hook(s), 3 unused file(s), 1 unused class(es), 2 unused method(s)
 ```
 
-`✗` is an `Error` — a definite finding. `⚠` is a `Warning`: likely dead, but reachable
-through a path static analysis can't see (a dynamic hook tag, a method called on an
-untyped variable). Start with the `✗` lines.
-
 
 ## Requirements
 
