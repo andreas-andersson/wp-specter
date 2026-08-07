@@ -1,0 +1,5 @@
+{
+    "name": "wp-specter/my-block",
+    "title": "My Block",
+    "render": "parts/my-block-render.php"
+}

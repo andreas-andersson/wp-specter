@@ -1,0 +1,13 @@
+{
+    "require": {
+        "roots/bedrock": "^1.24",
+        "roots/wordpress": "^6.0"
+    },
+    "extra": {
+        "installer-paths": {
+            "web/app/plugins/{$name}/": ["type:wordpress-plugin"],
+            "web/app/themes/{$name}/": ["type:wordpress-theme"],
+            "web/app/mu-plugins/{$name}/": ["type:wordpress-muplugin"]
+        }
+    }
+}
