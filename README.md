@@ -9,15 +9,16 @@ Static analysis tool for WordPress projects. Finds unused functions, unmatched h
 
 ## Installation
 
-wp-specter isn't published on Packagist — install it via a local [path repository](https://getcomposer.org/doc/05-repositories.md#path) pointing at this checkout. Composer symlinks it in, so pulling changes here (`git pull` or hand-edits) is picked up immediately by everything that depends on it — no reinstall needed.
+wp-specter is published on [Packagist](https://packagist.org/packages/andreas-andersson/wp-specter).
+
+> No tagged release yet — only `dev-master` is available, so the version constraint below is
+> required for now. Plain `composer require --dev andreas-andersson/wp-specter` (no constraint)
+> will fail with a minimum-stability error until a first version tag is pushed.
 
 ### As a project dev-dependency
 
-In the project you want to lint, point it at this checkout and require it:
-
 ```bash
-composer config repositories.wp-specter path /path/to/wp-specter
-composer require --dev wp-specter/wp-specter:@dev
+composer require --dev andreas-andersson/wp-specter:dev-master
 ```
 
 Run it via `vendor/bin/wp-specter scan ...`.
@@ -25,15 +26,15 @@ Run it via `vendor/bin/wp-specter scan ...`.
 ### Globally (one `wp-specter` command everywhere)
 
 ```bash
-composer global config repositories.wp-specter path /path/to/wp-specter
-composer global require wp-specter/wp-specter:@dev
+composer global require andreas-andersson/wp-specter:dev-master
 ```
 
 Make sure Composer's global bin dir is on your `PATH` (`composer global config bin-dir --absolute` prints it — usually `~/.config/composer/vendor/bin` or `~/.composer/vendor/bin`).
 
-### From this checkout directly (contributing to wp-specter itself)
+### From source (contributing to wp-specter itself)
 
 ```bash
+git clone https://github.com/andreas-andersson/wp-specter.git
 cd wp-specter
 composer install
 php bin/wp-specter scan ...

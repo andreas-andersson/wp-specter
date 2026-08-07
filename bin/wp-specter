@@ -3,12 +3,38 @@
 
 declare(strict_types=1);
 
-foreach ([__DIR__ . '/../vendor/autoload.php', __DIR__ . '/../../autoload.php'] as $autoload) {
-    if (file_exists($autoload)) {
-        require $autoload;
-        break;
+// Composer's generated bin proxy exposes this global with the exact autoload path — use it
+// when present instead of guessing a relative depth, since that depth differs between "this is
+// the project" (php bin/wp-specter), "installed as a dependency"
+// (vendor/<vendor>/wp-specter/bin/wp-specter, three levels below vendor/autoload.php), and
+// "installed globally". See https://getcomposer.org/doc/articles/vendor-binaries.md
+$autoload = $GLOBALS['_composer_autoload_path'] ?? null;
+
+if ($autoload === null) {
+    // Not invoked via the Composer proxy (e.g. running straight from a git checkout) — walk
+    // upward for vendor/autoload.php rather than hardcoding how many levels up it is. Can't
+    // reuse the project's own PathWalker helper here: it's loaded BY this same autoloader we're
+    // still looking for.
+    $dir = __DIR__;
+    while (true) {
+        if (file_exists($dir . '/vendor/autoload.php')) {
+            $autoload = $dir . '/vendor/autoload.php';
+            break;
+        }
+        $parent = dirname($dir);
+        if ($parent === $dir) {
+            break;
+        }
+        $dir = $parent;
     }
 }
+
+if ($autoload === null) {
+    fwrite(STDERR, "Error: could not locate vendor/autoload.php — run composer install first.\n");
+    exit(2);
+}
+
+require $autoload;
 
 use WpSpecter\Application;
 
