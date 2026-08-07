@@ -1,6 +1,80 @@
 # WP Specter
 
-Static analysis tool for WordPress projects. Finds unused functions, unmatched hooks, unreferenced templates, and orphaned PHP files — without needing a running WordPress installation.
+**Has your WordPress project grown over the years? Or did you inherit one — thousands
+of lines of PHP, and nobody left who can tell you what's still actually used?**
+
+Deleting code from a WordPress project is scary, because so little of it is called
+the way normal PHP is called. A template file isn't `include`d anywhere — WordPress
+picks it up from the template hierarchy. A function isn't called by name — it's
+hooked to an action by string. So generic dead-code tools either flag half your theme
+as unused, or shrug and tell you nothing.
+
+WP Specter is a static analyser that knows those conventions. Point it at a theme,
+a plugin, or a whole Bedrock project and it reports what's genuinely orphaned:
+
+- **Unused functions and classes** — defined, never referenced
+- **Unused methods** — resolved per class, not just by name
+- **Unmatched hooks** — `add_action` / `add_filter` for a tag nothing ever fires
+- **Unused templates** — template parts nothing loads, with the template hierarchy
+  and `block.json` render fields accounted for
+- **Orphaned files** — PHP that is never included, required or referenced
+
+**Example output:**
+
+```
+wp-specter — WordPress unused code scanner
+
+  Path:   /home/user/dev/my-site/wp-content/themes/mytheme/
+  Mode:   Classic theme
+  Files:  247 PHP files scanned
+
+Unused Functions
+
+  ✗  user_is_temporarly_banned
+     /home/user/dev/my-site/wp-content/themes/mytheme/functions.php:524
+
+  ✗  custom_loginpage_with_return_url
+     /home/user/dev/my-site/wp-content/themes/mytheme/functions.php:532
+
+  ✗  acf_location_rules_match_user
+      /home/user/dev/my-site/wp-content/themes/mytheme/functions.php:647
+
+Unmatched Hooks
+
+  ⚠  wsl_hook_process_login_before_wp_safe_redirect  // not fired within scanned directory
+     /home/user/dev/my-site/wp-content/themes/mytheme/functions.php:2006
+
+Unused Files
+
+  ⚠  acf-blocks/featured-pages  // not included, required, or referenced anywhere in scanned directory
+     /home/user/dev/my-site/wp-content/themes/mytheme/acf-blocks/featured-pages.php:1
+
+  ⚠  acf-blocks/featured-posts  // not included, required, or referenced anywhere in scanned directory
+     /home/user/dev/my-site/wp-content/themes/mytheme/acf-blocks/featured-posts.php:1
+
+  ⚠  page-templates/sections/parts/feedback-form  // not included, required, or referenced anywhere in scanned directory
+     /home/user/dev/my-site/wp-content/themes/mytheme/page-templates/sections/parts/feedback-form.php:1
+
+Unused Classes
+
+  ✗  WP_Page_List_Navwalker
+     /home/user/dev/my-site/wp-content/themes/mytheme/includes/wp_page_list_navwalker.php:3
+
+Unused Methods
+
+  ⚠  start_lvl
+     /home/user/dev/my-site/wp-content/themes/mytheme/includes/wp_page_list_navwalker.php:5
+
+  ⚠  start_el
+     /home/user/dev/my-site/wp-content/themes/mytheme/includes/wp_page_list_navwalker.php:10
+
+Found: 3 unused function(s), 1 unmatched hook(s), 3 unused file(s), 1 unused class(es), 2 unused method(s)
+```
+
+`✗` is an `Error` — a definite finding. `⚠` is a `Warning`: likely dead, but reachable
+through a path static analysis can't see (a dynamic hook tag, a method called on an
+untyped variable). Start with the `✗` lines.
+
 
 ## Requirements
 
