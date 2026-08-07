@@ -2,35 +2,34 @@ name: CI
 
 on:
   push:
+    paths:
+      - '**/*.php'
+  pull_request:
+    paths:
+      - '**/*.php'
+
+permissions:
+  contents: read
 
 jobs:
-  check:
-    name: composer check
+  ci:
+
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    - uses: actions/checkout@v4
 
-      - name: Set up PHP
-        uses: shivammathur/setup-php@v2
-        with:
-          php-version: '8.4'
-          coverage: none
+    - name: Validate composer.json and composer.lock
+      run: composer validate --strict
 
-      - name: Get Composer cache directory
-        id: composer-cache
-        run: echo "dir=$(composer config cache-files-dir)" >> "$GITHUB_OUTPUT"
+    - name: Install Composer dependencies
+      uses: "ramsey/composer-install@v3"
 
-      - name: Cache Composer packages
-        uses: actions/cache@v4
-        with:
-          path: ${{ steps.composer-cache.outputs.dir }}
-          key: composer-${{ runner.os }}-${{ hashFiles('composer.lock') }}
-          restore-keys: composer-${{ runner.os }}-
+    - name: Run PHP-CS-Fixer
+      run: composer lint
 
-      - name: Install dependencies
-        run: composer install --no-interaction --prefer-dist --no-progress
+    - name: Run PHPUnit
+      run: composer test
 
-      - name: composer check (lint + phpstan + tests)
-        run: composer check
+    - name: Run PHPStan
+      run: composer phpstan
