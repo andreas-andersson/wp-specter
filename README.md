@@ -132,9 +132,14 @@ The generated file looks like:
     "hooks": [
         "my_plugin_action",
         "my_plugin_filter"
+    ],
+    "prefixes": [
+        "acf/settings/"
     ]
 }
 ```
+
+Some plugins fire a whole family of hooks through one dynamic call site instead of a literal `do_action`/`apply_filters` per hook — ACF is a good example: every `acf/settings/*` filter (`save_json`, `load_json`, `enable_datastore`, ...) routes through a single `apply_filters( "acf/settings/{$name}", $value )`. No individual tag ever appears as a literal string anywhere in ACF's source, so it can never land in `hooks`, no matter how thoroughly that source is scanned. `generate-stubs` detects this shape — an interpolated string or a `'literal' . $var` concatenation — and records the resolvable leading segment under `prefixes` instead. `scan` treats a `prefixes` match the same as an exact `hooks` match: `add_filter('acf/settings/save_json', ...)` is suppressed because `acf/settings/` was seen, not because `acf/settings/save_json` itself was. The same dynamic-prefix matching also applies within a single scan directly — a project firing its own `apply_filters("myplugin/{$type}", ...)` suppresses matching registrations without needing a stubs file at all.
 
 You can commit this file alongside your project and update it whenever plugins change.
 
@@ -202,7 +207,7 @@ WordPress core hooks (~400 known actions and filters) are silently ignored via a
 
 Third-party plugin hooks (ACF, ElasticPress, WooCommerce, etc.) aren't hardcoded — if wp-specter can scan the plugin's actual code (composer project mode already does this for anything under your project's `plugins/` directory), it sees the `do_action`/`apply_filters` calls directly and matches them for real. For plugins outside the scan (bundled/vendored elsewhere, or you're scanning just a theme), use `generate-stubs` against their source, or a `stubsFrom` entry in [`.wp-specter.config.json`](#project-config-wp-specterconfigjson) to keep it current automatically.
 
-Dynamic hook tags (variables, concatenated strings) are skipped — only literal string tags are analysed.
+Dynamic hook tags with no resolvable literal prefix (a bare variable, a function call result) are skipped entirely. A dynamic tag that does have a resolvable prefix — `"acf/settings/{$name}"`, `'acf/settings/' . $name` — still contributes that prefix as a match for any registration in the same family; see [generate-stubs](#generate-stubs).
 
 ### Unused templates
 

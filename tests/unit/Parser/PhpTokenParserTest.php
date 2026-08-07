@@ -91,6 +91,44 @@ apply_filters( 'the_content', \$content );
         self::assertCount(2, $result->hookInvocations);
         self::assertSame('wp_head', $result->hookInvocations[0]->tag);
         self::assertSame('the_content', $result->hookInvocations[1]->tag);
+        self::assertFalse($result->hookInvocations[0]->isDynamic);
+        self::assertSame('wp_head', $result->hookInvocations[0]->tagPrefix);
+    }
+
+    public function testInterpolatedHookInvocationKeepsLiteralPrefix(): void
+    {
+        // ACF's real shape: every acf/settings/* filter fires through this one dynamic
+        // dispatcher — apply_filters("acf/settings/{$name}", $value) — so "acf/settings/save_json"
+        // never appears as a literal string anywhere in ACF's own source.
+        $result = $this->parse('<?php
+function acf_get_setting($name, $value = null) {
+    return apply_filters("acf/settings/{$name}", $value);
+}
+');
+        self::assertCount(1, $result->hookInvocations);
+        self::assertTrue($result->hookInvocations[0]->isDynamic);
+        self::assertSame('', $result->hookInvocations[0]->tag);
+        self::assertSame('acf/settings/', $result->hookInvocations[0]->tagPrefix);
+    }
+
+    public function testConcatenatedHookInvocationKeepsLiteralPrefix(): void
+    {
+        $result = $this->parse('<?php
+do_action("acf/settings/" . $name);
+');
+        self::assertCount(1, $result->hookInvocations);
+        self::assertTrue($result->hookInvocations[0]->isDynamic);
+        self::assertSame('acf/settings/', $result->hookInvocations[0]->tagPrefix);
+    }
+
+    public function testFullyDynamicHookInvocationHasNoPrefix(): void
+    {
+        $result = $this->parse('<?php
+do_action($fullyDynamicTag);
+');
+        self::assertCount(1, $result->hookInvocations);
+        self::assertTrue($result->hookInvocations[0]->isDynamic);
+        self::assertSame('', $result->hookInvocations[0]->tagPrefix);
     }
 
     public function testExtractsGetTemplatePart(): void

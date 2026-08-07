@@ -13,6 +13,8 @@ final class ParseResult
      * @param list<HookInvocation>  $hookInvocations
      * @param list<TemplateRef>     $templateRefs
      * @param list<string>          $phpPathStrings
+     * @param list<ClassDef>        $classDefs
+     * @param list<string>          $classReferences
      */
     public function __construct(
         public readonly string $file,
@@ -22,6 +24,8 @@ final class ParseResult
         public readonly array $hookInvocations,
         public readonly array $templateRefs,
         public readonly array $phpPathStrings = [],
+        public readonly array $classDefs = [],
+        public readonly array $classReferences = [],
         public readonly ?string $error = null,
     ) {}
 }

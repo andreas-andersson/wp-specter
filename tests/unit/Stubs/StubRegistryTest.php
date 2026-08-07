@@ -128,6 +128,23 @@ final class StubRegistryTest extends TestCase
         self::assertTrue(StubRegistry::contains('flat_hook_two'));
     }
 
+    public function testLoadFileAddsPrefixesFromJsonFile(): void
+    {
+        // What generate-stubs writes for a dynamically-dispatched hook family, e.g. ACF's
+        // apply_filters("acf/settings/{$name}", ...) — no exact tag, just a prefix.
+        $file = $this->tmp . '/prefix-stubs.json';
+        file_put_contents($file, json_encode([
+            'hooks' => [],
+            'prefixes' => ['acf/settings/'],
+        ]));
+
+        StubRegistry::loadFile($file);
+
+        self::assertTrue(StubRegistry::contains('acf/settings/save_json'));
+        self::assertTrue(StubRegistry::contains('acf/settings/load_json'));
+        self::assertFalse(StubRegistry::contains('acf/other/thing'));
+    }
+
     // ── helpers ────────────────────────────────────────────────────────────
 
     private function resetRegistry(): void

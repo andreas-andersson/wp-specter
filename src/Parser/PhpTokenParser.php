@@ -13,6 +13,8 @@ final class PhpTokenParser
     private const CRON_SCHEDULE_FUNCS = ['wp_schedule_event' => 2, 'wp_schedule_single_event' => 1];
     private const TEMPLATE_FUNCS = ['get_template_part', 'get_header', 'get_footer', 'get_sidebar'];
     private const INCLUDE_KEYWORDS = [T_INCLUDE, T_INCLUDE_ONCE, T_REQUIRE, T_REQUIRE_ONCE];
+    // T_STRING: plain `Foo`. T_NAME_QUALIFIED: `Foo\Bar`. T_NAME_FULLY_QUALIFIED: `\Foo\Bar`.
+    private const CLASS_NAME_TOKENS = [T_STRING, T_NAME_QUALIFIED, T_NAME_FULLY_QUALIFIED];
 
     public function parse(string $file): ParseResult
     {
@@ -33,6 +35,8 @@ final class PhpTokenParser
         $hookInvocations = [];
         $templateRefs = [];
         $phpPathStrings = [];
+        $classDefs = [];
+        $classReferences = [];
 
         $count = count($tokens);
         $line = 1;
@@ -86,8 +90,42 @@ final class PhpTokenParser
                 continue;
             }
 
-            if ($type === T_CLASS || $type === T_INTERFACE || $type === T_TRAIT || $type === T_ENUM) {
+            if ($type === T_CLASS) {
+                // T_CLASS shows up in three unrelated shapes: `class Foo {}` (a real
+                // declaration — next token is the name), `Foo::class` (a class-const
+                // reference — no name follows; "Foo" was already captured as a reference when
+                // we processed that T_STRING, see below), and `new class {}` (anonymous — no
+                // name, but it does open a body). Only declarations and anonymous classes open
+                // a brace context; only declarations get a ClassDef.
+                if ($this->nextMeaningfulIsIdentifier($tokens, $i)) {
+                    $expectingClassOpen = true;
+                    $def = $this->parseClassDef($tokens, $i, $line, $file);
+                    if ($def !== null) {
+                        $classDefs[] = $def;
+                    }
+                } else {
+                    $expectingClassOpen = $this->isPrecededByNew($tokens, $i);
+                }
+                continue;
+            }
+
+            if ($type === T_INTERFACE || $type === T_TRAIT || $type === T_ENUM) {
                 $expectingClassOpen = true;
+                continue;
+            }
+
+            if ($type === T_NEW || $type === T_INSTANCEOF) {
+                $ref = $this->captureClassNameAfter($tokens, $i);
+                if ($ref !== null) {
+                    $classReferences[] = $ref;
+                }
+                continue;
+            }
+
+            if ($type === T_EXTENDS || $type === T_IMPLEMENTS) {
+                foreach ($this->captureClassNameList($tokens, $i) as $ref) {
+                    $classReferences[] = $ref;
+                }
                 continue;
             }
 
@@ -110,6 +148,13 @@ final class PhpTokenParser
                 $skipNextString = false;
                 $name = $value;
                 $nextNonWhitespace = $this->peekNextMeaningful($tokens, $i);
+
+                if ($nextNonWhitespace === '::') {
+                    // Foo::method(), Foo::CONST, Foo::class, Foo::$prop — whatever comes after
+                    // the '::', "Foo" itself is a class reference either way.
+                    $classReferences[] = $name;
+                    continue;
+                }
 
                 if ($nextNonWhitespace !== '(') {
                     // Could be a string callback — handled below via T_CONSTANT_ENCAPSED_STRING
@@ -187,6 +232,8 @@ final class PhpTokenParser
             hookInvocations: $hookInvocations,
             templateRefs: $templateRefs,
             phpPathStrings: $phpPathStrings,
+            classDefs: $classDefs,
+            classReferences: $classReferences,
         );
     }
 
@@ -228,22 +275,22 @@ final class PhpTokenParser
     private function parseHookRegistration(array $tokens, int $i, string|int $line, string $file, string $funcName): ?HookRegistration
     {
         // add_action( 'tag', callback )
-        $args = $this->extractFirstTwoStringArgs($tokens, $i);
-        if ($args === null) {
+        $arg = $this->extractStringArgAt($tokens, $i, 0);
+        if ($arg === null) {
             return new HookRegistration('', $funcName, (int) $line, $file, true);
         }
-        [$tag, $isDynamic] = $args;
+        [$tag, $isDynamic] = $arg;
         return new HookRegistration($tag, $funcName, (int) $line, $file, $isDynamic);
     }
 
     private function parseHookInvocation(array $tokens, int $i, string|int $line, string $file, string $funcName): ?HookInvocation
     {
-        $args = $this->extractFirstTwoStringArgs($tokens, $i);
-        if ($args === null) {
-            return new HookInvocation('', $funcName, (int) $line, $file, true);
+        $arg = $this->extractStringArgAt($tokens, $i, 0);
+        if ($arg === null) {
+            return new HookInvocation('', $funcName, (int) $line, $file, true, '');
         }
-        [$tag, $isDynamic] = $args;
-        return new HookInvocation($tag, $funcName, (int) $line, $file, $isDynamic);
+        [$tag, $isDynamic, $prefix] = $arg;
+        return new HookInvocation($tag, $funcName, (int) $line, $file, $isDynamic, $prefix);
     }
 
     private function parseCronScheduleHook(array $tokens, int $i, string|int $line, string $file, string $funcName): ?HookInvocation
@@ -251,10 +298,10 @@ final class PhpTokenParser
         $argIndex = self::CRON_SCHEDULE_FUNCS[$funcName];
         $arg = $this->extractStringArgAt($tokens, $i, $argIndex);
         if ($arg === null) {
-            return new HookInvocation('', $funcName, (int) $line, $file, true);
+            return new HookInvocation('', $funcName, (int) $line, $file, true, '');
         }
-        [$tag, $isDynamic] = $arg;
-        return new HookInvocation($tag, $funcName, (int) $line, $file, $isDynamic);
+        [$tag, $isDynamic, $prefix] = $arg;
+        return new HookInvocation($tag, $funcName, (int) $line, $file, $isDynamic, $prefix);
     }
 
     private function parseTemplateRef(array $tokens, int $i, string|int $line, string $file, string $funcName): ?TemplateRef
@@ -262,7 +309,8 @@ final class PhpTokenParser
         // Unlike hook tags, a template ref keeps a usable value even when the arg is a dynamic
         // interpolated string — e.g. get_template_part("variants/$variant") still tells us
         // every "variants/*" file is reachable, even though the exact suffix isn't known.
-        [$path] = $this->extractFirstArgWithPrefix($tokens, $i);
+        // The literal prefix doubles as the exact value when the arg isn't dynamic at all.
+        [, , $path] = $this->extractStringArgAt($tokens, $i, 0) ?? ['', true, ''];
 
         // get_header('kiosk') loads header-kiosk.php; prefix the stem so matching works
         if ($path !== '') {
@@ -318,91 +366,11 @@ final class PhpTokenParser
     }
 
     /**
-     * Like extractFirstTwoStringArgs, but when the first arg is a double-quoted string with
-     * interpolation (e.g. "variants/$variant"), returns its leading literal segment instead of
-     * discarding it — callers that can use a path *prefix* (template refs) want this; callers
-     * that need an exact tag (hooks) should keep using extractFirstTwoStringArgs.
-     *
-     * @return array{string, bool}
-     */
-    private function extractFirstArgWithPrefix(array $tokens, int $i): array
-    {
-        $j = $i + 1;
-        while (isset($tokens[$j])) {
-            $t = $tokens[$j];
-            if (is_string($t) && $t === '(') {
-                $j++;
-                break;
-            }
-            $j++;
-        }
-
-        while (isset($tokens[$j]) && is_array($tokens[$j]) && $tokens[$j][0] === T_WHITESPACE) {
-            $j++;
-        }
-
-        $first = $tokens[$j] ?? null;
-        if ($first === null) {
-            return ['', true];
-        }
-
-        if (is_array($first) && $first[0] === T_CONSTANT_ENCAPSED_STRING) {
-            return [$this->stripQuotes($first[1]), false];
-        }
-
-        if (is_string($first) && $first === '"') {
-            $next = $tokens[$j + 1] ?? null;
-            if (is_array($next) && $next[0] === T_ENCAPSED_AND_WHITESPACE) {
-                return [$next[1], true];
-            }
-        }
-
-        return ['', true];
-    }
-
-    /**
-     * Skip to the '(' after the current function name, then read the first argument.
-     * Returns [string, isDynamic] or null on parse error.
-     *
-     * @return array{string, bool}|null
-     */
-    private function extractFirstTwoStringArgs(array $tokens, int $i): ?array
-    {
-        $j = $i + 1;
-        // skip to opening paren
-        while (isset($tokens[$j])) {
-            $t = $tokens[$j];
-            if (is_string($t) && $t === '(') {
-                $j++;
-                break;
-            }
-            $j++;
-        }
-
-        // skip whitespace
-        while (isset($tokens[$j]) && is_array($tokens[$j]) && $tokens[$j][0] === T_WHITESPACE) {
-            $j++;
-        }
-
-        $first = $tokens[$j] ?? null;
-        if ($first === null) {
-            return null;
-        }
-
-        if (is_array($first) && $first[0] === T_CONSTANT_ENCAPSED_STRING) {
-            return [$this->stripQuotes($first[1]), false];
-        }
-
-        // Variable or expression — dynamic
-        return ['', true];
-    }
-
-    /**
      * Skip to the '(' after the current function name, then read the argument at $argIndex
-     * (0-indexed), splitting on top-level commas. Returns [string, isDynamic] or null if the
-     * call doesn't have that many arguments.
+     * (0-indexed), splitting on top-level commas. Returns null if the call doesn't have that
+     * many arguments.
      *
-     * @return array{string, bool}|null
+     * @return array{string, bool, string}|null  [exact tag or '', isDynamic, literal prefix]
      */
     private function extractStringArgAt(array $tokens, int $i, int $argIndex): ?array
     {
@@ -434,7 +402,7 @@ final class PhpTokenParser
                 $argTokens[] = $t;
             } elseif (is_string($t) && $t === ',' && $depth === 0) {
                 if ($currentIndex === $argIndex) {
-                    return $this->resolveSingleStringArg($argTokens);
+                    return $this->classifyArgTokens($argTokens);
                 }
                 $currentIndex++;
                 $argTokens = [];
@@ -448,22 +416,152 @@ final class PhpTokenParser
         }
 
         if ($currentIndex === $argIndex) {
-            return $this->resolveSingleStringArg($argTokens);
+            return $this->classifyArgTokens($argTokens);
         }
 
         return null;
     }
 
     /**
+     * Classifies a single already-collected argument as one of three shapes:
+     *  - a fully literal string, nothing else: exact tag known, not dynamic.
+     *  - a string with a resolvable literal *prefix* — an interpolated double-quoted string
+     *    ("acf/settings/{$name}") or a literal segment followed by concatenation
+     *    ('acf/settings/' . $name) — exact tag unknown, but everything up to the first
+     *    variable/expression is. This is what turns something like ACF's single dynamic
+     *    dispatcher (every acf/settings/* hook fires through one apply_filters call) into a
+     *    still-useful signal instead of a total blind spot.
+     *  - anything else (bare variable, function call, array, ...): no literal information at
+     *    all.
+     *
      * @param list<mixed> $argTokens
-     * @return array{string, bool}
+     * @return array{string, bool, string}
      */
-    private function resolveSingleStringArg(array $argTokens): array
+    private function classifyArgTokens(array $argTokens): array
     {
         if (count($argTokens) === 1 && is_array($argTokens[0]) && $argTokens[0][0] === T_CONSTANT_ENCAPSED_STRING) {
-            return [$this->stripQuotes($argTokens[0][1]), false];
+            $value = $this->stripQuotes($argTokens[0][1]);
+            return [$value, false, $value];
         }
-        return ['', true];
+
+        if (
+            isset($argTokens[0], $argTokens[1])
+            && is_array($argTokens[0]) && $argTokens[0][0] === T_CONSTANT_ENCAPSED_STRING
+            && is_string($argTokens[1]) && $argTokens[1] === '.'
+        ) {
+            return ['', true, $this->stripQuotes($argTokens[0][1])];
+        }
+
+        if (
+            isset($argTokens[0], $argTokens[1])
+            && is_string($argTokens[0]) && $argTokens[0] === '"'
+            && is_array($argTokens[1]) && $argTokens[1][0] === T_ENCAPSED_AND_WHITESPACE
+        ) {
+            return ['', true, $argTokens[1][1]];
+        }
+
+        return ['', true, ''];
+    }
+
+    private function nextMeaningfulIsIdentifier(array $tokens, int $i): bool
+    {
+        $j = $i + 1;
+        while (isset($tokens[$j]) && is_array($tokens[$j]) && $tokens[$j][0] === T_WHITESPACE) {
+            $j++;
+        }
+        return isset($tokens[$j]) && is_array($tokens[$j]) && $tokens[$j][0] === T_STRING;
+    }
+
+    private function parseClassDef(array $tokens, int $i, int $line, string $file): ?ClassDef
+    {
+        $j = $i + 1;
+        while (isset($tokens[$j]) && is_array($tokens[$j]) && $tokens[$j][0] === T_WHITESPACE) {
+            $j++;
+        }
+
+        $next = $tokens[$j] ?? null;
+        if (!is_array($next) || $next[0] !== T_STRING) {
+            return null;
+        }
+
+        return new ClassDef($next[1], $next[2] ?? $line, $file);
+    }
+
+    private function isPrecededByNew(array $tokens, int $i): bool
+    {
+        $j = $i - 1;
+        while ($j >= 0 && is_array($tokens[$j]) && $tokens[$j][0] === T_WHITESPACE) {
+            $j--;
+        }
+        return $j >= 0 && is_array($tokens[$j]) && $tokens[$j][0] === T_NEW;
+    }
+
+    /**
+     * Reads the class name following `new` or `instanceof`. Skips non-name cases such as
+     * `new class {}` (anonymous — next token is T_CLASS) and `new static()` (T_STATIC, a
+     * late-static-binding placeholder, not a literal class name).
+     */
+    private function captureClassNameAfter(array $tokens, int $i): ?string
+    {
+        $j = $i + 1;
+        while (isset($tokens[$j]) && is_array($tokens[$j]) && $tokens[$j][0] === T_WHITESPACE) {
+            $j++;
+        }
+
+        $next = $tokens[$j] ?? null;
+        if (!is_array($next) || !in_array($next[0], self::CLASS_NAME_TOKENS, true)) {
+            return null;
+        }
+
+        return $this->shortClassName($next[1]);
+    }
+
+    /**
+     * Reads a comma-separated list of class/interface names after `extends` or `implements`,
+     * e.g. `class A extends B implements C, D`. Stops at the class body's opening brace, the
+     * end of an interface-only declaration, or a following `implements` clause.
+     *
+     * @return list<string>
+     */
+    private function captureClassNameList(array $tokens, int $i): array
+    {
+        $names = [];
+        $j = $i + 1;
+
+        while (isset($tokens[$j])) {
+            $t = $tokens[$j];
+
+            if (is_string($t)) {
+                if ($t === '{' || $t === ';') {
+                    break;
+                }
+                $j++;
+                continue;
+            }
+
+            if ($t[0] === T_WHITESPACE) {
+                $j++;
+                continue;
+            }
+
+            if ($t[0] === T_IMPLEMENTS) {
+                break;
+            }
+
+            if (in_array($t[0], self::CLASS_NAME_TOKENS, true)) {
+                $names[] = $this->shortClassName($t[1]);
+            }
+
+            $j++;
+        }
+
+        return $names;
+    }
+
+    private function shortClassName(string $name): string
+    {
+        $pos = strrpos($name, '\\');
+        return $pos === false ? $name : substr($name, $pos + 1);
     }
 
     private function peekNextMeaningful(array $tokens, int $i): string

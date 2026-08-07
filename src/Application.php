@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace WpSpecter;
 
+use WpSpecter\Analyzer\ClassAnalyzer;
 use WpSpecter\Analyzer\FileAnalyzer;
 use WpSpecter\Analyzer\FunctionAnalyzer;
 use WpSpecter\Analyzer\HookAnalyzer;
@@ -20,7 +21,7 @@ use WpSpecter\Scanner\FileScanner;
 
 class Application
 {
-    private const VERSION = '0.1.0';
+    private const VERSION = '0.2.0';
 
     /** @param list<string> $argv */
     public function run(array $argv): int
@@ -54,7 +55,7 @@ class Application
 
         Scan options:
           --target=<target>      What to scan: theme or plugin (default: auto-detect)
-          --type=<types>         Comma-separated: functions,hooks,templates,files (default: all)
+          --type=<types>         Comma-separated: functions,hooks,templates,files,classes (default: all)
           --stubs=<file>         JSON stubs file to suppress known hooks (see generate-stubs)
           --ignore=<globs>       Comma-separated glob patterns to exclude
           --verbose              Show matched references alongside findings
@@ -219,6 +220,10 @@ class Application
             $findings = array_merge($findings, (new HookAnalyzer($parser))->analyze($allFiles));
         }
 
+        if ($config->wantsType('classes')) {
+            $findings = array_merge($findings, (new ClassAnalyzer($parser))->analyze($allFiles));
+        }
+
         // Templates and files need a specific root to know what's "root-level" and which mode's
         // hierarchy applies, so those run once per target — but still see every target's files
         // when resolving references, for the same cross-target reason as above.
@@ -297,6 +302,7 @@ class Application
         $scanner = new FileScanner();
         $parser = new PhpTokenParser();
         $hooks = [];
+        $prefixes = [];
         $totalFiles = 0;
 
         foreach ($sources as $source) {
@@ -311,18 +317,27 @@ class Application
                 foreach ($result->hookInvocations as $inv) {
                     if (!$inv->isDynamic && $inv->tag !== '') {
                         $hooks[$inv->tag] = true;
+                    } elseif ($inv->isDynamic && $inv->tagPrefix !== '') {
+                        // A dynamic call with a resolvable prefix — e.g. ACF's single
+                        // apply_filters("acf/settings/{$name}", ...) dispatcher — fires every
+                        // hook in that family even though no individual one ever appears as a
+                        // literal string anywhere in the source.
+                        $prefixes[$inv->tagPrefix] = true;
                     }
                 }
             }
         }
 
         ksort($hooks);
+        ksort($prefixes);
         $hookList = array_keys($hooks);
+        $prefixList = array_keys($prefixes);
 
         $data = [
             'generated' => date('Y-m-d'),
             'source'    => count($sources) === 1 ? $sources[0] : $sources,
             'hooks'     => $hookList,
+            'prefixes'  => $prefixList,
         ];
 
         $json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . PHP_EOL;
@@ -332,8 +347,10 @@ class Application
         }
 
         $count = count($hookList);
+        $prefixCount = count($prefixList);
+        $prefixDesc = $prefixCount > 0 ? " and {$prefixCount} dynamic hook prefix(es)" : '';
         $sourceDesc = count($sources) === 1 ? $sources[0] : (count($sources) . ' configured source(s)');
-        echo "Found {$count} hook(s) in {$sourceDesc} ({$totalFiles} files scanned)" . PHP_EOL;
+        echo "Found {$count} hook(s){$prefixDesc} in {$sourceDesc} ({$totalFiles} files scanned)" . PHP_EOL;
         echo "Stubs written to {$output}" . PHP_EOL;
 
         return 0;
@@ -390,7 +407,7 @@ class Application
             } elseif (str_starts_with($arg, '--type=')) {
                 $raw = substr($arg, strlen('--type='));
                 $types = array_filter(array_map('trim', explode(',', $raw)));
-                $valid = ['all', 'functions', 'hooks', 'templates', 'files'];
+                $valid = ['all', 'functions', 'hooks', 'templates', 'files', 'classes'];
                 foreach ($types as $t) {
                     if (!in_array($t, $valid, true)) {
                         throw new \InvalidArgumentException("Unknown type \"{$t}\". Valid: " . implode(', ', $valid));

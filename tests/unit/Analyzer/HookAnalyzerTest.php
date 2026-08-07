@@ -148,6 +148,49 @@ add_filter( 'should_load_separate_core_block_assets', '__return_true' );
         self::assertEmpty($this->analyzer->analyze([$file]));
     }
 
+    // ── dynamic hook dispatchers (interpolated / concatenated tag prefixes) ─
+
+    public function testRegistrationMatchedByDynamicInvocationPrefixInSameProject(): void
+    {
+        // One dynamic dispatcher firing every acf/settings/* hook, ACF's actual shape.
+        $file = $this->write('<?php
+add_filter( "acf/settings/save_json", "handler" );
+function acf_get_setting($name, $value = null) {
+    return apply_filters("acf/settings/{$name}", $value);
+}
+');
+        self::assertEmpty($this->analyzer->analyze([$file]));
+    }
+
+    public function testRegistrationNotMatchedByUnrelatedDynamicPrefix(): void
+    {
+        $file = $this->write('<?php
+add_filter( "acf/other/thing", "handler" );
+function acf_get_setting($name, $value = null) {
+    return apply_filters("acf/settings/{$name}", $value);
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        self::assertCount(1, $findings);
+        self::assertSame('acf/other/thing', $findings[0]->name);
+    }
+
+    public function testCustomStubsPrefixSuppressesHook(): void
+    {
+        // What generate-stubs writes after scanning a vendor plugin whose hooks fire through a
+        // dynamic dispatcher — no exact tags known, only the prefix.
+        $stubsFile = $this->tmp . '/project-stubs.json';
+        file_put_contents($stubsFile, json_encode([
+            'hooks' => [],
+            'prefixes' => ['acf/settings/'],
+        ]));
+        StubRegistry::loadFile($stubsFile);
+
+        $file = $this->write("<?php add_filter( 'acf/settings/save_json', 'handler' );");
+
+        self::assertEmpty($this->analyzer->analyze([$file]));
+    }
+
     // ── custom --stubs file ────────────────────────────────────────────────
 
     public function testCustomStubsFileSuppressesHook(): void

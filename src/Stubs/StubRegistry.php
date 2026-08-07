@@ -37,11 +37,21 @@ final class StubRegistry
 
         // Support both {"hooks": [...]} and a flat array
         $hooks = isset($data['hooks']) && is_array($data['hooks']) ? $data['hooks'] : $data;
+        // Prefixes cover dynamically-dispatched hook families (e.g. ACF's single
+        // apply_filters("acf/settings/{$name}", ...) call site fanning out to every
+        // acf/settings/* hook) — generate-stubs writes these when it finds one, same idea as
+        // the built-in HookStub::prefixes() used for WordPress core.
+        $prefixes = isset($data['prefixes']) && is_array($data['prefixes']) ? $data['prefixes'] : [];
 
         self::build();
         foreach ($hooks as $hook) {
             if (is_string($hook) && $hook !== '') {
                 self::$hookIndex[$hook] = true;
+            }
+        }
+        foreach ($prefixes as $prefix) {
+            if (is_string($prefix) && $prefix !== '') {
+                self::$prefixes[] = $prefix;
             }
         }
     }

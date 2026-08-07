@@ -12,5 +12,9 @@ final class HookInvocation
         public readonly int $line,
         public readonly string $file,
         public readonly bool $isDynamic,
+        // Equals $tag when the tag is fully literal. When $isDynamic, the leading literal
+        // segment of an interpolated string or a concatenation starting with a literal (e.g.
+        // "acf/settings/{$name}" → "acf/settings/") — empty when nothing literal was resolvable.
+        public readonly string $tagPrefix = '',
     ) {}
 }

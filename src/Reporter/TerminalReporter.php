@@ -52,6 +52,8 @@ final class TerminalReporter
             FindingType::UnmatchedHook->value  => [],
             FindingType::UnusedTemplate->value => [],
             FindingType::UnusedFile->value     => [],
+            FindingType::UnusedClass->value    => [],
+            FindingType::UnusedMethod->value   => [],
         ];
 
         foreach ($findings as $finding) {
@@ -63,6 +65,8 @@ final class TerminalReporter
             FindingType::UnmatchedHook->value  => 'Unmatched Hooks',
             FindingType::UnusedTemplate->value => 'Unused Templates',
             FindingType::UnusedFile->value     => 'Unused Files',
+            FindingType::UnusedClass->value    => 'Unused Classes',
+            FindingType::UnusedMethod->value   => 'Unused Methods',
         ];
 
         foreach ($sections as $typeVal => $heading) {
@@ -97,6 +101,8 @@ final class TerminalReporter
             FindingType::UnmatchedHook->value  => 0,
             FindingType::UnusedTemplate->value => 0,
             FindingType::UnusedFile->value     => 0,
+            FindingType::UnusedClass->value    => 0,
+            FindingType::UnusedMethod->value   => 0,
         ];
 
         foreach ($findings as $f) {
@@ -115,6 +121,12 @@ final class TerminalReporter
         }
         if ($counts[FindingType::UnusedFile->value] > 0) {
             $parts[] = $counts[FindingType::UnusedFile->value] . ' unused file(s)';
+        }
+        if ($counts[FindingType::UnusedClass->value] > 0) {
+            $parts[] = $counts[FindingType::UnusedClass->value] . ' unused class(es)';
+        }
+        if ($counts[FindingType::UnusedMethod->value] > 0) {
+            $parts[] = $counts[FindingType::UnusedMethod->value] . ' unused method(s)';
         }
 
         if (empty($parts)) {

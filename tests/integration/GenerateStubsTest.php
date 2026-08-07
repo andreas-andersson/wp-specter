@@ -132,6 +132,64 @@ do_action('hook_two');
         self::assertStringContainsString($output_file, $output);
     }
 
+    public function testDiscoversDynamicHookPrefix(): void
+    {
+        // ACF's real shape: every acf/settings/* filter fires through one dynamic dispatcher,
+        // so no individual tag ever appears as a literal string anywhere in the source.
+        file_put_contents($this->tmp . '/plugin.php', '<?php
+function acf_get_setting($name, $value = null) {
+    return apply_filters("acf/settings/{$name}", $value);
+}
+');
+        $output_file = $this->tmp . '/stubs.json';
+
+        ob_start();
+        $this->app->run(['wp-specter', 'generate-stubs', $this->tmp, "--output={$output_file}"]);
+        ob_get_clean();
+
+        $data = json_decode(file_get_contents($output_file), true);
+        self::assertArrayHasKey('prefixes', $data);
+        self::assertContains('acf/settings/', $data['prefixes']);
+        self::assertEmpty($data['hooks']);
+    }
+
+    public function testStubsFilePrefixSuppressesHooksInScan(): void
+    {
+        // Same scenario as testStubsFileSuppressesHooksInScan, but for a hook family fired only
+        // through a dynamic dispatcher in the "plugin" dir — generate-stubs can only capture a
+        // prefix here, never an exact tag.
+        $themeDir = $this->tmp . '/theme';
+        $pluginDir = $this->tmp . '/plugin';
+        mkdir($themeDir, 0755, true);
+        mkdir($pluginDir, 0755, true);
+
+        file_put_contents($themeDir . '/style.css', "/*\nTheme Name: Test\n*/");
+        file_put_contents($themeDir . '/functions.php', "<?php
+add_filter('acf/settings/save_json', 'my_handler');
+");
+        file_put_contents($pluginDir . '/plugin.php', '<?php
+function acf_get_setting($name, $value = null) {
+    return apply_filters("acf/settings/{$name}", $value);
+}
+');
+
+        $stubsFile = $this->tmp . '/stubs.json';
+        ob_start();
+        $this->app->run(['wp-specter', 'generate-stubs', $pluginDir, "--output={$stubsFile}"]);
+        ob_get_clean();
+
+        ob_start();
+        $this->app->run(['wp-specter', 'scan', $themeDir, '--no-color', '--type=hooks']);
+        $outputWithout = ob_get_clean();
+
+        ob_start();
+        $this->app->run(['wp-specter', 'scan', $themeDir, '--no-color', '--type=hooks', "--stubs={$stubsFile}"]);
+        $outputWith = ob_get_clean();
+
+        self::assertStringContainsString('acf/settings/save_json', $outputWithout);
+        self::assertStringNotContainsString('acf/settings/save_json', $outputWith);
+    }
+
     public function testReturnsErrorForMissingDirectory(): void
     {
         ob_start();
