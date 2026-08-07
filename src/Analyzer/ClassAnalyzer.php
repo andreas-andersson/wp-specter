@@ -96,12 +96,25 @@ final class ClassAnalyzer
      */
     private function findUnusedMethods(array $parseResults, array $classDefsByName): array
     {
-        // Method calls aren't tracked separately from function calls — $obj->method(),
-        // Class::method(), and [$obj, 'method'] callables all land in functionCalls under the
-        // bare method name already (see PhpTokenParser). That also means this match is
-        // name-only, not scoped to the declaring class: two unrelated classes sharing a method
-        // name (e.g. "render") will each look "used" if either one is called anywhere. Warning
-        // certainty (not Error) reflects that lower confidence.
+        // Calls PhpTokenParser could resolve to a concrete receiver class — $this->method(),
+        // self::/parent::/static::method(), and Foo::method() with a literal class name — are
+        // precise: they're never added to the generic $called pool below at all (see
+        // findScopedCallTarget in the parser), so they can't cause an unrelated same-named
+        // method on some other class to look used.
+        $scopedCalled = [];
+        foreach ($parseResults as $result) {
+            foreach ($result->scopedMethodCalls as $call) {
+                $scopedCalled[$call->receiverClass][$call->method] = true;
+            }
+        }
+
+        // Everything else — $obj->method() on a variable of unknown type, [$obj, 'method'] /
+        // [Class::class, 'method'] array callbacks (the common add_action/add_filter shape),
+        // string callbacks — still can't be attributed to a class, so it falls back to the same
+        // name-only pool FunctionAnalyzer uses. This is where the remaining imprecision lives:
+        // two unrelated classes sharing a method name (e.g. "render") will each look "used" if
+        // either is called this way. Warning certainty (not Error) reflects that lower
+        // confidence for whatever a finding's fallback-pool check alone couldn't rule out.
         $called = [];
         foreach ($parseResults as $result) {
             foreach ($result->functionCalls as $call) {
@@ -116,6 +129,7 @@ final class ClassAnalyzer
                     !$def->isMethod
                     || $this->isMagicMethod($def->name)
                     || isset($called[$def->name])
+                    || isset($scopedCalled[$def->ownerClass ?? ''][$def->name])
                     || $this->isContractMethod($def->name, $def->ownerClass, $classDefsByName)
                 ) {
                     continue;

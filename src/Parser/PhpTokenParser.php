@@ -37,20 +37,25 @@ final class PhpTokenParser
         $phpPathStrings = [];
         $classDefs = [];
         $classReferences = [];
+        $scopedMethodCalls = [];
 
         $count = count($tokens);
         $line = 1;
         $skipNextString = false;
 
         // Class context tracking: push brace depth when a class body opens, pop when it closes.
-        // $classNameStack runs in lockstep with $classDepthStack, tracking which class a method
-        // belongs to (null for interface/trait/enum/anonymous-class bodies, which have no
-        // ClassDef) — needed so a method's contract (implements/extends) can be checked later.
+        // $classNameStack and $classParentStack run in lockstep with $classDepthStack, tracking
+        // which class (and its extends[0], for `parent::`) a method belongs to — null for
+        // interface/trait/enum/anonymous-class bodies, which have no ClassDef. Used both for
+        // contract (implements/extends) checks and for resolving $this->/self::/parent::/
+        // static:: calls to a concrete receiver class below.
         $braceDepth = 0;
         $classDepthStack = [];
         $classNameStack = [];
+        $classParentStack = [];
         $expectingClassOpen = false;
         $pendingClassName = null;
+        $pendingClassParent = null;
         // String interpolation `{$var}` and `${var}` emit a STRING "}" token that closes the
         // interpolation but is NOT a code-level brace. Track depth so we skip those.
         $interpolationDepth = 0;
@@ -64,8 +69,10 @@ final class PhpTokenParser
                     if ($expectingClassOpen) {
                         $classDepthStack[] = $braceDepth;
                         $classNameStack[] = $pendingClassName;
+                        $classParentStack[] = $pendingClassParent;
                         $expectingClassOpen = false;
                         $pendingClassName = null;
+                        $pendingClassParent = null;
                     }
                 } elseif ($token === '}') {
                     if ($interpolationDepth > 0) {
@@ -74,6 +81,7 @@ final class PhpTokenParser
                         if (!empty($classDepthStack) && end($classDepthStack) === $braceDepth) {
                             array_pop($classDepthStack);
                             array_pop($classNameStack);
+                            array_pop($classParentStack);
                         }
                         $braceDepth--;
                     }
@@ -111,6 +119,7 @@ final class PhpTokenParser
                     if ($def !== null) {
                         $classDefs[] = $def;
                         $pendingClassName = $def->name;
+                        $pendingClassParent = $def->extends[0] ?? null;
                     }
                 } else {
                     $expectingClassOpen = $this->isPrecededByNew($tokens, $i);
@@ -149,6 +158,38 @@ final class PhpTokenParser
                 continue;
             }
 
+            // $this->method() — the one case where an object's exact class is always known
+            // without any type inference: it's whichever class this code is physically inside.
+            if ($type === T_VARIABLE && $value === '$this') {
+                $target = $this->findScopedCallTarget($tokens, $i);
+                if ($target !== null) {
+                    $receiverClass = empty($classNameStack) ? null : end($classNameStack);
+                    if ($receiverClass !== null) {
+                        [$methodName, $methodNameIndex] = $target;
+                        $scopedMethodCalls[] = new ScopedMethodCall($receiverClass, $methodName);
+                        $i = $methodNameIndex;
+                    }
+                }
+                // No `continue` — $this is used in plenty of other ways (property access,
+                // passed as an argument, ...) that need no special handling here.
+            }
+
+            // static::method() — "static" is its own token (T_STATIC), never T_STRING, so it
+            // can't be reached by the T_STRING branch below the way self:: and parent:: are.
+            if ($type === T_STATIC) {
+                $target = $this->findScopedCallTarget($tokens, $i);
+                if ($target !== null) {
+                    $receiverClass = empty($classNameStack) ? null : end($classNameStack);
+                    if ($receiverClass !== null) {
+                        [$methodName, $methodNameIndex] = $target;
+                        $scopedMethodCalls[] = new ScopedMethodCall($receiverClass, $methodName);
+                        $i = $methodNameIndex;
+                    }
+                }
+                // No `continue` — "static" is also a method/property modifier and a local-variable
+                // keyword ("static function", "static $var") that need no handling here either.
+            }
+
             if ($type === T_STRING) {
                 // Skip the function name token — it's a definition, not a call
                 if ($skipNextString) {
@@ -163,6 +204,22 @@ final class PhpTokenParser
                     // Foo::method(), Foo::CONST, Foo::class, Foo::$prop — whatever comes after
                     // the '::', "Foo" itself is a class reference either way.
                     $classReferences[] = $name;
+
+                    // self::method()/parent::method()/Foo::method() (but not Foo::CONST,
+                    // Foo::class, Foo::$prop — findScopedCallTarget only matches an actual call).
+                    $target = $this->findScopedCallTarget($tokens, $i);
+                    if ($target !== null) {
+                        $receiverClass = match ($name) {
+                            'self' => empty($classNameStack) ? null : end($classNameStack),
+                            'parent' => empty($classParentStack) ? null : end($classParentStack),
+                            default => $name,
+                        };
+                        if ($receiverClass !== null) {
+                            [$methodName, $methodNameIndex] = $target;
+                            $scopedMethodCalls[] = new ScopedMethodCall($receiverClass, $methodName);
+                            $i = $methodNameIndex;
+                        }
+                    }
                     continue;
                 }
 
@@ -244,6 +301,7 @@ final class PhpTokenParser
             phpPathStrings: $phpPathStrings,
             classDefs: $classDefs,
             classReferences: $classReferences,
+            scopedMethodCalls: $scopedMethodCalls,
         );
     }
 
@@ -632,6 +690,58 @@ final class PhpTokenParser
             return is_string($t) ? $t : ($t[1] ?? '');
         }
         return '';
+    }
+
+    private function peekNextMeaningfulIndex(array $tokens, int $i): ?int
+    {
+        $j = $i + 1;
+        while (isset($tokens[$j])) {
+            if (is_array($tokens[$j]) && $tokens[$j][0] === T_WHITESPACE) {
+                $j++;
+                continue;
+            }
+            return $j;
+        }
+        return null;
+    }
+
+    /**
+     * Given the index of a receiver token ($this, self, parent, static, or a class name),
+     * checks whether it's immediately followed by `::` or `->`, an identifier, and a call `(`
+     * — i.e. an actual method call, not e.g. Foo::CONST, Foo::class, Foo::$prop, or $this->prop.
+     * Also guards against non-call uses of the same tokens, like the `static` *modifier* in
+     * `public static function foo()` — that's `static` immediately followed by `function`, not
+     * by `::`, so it must not be mistaken for `static::foo(`.
+     *
+     * @return array{string, int}|null  [method name, its token index] or null if this isn't a call.
+     */
+    private function findScopedCallTarget(array $tokens, int $receiverIndex): ?array
+    {
+        $sepIndex = $this->peekNextMeaningfulIndex($tokens, $receiverIndex);
+        if ($sepIndex === null) {
+            return null;
+        }
+        $sepToken = $tokens[$sepIndex];
+        $sepValue = is_string($sepToken) ? $sepToken : ($sepToken[1] ?? '');
+        if ($sepValue !== '::' && $sepValue !== '->') {
+            return null;
+        }
+
+        $nameIndex = $this->peekNextMeaningfulIndex($tokens, $sepIndex);
+        if ($nameIndex === null) {
+            return null;
+        }
+        $nameToken = $tokens[$nameIndex];
+        if (!is_array($nameToken) || $nameToken[0] !== T_STRING) {
+            return null;
+        }
+
+        $afterIndex = $this->peekNextMeaningfulIndex($tokens, $nameIndex);
+        if ($afterIndex === null || $tokens[$afterIndex] !== '(') {
+            return null;
+        }
+
+        return [$nameToken[1], $nameIndex];
     }
 
     private function stripQuotes(string $value): string

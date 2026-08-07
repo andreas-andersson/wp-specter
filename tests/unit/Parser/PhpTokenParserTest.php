@@ -269,6 +269,67 @@ class My_Widget extends WP_Widget implements Countable {
         self::assertNull($result->functionDefs[0]->ownerClass);
     }
 
+    public function testScopedMethodCallsResolveThisSelfParentStaticAndLiteralClass(): void
+    {
+        $result = $this->parse('<?php
+class Base { public function base_method() {} }
+class Child extends Base {
+    public function self_call() { $this->helper(); }
+    public function helper() {}
+    public static function static_call() { self::other(); }
+    public function other() {}
+    public function calls_parent() { parent::base_method(); }
+    public function calls_late_binding() { static::late_bound(); }
+    public function late_bound() {}
+}
+Child::static_call();
+');
+        $calls = array_map(
+            fn($c) => $c->receiverClass . '::' . $c->method,
+            $result->scopedMethodCalls,
+        );
+
+        self::assertContains('Child::helper', $calls);
+        self::assertContains('Child::other', $calls);
+        self::assertContains('Base::base_method', $calls);
+        self::assertContains('Child::late_bound', $calls);
+        self::assertContains('Child::static_call', $calls);
+
+        // None of these should also land in the generic, unscoped call pool — that would
+        // defeat the point of scoping (an unrelated class's same-named method would still
+        // look "used").
+        self::assertEmpty($result->functionCalls);
+    }
+
+    public function testStaticModifierIsNotMistakenForStaticCall(): void
+    {
+        // "static" here is the method-visibility modifier, not `static::` late static binding —
+        // must not be swallowed as part of a bogus scoped call, which would eat the actual
+        // function definition tokens that follow.
+        $result = $this->parse('<?php
+class MyPlugin {
+    public static function enqueue() {}
+}
+');
+        $names = array_column($result->functionDefs, 'name');
+        self::assertContains('enqueue', $names);
+        self::assertEmpty($result->scopedMethodCalls);
+    }
+
+    public function testPropertyAccessAndClassConstAreNotScopedCalls(): void
+    {
+        $result = $this->parse('<?php
+class My_Class {
+    public function boot() {
+        $x = $this->property;
+        $y = self::CONST_VALUE;
+        $z = My_Class::class;
+    }
+}
+');
+        self::assertEmpty($result->scopedMethodCalls);
+    }
+
     public function testStringInterpolationDoesNotCorruptClassContext(): void
     {
         // "{{$k}}" emits a STRING "}" from the interpolation — must not corrupt brace depth.

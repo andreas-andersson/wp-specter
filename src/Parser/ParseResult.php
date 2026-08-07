@@ -15,6 +15,7 @@ final class ParseResult
      * @param list<string>          $phpPathStrings
      * @param list<ClassDef>        $classDefs
      * @param list<string>          $classReferences
+     * @param list<ScopedMethodCall> $scopedMethodCalls
      */
     public function __construct(
         public readonly string $file,
@@ -26,6 +27,7 @@ final class ParseResult
         public readonly array $phpPathStrings = [],
         public readonly array $classDefs = [],
         public readonly array $classReferences = [],
+        public readonly array $scopedMethodCalls = [],
         public readonly ?string $error = null,
     ) {}
 }

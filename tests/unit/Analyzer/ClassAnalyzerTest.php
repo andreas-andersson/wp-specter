@@ -154,6 +154,88 @@ add_action("init", [My_Class::class, "static_callback_method"]);
         self::assertEmpty(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod));
     }
 
+    // ── class-scoped call matching ──────────────────────────────────────────
+
+    public function testClassScopedMatchingDoesNotLeakBetweenUnrelatedClasses(): void
+    {
+        // Both classes declare a "render" method. Used_Service's is genuinely called (via
+        // $this->), Dead_Service's never is — before class-scoped matching, the bare-name
+        // "render" call would have suppressed both findings; now only the real one is used.
+        $file = $this->write('<?php
+class Used_Service {
+    public function boot() { $this->render(); }
+    public function render() {}
+}
+class Dead_Service {
+    public function boot() {}
+    public function render() {}
+}
+$s = new Used_Service();
+$s->boot();
+$d = new Dead_Service();
+$d->boot();
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertContains('render', $unusedMethods);
+        self::assertCount(1, $unusedMethods, 'Only Dead_Service::render should be flagged, not Used_Service::render');
+    }
+
+    public function testDoesNotReportMethodCalledViaSelf(): void
+    {
+        // "boot" itself is never called anywhere in this fixture, so it's legitimately
+        // reported too — only "helper" (called via self::) is under test here.
+        $file = $this->write('<?php
+class My_Class {
+    public function boot() { self::helper(); }
+    public static function helper() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('helper', $unusedMethods);
+    }
+
+    public function testDoesNotReportMethodCalledViaStaticLateBinding(): void
+    {
+        $file = $this->write('<?php
+class My_Class {
+    public function boot() { static::helper(); }
+    public static function helper() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('helper', $unusedMethods);
+    }
+
+    public function testDoesNotReportParentMethodCalledViaParentKeyword(): void
+    {
+        $file = $this->write('<?php
+class Base_Class {
+    public function base_helper() {}
+}
+class Child_Class extends Base_Class {
+    public function boot() { parent::base_helper(); }
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('base_helper', $unusedMethods);
+    }
+
+    public function testDoesNotReportMethodCalledViaLiteralClassName(): void
+    {
+        $file = $this->write('<?php
+class My_Class {
+    public static function helper() {}
+}
+My_Class::helper();
+');
+        $findings = $this->analyzer->analyze([$file]);
+        self::assertEmpty(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod));
+    }
+
     public function testExcludesWpWidgetContractMethods(): void
     {
         // WP core calls widget()/form()/update() by reflection on any WP_Widget subclass —

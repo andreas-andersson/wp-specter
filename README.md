@@ -225,9 +225,11 @@ A class only ever instantiated dynamically (`$class = 'Foo'; new $class()`) or r
 
 ### Unused methods
 
-Class methods that are never called by name anywhere in the scanned directory — `$obj->method()`, `Class::method()`, and `[$obj, 'method']` / `[Class::class, 'method']` callables (the common `add_action`/`add_filter` callback shape) all count as a call.
+Class methods that are never called anywhere in the scanned directory.
 
-This match is by method name only, not scoped to a specific object's type — two unrelated classes that happen to share a method name (e.g. `render()`) will each look "used" if either one is called anywhere. Findings are reported at `Warning` certainty (not `Error`) to reflect that lower confidence.
+Calls with a statically-known receiver are matched *per class*, not just by name: `$this->method()`, `self::method()`, `parent::method()`, `static::method()`, and `Class::method()` with a literal class name all resolve to a specific declaring class. Two unrelated classes that happen to share a method name (e.g. `render()`) no longer suppress each other's findings just because one of them is called this way.
+
+Everything else — `$obj->method()` on a variable of unknown type, `[$obj, 'method']` / `[Class::class, 'method']` callables (the common `add_action`/`add_filter` callback shape), and string callbacks — can't be attributed to a class, so it still falls back to a name-only match across the whole scanned directory. That's the remaining source of imprecision, and why findings are reported at `Warning` certainty (not `Error`): a method that looks unused might still be reachable through one of these unscoped paths.
 
 Magic methods (`__construct`, `__toString`, etc.) are always excluded. Methods required by a handful of common contracts are excluded too, but only when the *declaring* class itself directly `implements`/`extends` that contract — not further up an inheritance chain:
 
