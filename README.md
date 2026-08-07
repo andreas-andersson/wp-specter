@@ -1,4 +1,4 @@
-# wp-specter
+# WP Specter
 
 Static analysis tool for WordPress projects. Finds unused functions, unmatched hooks, unreferenced templates, and orphaned PHP files — without needing a running WordPress installation.
 
