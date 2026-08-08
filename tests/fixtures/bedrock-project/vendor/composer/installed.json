@@ -1,0 +1,10 @@
+{
+    "packages": [
+        {
+            "name": "wpackagist-theme/vendor-theme",
+            "version": "1.0.0",
+            "type": "wordpress-theme",
+            "install-path": "../../web/app/themes/vendor-theme"
+        }
+    ]
+}
