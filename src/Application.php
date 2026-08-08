@@ -22,7 +22,7 @@ use WpSpecter\Stubs\StubRegistry;
 
 class Application
 {
-    private const VERSION = '0.2.0';
+    private const VERSION = '0.2.2';
 
     /** @param list<string> $argv */
     public function run(array $argv): int

@@ -74,7 +74,7 @@ Found: 3 unused function(s), 1 unmatched hook(s), 3 unused file(s), 1 unused cla
 
 ## Requirements
 
-- PHP 8.1 or higher
+- PHP 8.4 or higher
 - Composer
 
 ## Installation
