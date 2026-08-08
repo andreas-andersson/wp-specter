@@ -243,7 +243,7 @@ class Application
             }
         }
 
-        $reporter->printFindings($findings, $config->verbose);
+        $reporter->printFindings($findings, $config->verbose, $targets);
         $reporter->printSummary($findings);
 
         return empty($findings) ? 0 : 1;
@@ -486,7 +486,7 @@ class Application
 
     private function error(string $message): int
     {
-        fwrite(STDERR, "Error: {$message}" . PHP_EOL);
+        echo("Error: {$message}" . PHP_EOL);
         return 2;
     }
 }

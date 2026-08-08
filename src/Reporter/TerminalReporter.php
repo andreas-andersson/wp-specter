@@ -16,30 +16,32 @@ final class TerminalReporter
 
     public function printHeader(string $path, ?WpMode $mode, int $fileCount): void
     {
-        $this->line($this->bold('wp-specter') . ' — WordPress unused code scanner');
-        $this->line('');
-        $this->line('  Path:   ' . $path);
-        $this->line('  Mode:   ' . ($mode?->label() ?? 'unknown'));
-        $this->line('  Files:  ' . $fileCount . ' PHP files scanned');
+        $this->line($this->bold('WP-Specter'));
+        $this->line($this->dim('  Path:   ' . $path));
+        $this->line($this->dim('  Mode:   ' . ($mode?->label() ?? 'unknown')));
+        $this->line($this->dim('  Files:  ' . $fileCount . ' PHP files scanned'));
         $this->line('');
     }
 
     /** @param list<ScanTarget> $targets */
     public function printProjectHeader(string $projectRoot, array $targets, int $fileCount, string $sourceLabel, string $targetsNote): void
     {
-        $this->line($this->bold('wp-specter') . ' — WordPress unused code scanner');
-        $this->line('');
-        $this->line('  Project: ' . $projectRoot . $this->dim('  (' . $sourceLabel . ')'));
-        $this->line('  Targets: ' . count($targets) . ' ' . $targetsNote);
+        $this->line($this->bold('WP-Specter'));
+        $this->line($this->dim('  Project: ' . $projectRoot . '  (' . $sourceLabel . ')'));
+        $this->line($this->dim('  Targets: ' . count($targets) . ' ' . $targetsNote));
         foreach ($targets as $target) {
-            $this->line('    - ' . $target->name . $this->dim('  (' . ($target->mode?->label() ?? 'unknown') . ')'));
+            $this->line($this->dim('    - ' . $target->name . '  (' . ($target->mode?->label() ?? 'unknown') . ')'));
         }
-        $this->line('  Files:   ' . $fileCount . ' PHP files scanned');
+        $this->line($this->dim('  Files:   ' . $fileCount . ' PHP files scanned'));
         $this->line('');
     }
 
-    /** @param list<Finding> $findings */
-    public function printFindings(array $findings, bool $verbose = false): void
+    /**
+     * @param list<Finding> $findings
+     * @param bool $verbose Whether to print verbose output (currently unused)
+     * @param list<ScanTarget> $targets The list of scan targets
+     * */
+    public function printFindings(array $findings, bool $verbose = false, array $targets = []): void
     {
         if (empty($findings)) {
             $this->line($this->green('  ✓ No issues found.'));
@@ -82,12 +84,22 @@ final class TerminalReporter
                     ? $this->red('✗')
                     : $this->yellow('⚠');
 
-                $location = $this->dim($finding->file . ':' . $finding->line);
+                $location = $finding->file . ':' . $finding->line;
                 $name     = $this->bold($finding->name);
                 $note     = $finding->note ? $this->dim('  // ' . $finding->note) : '';
 
+                $relativePath = $this->dim($location);
+                foreach ($targets as $target) {
+                    $parts = explode(DIRECTORY_SEPARATOR, $target->path);
+                    $pathName = array_pop($parts);
+                    if (str_starts_with($finding->file, $target->path)) {
+                        $relativePath = $this->dim($pathName . str_replace($target->path, '', $finding->file) . ':' . $finding->line);
+                        break;
+                    }
+                }
+
                 $this->line("  {$icon}  {$name}{$note}");
-                $this->line("     {$location}");
+                $this->line("     {$relativePath}");
                 $this->line('');
             }
         }
