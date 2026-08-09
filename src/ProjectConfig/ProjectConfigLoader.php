@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace WpSpecter\ProjectConfig;
 
+use WpSpecter\Support\GlobExpander;
 use WpSpecter\Support\PathWalker;
 
 /**
@@ -37,8 +38,9 @@ final class ProjectConfigLoader
         $stubsPath = isset($data['stubs']) && is_string($data['stubs']) && $data['stubs'] !== ''
             ? $this->resolvePath($data['stubs'], $dir)
             : null;
+        $baseline = $this->parseBaseline($data['baseline'] ?? null);
 
-        return new ProjectConfig($dir, $targets, $stubsFrom, $stubsPath);
+        return new ProjectConfig($dir, $targets, $stubsFrom, $stubsPath, $baseline);
     }
 
     /** Walk upward from $path looking for the default `.wp-specter.stubs.json` convention file. */
@@ -48,7 +50,14 @@ final class ProjectConfigLoader
         return $dir !== null ? $dir . '/' . self::STUBS_FILENAME : null;
     }
 
-    /** @return list<string>|null */
+    /**
+     * A "targets"/"stubsFrom" entry may be a glob pattern (e.g. "plugins/custom-*") — expanded
+     * fresh on every load, so a new directory matching an already-declared pattern is picked up
+     * automatically with no config change needed. A pattern matching nothing contributes no
+     * entries; that's a normal state (e.g. no custom plugins yet), not an error.
+     *
+     * @return list<string>|null
+     */
     private function resolvePathList(mixed $value, string $baseDir): ?array
     {
         if (!is_array($value)) {
@@ -56,9 +65,15 @@ final class ProjectConfigLoader
         }
         $resolved = [];
         foreach ($value as $entry) {
-            if (is_string($entry) && $entry !== '') {
-                $resolved[] = $this->resolvePath($entry, $baseDir);
+            if (!is_string($entry) || $entry === '') {
+                continue;
             }
+            $absolute = str_starts_with($entry, '/') ? $entry : $baseDir . '/' . $entry;
+            if (GlobExpander::containsWildcard($entry)) {
+                array_push($resolved, ...GlobExpander::expandDirs($absolute));
+                continue;
+            }
+            $resolved[] = realpath($absolute) ?: rtrim($absolute, '/');
         }
         return $resolved;
     }
@@ -67,5 +82,24 @@ final class ProjectConfigLoader
     {
         $absolute = str_starts_with($path, '/') ? $path : $baseDir . '/' . $path;
         return realpath($absolute) ?: rtrim($absolute, '/');
+    }
+
+    /** @return list<BaselineEntry> */
+    private function parseBaseline(mixed $value): array
+    {
+        if (!is_array($value)) {
+            return [];
+        }
+        $entries = [];
+        foreach ($value as $entry) {
+            if (
+                is_array($entry)
+                && isset($entry['type'], $entry['name'], $entry['file'])
+                && is_string($entry['type']) && is_string($entry['name']) && is_string($entry['file'])
+            ) {
+                $entries[] = new BaselineEntry($entry['type'], $entry['name'], $entry['file']);
+            }
+        }
+        return $entries;
     }
 }

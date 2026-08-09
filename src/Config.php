@@ -18,6 +18,8 @@ final class Config
         public readonly ?string $stubs,
         public readonly bool $verbose,
         public readonly bool $noColor,
+        public readonly bool $generateConfig = false,
+        public readonly bool $generateBaseline = false,
     ) {}
 
     public function wantsType(string $type): bool

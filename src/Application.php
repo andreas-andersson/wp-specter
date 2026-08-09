@@ -12,13 +12,18 @@ use WpSpecter\Analyzer\TemplateAnalyzer;
 use WpSpecter\Composer\ComposerProjectDetector;
 use WpSpecter\Detector\WpModeDetector;
 use WpSpecter\Enum\WpMode;
+use WpSpecter\Finding\Finding;
 use WpSpecter\Parser\PhpTokenParser;
+use WpSpecter\ProjectConfig\BaselineEntry;
+use WpSpecter\ProjectConfig\ProjectConfig;
 use WpSpecter\ProjectConfig\ProjectConfigLoader;
+use WpSpecter\ProjectConfig\ProjectConfigWriter;
 use WpSpecter\Reporter\TerminalReporter;
 use WpSpecter\Scan\ProjectInfo;
 use WpSpecter\Scan\ScanTarget;
 use WpSpecter\Scanner\FileScanner;
 use WpSpecter\Stubs\StubRegistry;
+use WpSpecter\Support\GlobExpander;
 
 class Application
 {
@@ -52,7 +57,9 @@ class Application
           wp-specter version
 
         Arguments:
-          path                   Path to a theme or plugin directory (default: current directory)
+          path                   Path to a theme or plugin directory (default: current directory).
+                                  May be a glob pattern (e.g. "plugins/custom-*", quoted so your
+                                  shell doesn't expand it first) to scan every matching directory.
 
         Scan options:
           --target=<target>      What to scan: theme or plugin (default: auto-detect)
@@ -61,13 +68,22 @@ class Application
           --ignore=<globs>       Comma-separated glob patterns to exclude
           --verbose              Show matched references alongside findings
           --no-color             Disable ANSI color output
+          --generate-config      Write resolved scan targets to .wp-specter.config.json and exit.
+                                  Written to the composer project root if detected, else to the
+                                  current directory — run this from your project root, not from
+                                  inside the scanned theme/plugin directory.
+          --generate-baseline    Save current findings as suppressions in .wp-specter.config.json
+                                  and exit (requires --generate-config to have run first)
 
         Generate-stubs options:
           --output=<file>        Output path for the stubs file (default: wp-specter-stubs.json)
           (with no <path>, uses "stubsFrom" from .wp-specter.config.json if present)
 
         Project files (auto-discovered by walking upward from <path>):
-          .wp-specter.config.json   "targets" (exact dirs to scan) and "stubsFrom" (see above)
+          .wp-specter.config.json   "targets" (dirs to scan) and "stubsFrom" (see above) — either
+                                    may include glob patterns (e.g. "plugins/custom-*"), expanded
+                                    fresh on every run — and "baseline" (findings suppressed via
+                                    --generate-baseline)
           .wp-specter.stubs.json    auto-loaded by scan, same as passing --stubs=
 
         Exit codes:
@@ -95,21 +111,34 @@ class Application
             return $this->error($e->getMessage());
         }
 
-        if (!is_dir($config->path)) {
+        $isGlobPath = GlobExpander::containsWildcard($config->path);
+        // A glob pattern isn't itself a real directory to check/walk from — anchor upward
+        // searches (project-config discovery, composer.json detection) at its longest literal
+        // leading segment instead, which is guaranteed to exist even if the pattern currently
+        // matches zero directories.
+        $configSearchPath = $isGlobPath ? GlobExpander::baseDir($config->path) : $config->path;
+
+        if (!$isGlobPath && !is_dir($config->path)) {
             return $this->error("Path does not exist or is not a directory: {$config->path}");
         }
 
         $configLoader = new ProjectConfigLoader();
         try {
-            $projectConfig = $configLoader->load($config->path);
+            $projectConfig = $configLoader->load($configSearchPath);
         } catch (\RuntimeException $e) {
             return $this->error($e->getMessage());
+        }
+
+        if ($config->generateBaseline && $projectConfig === null) {
+            return $this->error(
+                'No ' . ProjectConfigLoader::CONFIG_FILENAME . ' found. Run with --generate-config first.'
+            );
         }
 
         // Stubs load additively: the project convention file (or the config's override of it),
         // then whatever --stubs= adds on top. Order doesn't matter — loadFile only ever adds
         // suppressions, never removes any.
-        $autoStubsPath = $projectConfig->stubsPath ?? $configLoader->findDefaultStubsFile($config->path);
+        $autoStubsPath = $projectConfig->stubsPath ?? $configLoader->findDefaultStubsFile($configSearchPath);
         if ($autoStubsPath !== null) {
             try {
                 StubRegistry::loadFile($autoStubsPath);
@@ -133,9 +162,32 @@ class Application
         // misclassify the entire tree as one giant "theme". Composer detection sidesteps that:
         // it only trusts what composer.json + vendor/composer/installed.json actually say.
         $projectInfo = null;
+        $composerRoot = null;
         $targets = null;
 
-        if ($config->target === null) {
+        if ($isGlobPath) {
+            // An explicit wildcard on the CLI is the most explicit possible target declaration
+            // — scan exactly what it matches, bypassing config-declared targets and composer
+            // auto-discovery entirely (same tier as, and even more deliberate than, the
+            // .wp-specter.config.json-targets case below).
+            $matches = GlobExpander::expandDirs($config->path);
+            if (empty($matches)) {
+                return $this->error("No directories matched pattern: {$config->path}");
+            }
+            $targets = array_map(
+                fn(string $dir) => new ScanTarget(basename($dir), $dir, $modeDetector->detect($dir)),
+                $matches,
+            );
+            // Still worth detecting a real composer root here (for --generate-config to prefer
+            // over cwd) — a wildcard match can perfectly well live inside a composer-managed
+            // project even though it wasn't reached via composer auto-discovery.
+            $composerRoot = (new ComposerProjectDetector($modeDetector))->findProjectRoot($configSearchPath);
+            $projectInfo = new ProjectInfo(
+                $composerRoot ?? $configSearchPath,
+                'matched by CLI wildcard',
+                'dir(s) matching "' . basename($config->path) . '"',
+            );
+        } elseif ($config->target === null) {
             // An explicit .wp-specter.config.json targets list is a deliberate choice — it wins
             // over composer auto-discovery, not just heuristics.
             if ($projectConfig !== null && !empty($projectConfig->targets)) {
@@ -164,6 +216,7 @@ class Application
                 $projectDetector = new ComposerProjectDetector($modeDetector);
                 $root = $projectDetector->findProjectRoot($config->path);
                 if ($root !== null) {
+                    $composerRoot = $root;
                     $discovered = $projectDetector->discoverCustomTargets($root);
                     $matched = $this->findExactTarget($discovered, $config->path);
                     if ($matched !== null) {
@@ -186,6 +239,10 @@ class Application
         if ($targets === null) {
             $mode = $this->resolveMode($config, $modeDetector);
             $targets = [new ScanTarget(basename($config->path), $config->path, $mode)];
+        }
+
+        if ($config->generateConfig) {
+            return $this->writeGeneratedConfig($targets, $projectConfig, $composerRoot, $isGlobPath ? $config->path : null);
         }
 
         $scanner = new FileScanner();
@@ -243,10 +300,123 @@ class Application
             }
         }
 
+        if ($config->generateBaseline) {
+            // Guaranteed non-null: the earlier "$config->generateBaseline && $projectConfig
+            // === null" guard already returned if a config file wasn't found.
+            return $this->writeGeneratedBaseline($projectConfig, $findings);
+        }
+
+        $suppressedCount = 0;
+        if ($projectConfig !== null && !empty($projectConfig->baseline)) {
+            [$findings, $suppressedCount] = $this->applyBaseline($findings, $projectConfig);
+        }
+
         $reporter->printFindings($findings, $config->verbose, $targets);
-        $reporter->printSummary($findings);
+        $reporter->printSummary($findings, $suppressedCount);
 
         return empty($findings) ? 0 : 1;
+    }
+
+    /** @param list<ScanTarget> $targets */
+    private function writeGeneratedConfig(array $targets, ?ProjectConfig $projectConfig, ?string $composerRoot, ?string $globPattern): int
+    {
+        if ($projectConfig !== null) {
+            return $this->error(
+                ProjectConfigLoader::CONFIG_FILENAME . ' already exists at ' . $projectConfig->configDir
+                . ' — edit it directly, or remove it first to regenerate.'
+            );
+        }
+
+        // A detected composer project root (found via composer.json/vendor detection) is an
+        // authoritative anchor — prefer it over cwd, since every target (composer-discovered or
+        // matched by a CLI wildcard) necessarily lives under it already. Otherwise default to
+        // cwd, matching how most CLI tools (phpstan, eslint, ...) resolve their config file —
+        // but only when cwd is actually an ancestor of every scanned target: ProjectConfigLoader
+        // only ever walks *upward* from a scan path to find the config, so writing it anywhere
+        // else makes it permanently undiscoverable on the next run.
+        if ($composerRoot !== null) {
+            $writeDir = $composerRoot;
+        } else {
+            try {
+                $writeDir = $this->requireCwd();
+            } catch (\RuntimeException $e) {
+                return $this->error($e->getMessage());
+            }
+            foreach ($targets as $target) {
+                if (!$this->isAncestorOrSame($writeDir, $target->path)) {
+                    return $this->error(
+                        'Cannot write ' . ProjectConfigLoader::CONFIG_FILENAME . " to the current directory ({$writeDir}) "
+                        . "— it is not an ancestor of the scanned path ({$target->path}). Run this command from the "
+                        . 'project root (an ancestor of everything you scan).'
+                    );
+                }
+            }
+        }
+
+        // A wildcard CLI path is written back as the pattern itself, not the directories it
+        // happens to match right now — that's the entire point of supporting it here: a
+        // custom-* plugin added next month gets picked up on the next scan with no config
+        // change needed, instead of freezing today's snapshot.
+        $writer = new ProjectConfigWriter();
+        if ($globPattern !== null) {
+            $writer->writeTargets($writeDir, [$globPattern]);
+            $count = count($targets);
+            echo "Config written to {$writeDir}/" . ProjectConfigLoader::CONFIG_FILENAME
+                . " (pattern matching {$count} target(s) currently)." . PHP_EOL;
+        } else {
+            $writer->writeTargets($writeDir, array_map(fn(ScanTarget $t) => $t->path, $targets));
+            $count = count($targets);
+            echo "Config written to {$writeDir}/" . ProjectConfigLoader::CONFIG_FILENAME . " ({$count} target(s))." . PHP_EOL;
+        }
+
+        return 0;
+    }
+
+    private function isAncestorOrSame(string $ancestor, string $path): bool
+    {
+        $ancestor = rtrim($ancestor, '/');
+        return $path === $ancestor || str_starts_with($path, $ancestor . '/');
+    }
+
+    /** @param list<Finding> $findings */
+    private function writeGeneratedBaseline(ProjectConfig $projectConfig, array $findings): int
+    {
+        $entries = array_map(
+            fn(Finding $f) => new BaselineEntry($f->type->value, $f->name, BaselineEntry::relativize($f->file, $projectConfig->configDir)),
+            $findings,
+        );
+
+        (new ProjectConfigWriter())->writeBaseline($projectConfig->configDir, $entries);
+
+        $count = count($entries);
+        echo "Baseline written to {$projectConfig->configDir}/" . ProjectConfigLoader::CONFIG_FILENAME . " ({$count} finding(s))." . PHP_EOL;
+
+        return 0;
+    }
+
+    /**
+     * @param list<Finding> $findings
+     * @return array{0: list<Finding>, 1: int}
+     */
+    private function applyBaseline(array $findings, ProjectConfig $projectConfig): array
+    {
+        $kept = [];
+        $suppressed = 0;
+        foreach ($findings as $finding) {
+            $isBaselined = false;
+            foreach ($projectConfig->baseline as $entry) {
+                if ($entry->matches($finding, $projectConfig->configDir)) {
+                    $isBaselined = true;
+                    break;
+                }
+            }
+            if ($isBaselined) {
+                $suppressed++;
+            } else {
+                $kept[] = $finding;
+            }
+        }
+        return [$kept, $suppressed];
     }
 
     /** @param list<string> $args */
@@ -402,6 +572,8 @@ class Application
         $stubs = null;
         $verbose = false;
         $noColor = false;
+        $generateConfig = false;
+        $generateBaseline = false;
 
         foreach ($args as $arg) {
             if (str_starts_with($arg, '--stubs=')) {
@@ -427,6 +599,10 @@ class Application
                 $verbose = true;
             } elseif ($arg === '--no-color') {
                 $noColor = true;
+            } elseif ($arg === '--generate-config') {
+                $generateConfig = true;
+            } elseif ($arg === '--generate-baseline') {
+                $generateBaseline = true;
             } elseif (!str_starts_with($arg, '--')) {
                 $path = $arg;
             } else {
@@ -434,16 +610,33 @@ class Application
             }
         }
 
-        $cwd = $path ?? $this->requireCwd();
+        if ($generateConfig && $generateBaseline) {
+            throw new \InvalidArgumentException('--generate-config and --generate-baseline cannot be used together.');
+        }
+
+        $cwd = $this->requireCwd();
+        $resolvedPath = $path ?? $cwd;
+        if (GlobExpander::containsWildcard($resolvedPath)) {
+            // realpath() can't resolve a path containing wildcard metacharacters — just anchor
+            // it to an absolute path so the glob() call in runScan() is unambiguous regardless
+            // of the process's cwd by the time it runs.
+            if (!str_starts_with($resolvedPath, '/')) {
+                $resolvedPath = $cwd . '/' . $resolvedPath;
+            }
+        } else {
+            $resolvedPath = realpath($resolvedPath) ?: $resolvedPath;
+        }
 
         return new Config(
-            path: realpath($cwd) ?: $cwd,
+            path: $resolvedPath,
             target: $target,
             types: array_values($types),
             ignoreGlobs: array_values($ignoreGlobs),
             stubs: $stubs,
             verbose: $verbose,
             noColor: $noColor,
+            generateConfig: $generateConfig,
+            generateBaseline: $generateBaseline,
         );
     }
 

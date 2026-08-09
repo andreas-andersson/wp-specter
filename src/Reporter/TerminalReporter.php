@@ -108,7 +108,7 @@ final class TerminalReporter
     }
 
     /** @param list<Finding> $findings */
-    public function printSummary(array $findings): void
+    public function printSummary(array $findings, int $suppressedCount = 0): void
     {
         $counts = [
             FindingType::UnusedFunction->value => 0,
@@ -147,6 +147,9 @@ final class TerminalReporter
             $this->line($this->green('✓ All clear.'));
         } else {
             $this->line($this->red('Found: ') . implode(', ', $parts));
+        }
+        if ($suppressedCount > 0) {
+            $this->line($this->dim("{$suppressedCount} finding(s) suppressed by baseline"));
         }
         $this->line('');
     }

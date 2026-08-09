@@ -15,11 +15,13 @@ final class ProjectConfig
      *   with no explicit path.
      * @param string|null $stubsPath Absolute path to the project's stubs file, if the config
      *   overrides the default `.wp-specter.stubs.json` convention.
+     * @param list<BaselineEntry> $baseline Findings suppressed via `--generate-baseline`.
      */
     public function __construct(
         public readonly string $configDir,
         public readonly ?array $targets,
         public readonly ?array $stubsFrom,
         public readonly ?string $stubsPath,
+        public readonly array $baseline = [],
     ) {}
 }
