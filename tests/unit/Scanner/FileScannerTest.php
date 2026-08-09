@@ -68,6 +68,30 @@ final class FileScannerTest extends TestCase
         self::assertStringContainsString('functions.php', $result->files[0]);
     }
 
+    public function testExcludeDirsPruned(): void
+    {
+        $this->touch('functions.php');
+        $this->touch('tests/FooTest.php');
+        $this->touch('nested/tests/BarTest.php');
+
+        $result = $this->scanner->scan($this->tmp, [], ['tests']);
+
+        self::assertCount(1, $result->files);
+        self::assertStringContainsString('functions.php', $result->files[0]);
+    }
+
+    public function testExcludeDirsAdditiveWithDefaults(): void
+    {
+        $this->touch('functions.php');
+        $this->touch('vendor/autoload.php');
+        $this->touch('tests/FooTest.php');
+
+        $result = $this->scanner->scan($this->tmp, [], ['tests']);
+
+        self::assertCount(1, $result->files);
+        self::assertStringContainsString('functions.php', $result->files[0]);
+    }
+
     public function testNonPhpFilesExcluded(): void
     {
         $this->touch('functions.php');

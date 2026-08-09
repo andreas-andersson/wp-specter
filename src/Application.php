@@ -82,8 +82,9 @@ class Application
         Project files (auto-discovered by walking upward from <path>):
           .wp-specter.config.json   "targets" (dirs to scan) and "stubsFrom" (see above) — either
                                     may include glob patterns (e.g. "plugins/custom-*"), expanded
-                                    fresh on every run — and "baseline" (findings suppressed via
-                                    --generate-baseline)
+                                    fresh on every run — "exclude" (directory names/relative paths
+                                    pruned from every scan, e.g. ["tests", "vendor"]) — and
+                                    "baseline" (findings suppressed via --generate-baseline)
           .wp-specter.stubs.json    auto-loaded by scan, same as passing --stubs=
 
         Exit codes:
@@ -252,7 +253,7 @@ class Application
                 $allFiles = array_merge($allFiles, $this->applyIgnoreGlobs($target->files, $config->ignoreGlobs));
                 continue;
             }
-            $scanResult = $scanner->scan($target->path, $config->ignoreGlobs);
+            $scanResult = $scanner->scan($target->path, $config->ignoreGlobs, $projectConfig->exclude ?? []);
             if ($scanResult->error !== null) {
                 return $this->error($scanResult->error);
             }
@@ -436,6 +437,7 @@ class Application
         }
 
         $sources = [];
+        $projectConfig = null;
 
         if ($path !== null) {
             $resolved = realpath($path) ?: $path;
@@ -483,7 +485,7 @@ class Application
         $totalFiles = 0;
 
         foreach ($sources as $source) {
-            $scanResult = $scanner->scan($source);
+            $scanResult = $scanner->scan($source, [], $projectConfig->exclude ?? []);
             if ($scanResult->error !== null) {
                 return $this->error($scanResult->error);
             }

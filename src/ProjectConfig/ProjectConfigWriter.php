@@ -55,7 +55,7 @@ final class ProjectConfigWriter
     private function writeRaw(string $configDir, array $data): void
     {
         $ordered = [];
-        foreach (['targets', 'stubsFrom', 'stubs', 'baseline'] as $key) {
+        foreach (['targets', 'stubsFrom', 'stubs', 'exclude', 'baseline'] as $key) {
             if (array_key_exists($key, $data)) {
                 $ordered[$key] = $data[$key];
             }

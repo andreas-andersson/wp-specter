@@ -144,7 +144,7 @@ After resolving the scan target(s):
 
 Two optional, auto-discovered files (walking upward from the scanned path, same convention as `composer.json`):
 
-- **`.wp-specter.config.json`** — `targets` (exact theme/plugin dirs to scan, overrides auto-detection when scanning the project as a whole), `stubsFrom` (dirs `generate-stubs` scans with no path argument), `stubs` (override for where the project stubs file lives).
+- **`.wp-specter.config.json`** — `targets` (exact theme/plugin dirs to scan, overrides auto-detection when scanning the project as a whole), `stubsFrom` (dirs `generate-stubs` scans with no path argument), `stubs` (override for where the project stubs file lives), `exclude` (directory names/relative paths pruned from every scan and `generate-stubs` run, on top of the always-on vendor/node_modules/.git defaults — not resolved to absolute paths, so a bare name like `"tests"` matches under any scanned target).
 - **`.wp-specter.stubs.json`** — what `generate-stubs` writes (`hooks` + `prefixes`); auto-loaded by `scan` with no flag needed, additive with an explicit `--stubs=`.
 
 ---

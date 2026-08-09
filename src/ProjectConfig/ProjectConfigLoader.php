@@ -39,8 +39,9 @@ final class ProjectConfigLoader
             ? $this->resolvePath($data['stubs'], $dir)
             : null;
         $baseline = $this->parseBaseline($data['baseline'] ?? null);
+        $exclude = $this->parseExclude($data['exclude'] ?? null);
 
-        return new ProjectConfig($dir, $targets, $stubsFrom, $stubsPath, $baseline);
+        return new ProjectConfig($dir, $targets, $stubsFrom, $stubsPath, $baseline, $exclude);
     }
 
     /** Walk upward from $path looking for the default `.wp-specter.stubs.json` convention file. */
@@ -82,6 +83,28 @@ final class ProjectConfigLoader
     {
         $absolute = str_starts_with($path, '/') ? $path : $baseDir . '/' . $path;
         return realpath($absolute) ?: rtrim($absolute, '/');
+    }
+
+    /**
+     * "exclude" entries are directory names or paths relative to whatever directory they end up
+     * nested under during a scan (e.g. "tests" or "vendor/some-lib") — not resolved against
+     * $configDir, since the same entry must match the same-named directory under every scan
+     * target, not just one anchored at the config file's location.
+     *
+     * @return list<string>
+     */
+    private function parseExclude(mixed $value): array
+    {
+        if (!is_array($value)) {
+            return [];
+        }
+        $entries = [];
+        foreach ($value as $entry) {
+            if (is_string($entry) && trim($entry, '/') !== '') {
+                $entries[] = trim($entry, '/');
+            }
+        }
+        return $entries;
     }
 
     /** @return list<BaselineEntry> */

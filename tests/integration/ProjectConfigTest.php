@@ -75,6 +75,30 @@ do_action( 'vendor_fired_hook' );
         self::assertStringContainsString('vendor_fired_hook', $output);
     }
 
+    public function testExcludePrunesConfiguredDirectory(): void
+    {
+        $this->write('theme/tests/FixtureTest.php', '<?php
+function should_not_be_scanned() {}
+');
+
+        $configJson = json_encode([
+            'targets' => ['theme'],
+            'stubsFrom' => ['vendor-plugins'],
+            'exclude' => ['tests'],
+        ]);
+        self::assertIsString($configJson);
+        $this->write(ProjectConfigLoader::CONFIG_FILENAME, $configJson);
+
+        ob_start();
+        $exit = $this->app->run(['wp-specter', 'scan', $this->tmp, '--no-color']);
+        $output = ob_get_clean();
+        self::assertIsString($output);
+
+        self::assertSame(1, $exit);
+        self::assertStringContainsString('configured_orphaned_func', $output);
+        self::assertStringNotContainsString('should_not_be_scanned', $output);
+    }
+
     public function testGenerateStubsWithNoPathUsesConfiguredStubsFrom(): void
     {
         $cwd = getcwd();

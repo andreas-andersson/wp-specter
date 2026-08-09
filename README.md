@@ -225,7 +225,8 @@ every time — drop a `.wp-specter.config.json` anywhere at or above the path yo
 {
     "targets": ["web/app/themes/sage", "web/app/plugins/my-plugin"],
     "stubsFrom": ["web/app/plugins", "web/app/mu-plugins"],
-    "stubs": ".wp-specter.stubs.json"
+    "stubs": ".wp-specter.stubs.json",
+    "exclude": ["tests", "vendor"]
 }
 ```
 
@@ -242,6 +243,13 @@ All paths are resolved relative to the config file's own directory.
   them instead of one invocation per directory.
 - **`stubs`** — overrides where the project stubs file lives (see below). Defaults to
   `.wp-specter.stubs.json` next to the config file if omitted.
+- **`exclude`** — directory names (or relative paths, e.g. `"tests/fixtures"`) pruned from every
+  scan and every `generate-stubs` run, on top of the always-on `vendor`/`node_modules`/`.git`
+  defaults. Unlike `targets`/`stubsFrom`, entries aren't resolved to absolute paths — a bare name
+  like `"tests"` matches a directory with that name anywhere under any scanned target, not just
+  one anchored at the config file's own location. Useful for a plugin project scanned from its own
+  root, where the plugin's `tests/` directory would otherwise be scanned for unused code alongside
+  the plugin itself.
 
 ### Project stubs: `.wp-specter.stubs.json`
 

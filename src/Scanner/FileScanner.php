@@ -8,15 +8,19 @@ final class FileScanner
 {
     private const DEFAULT_EXCLUDES = ['vendor', 'node_modules', '.git'];
 
-    /** @param list<string> $ignoreGlobs Glob patterns to exclude */
-    public function scan(string $dir, array $ignoreGlobs = []): ScanResult
+    /**
+     * @param list<string> $ignoreGlobs Glob patterns to exclude
+     * @param list<string> $excludeDirs Additional directory names/relative paths to prune,
+     *   on top of the always-on vendor/node_modules/.git defaults
+     */
+    public function scan(string $dir, array $ignoreGlobs = [], array $excludeDirs = []): ScanResult
     {
         if (!is_dir($dir)) {
             return new ScanResult([], 'Directory not found: ' . $dir);
         }
 
         $files = [];
-        $this->collectPhpFiles($dir, $files, self::DEFAULT_EXCLUDES, $ignoreGlobs, $dir);
+        $this->collectPhpFiles($dir, $files, [...self::DEFAULT_EXCLUDES, ...$excludeDirs], $ignoreGlobs, $dir);
 
         sort($files);
         return new ScanResult($files, null);
