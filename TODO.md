@@ -137,3 +137,81 @@ not shipped bugs.
   be arbitrary PHP (string manipulation, `str_replace` on the class name, etc.), so there's no
   single fixed shape to pattern-match against the way `composer.json`'s declarative `autoload` key
   offers.
+
+# Function, Hook & Template Detection — Open Issues
+
+Known gaps in `FunctionAnalyzer`, `HookAnalyzer`, and `TemplateAnalyzer` — the `functions`,
+`hooks`, and `templates` checks. Same spirit as the sections above: documented scope limits in a
+single-pass, no-AST tokenizer, not shipped bugs. Found by auditing these three analyzers the same
+way the class/method/file gaps above were found; nothing here has been fixed yet.
+
+## Template detection
+
+- [ ] **`TemplateAnalyzer` doesn't know about `Template Name:` custom page templates.** WP Page
+  Templates are selected from the admin UI by scanning the theme for this header comment — never
+  through a literal `include()`/`get_template_part()` call anywhere in project code, which is
+  exactly why `FileAnalyzer::hasPageTemplateHeader()` exists as an exemption. But a root-level
+  `.php` file is routed to `TemplateAnalyzer` instead (`FileAnalyzer::isCandidate()` returns
+  `false` for any root-level file before it would even reach that check — root-level files are
+  explicitly TemplateAnalyzer's job). `TemplateAnalyzer::analyze()` only exempts WP's fixed
+  template-hierarchy names (`WpModeDetector::isHierarchyTemplate()`); a custom-named page template
+  like `template-landing.php` or `page-fullwidth.php` — an extremely common WP theme pattern,
+  since the whole point of a custom page template is an author-chosen name — has no hierarchy
+  name to match and gets falsely flagged `UnusedTemplate`. Highest-impact item in this section:
+  it's a confirmed false positive on completely ordinary theme code, not an edge case.
+  - Fix shape: `TemplateAnalyzer` already has every candidate file's full path in
+    `collectTemplateFiles()` — give it the same `Template\s+Name\s*:` header check
+    `FileAnalyzer::hasPageTemplateHeader()` already does (read first ~4KB, regex match) and
+    exempt on a match, right alongside the existing `isHierarchyTemplate()` check.
+
+## Function detection
+
+- [ ] **Namespaced/fully-qualified function calls are invisible to `FunctionAnalyzer`.** The only
+  call-detection branch in `PhpTokenParser::parse` fires on `T_STRING`; a call like
+  `Foo\Bar\my_helper()` or `\My\Ns\init()` tokenizes as `T_NAME_QUALIFIED`/
+  `T_NAME_FULLY_QUALIFIED`, and the main loop's per-token dispatch never checks those types for
+  call purposes at all (only in class-name contexts — `new`, `extends`/`implements`,
+  `instanceof`, via `CLASS_NAME_TOKENS`) — the token is silently skipped, not even reaching the
+  `'('`-lookahead that would otherwise register a `FunctionCall`. Note the parser is
+  namespace-*blind*, not namespace-*broken*: a same-namespace unqualified call (`my_helper();`
+  from inside `namespace Foo;`) still matches its bare-name `FunctionDef` fine, since neither side
+  tracks namespace context. It's specifically a cross-namespace or fully-qualified call to a real
+  function that makes that function look unused. Matters for namespaced procedural helpers (Sage-
+  style theme scaffolds, modern plugins mixing namespaces with plain functions) — the same root
+  cause as the already-documented "Namespaced static calls aren't scoped" gap above, just hitting
+  plain functions instead of methods.
+  - Fix shape: extend the main loop's call-detection to also fire on `T_NAME_QUALIFIED`/
+    `T_NAME_FULLY_QUALIFIED` (mirroring the `T_STRING` branch's `'('`-lookahead), resolving to the
+    unqualified tail (`shortClassName()`-style trim) so it still matches the bare-name
+    `FunctionDef` the same namespace-blind way unqualified calls already do.
+
+## Hook & template tag detection
+
+- [ ] **A hook or template-part tag held in a variable/constant resolves to nothing.**
+  `$hook = 'my_plugin_loaded'; do_action($hook);`, `do_action(self::HOOK_NAME)`, or
+  `get_template_part($dynamic_slug)` — `extractStringArgAt`/`classifyArgTokens` only look at the
+  literal tokens directly inside the call's argument; there's no lightweight value-tracking for
+  string variables/constants the way `$varTypesStack` already tracks object types for method
+  scoping. The argument comes back fully dynamic (empty tag, no prefix), so a real, literal
+  `add_action('my_plugin_loaded', ...)` registration elsewhere in the project reports as
+  unmatched, and a real `template-parts/hero.php` file looks unused. Shared root cause across
+  `HookAnalyzer` and `TemplateAnalyzer` since both consume the same `extractStringArgAt` parser
+  output.
+  - Fix shape: reuse the existing `$varTypesStack`-style scoping infrastructure, but for string
+    literals instead of `new ClassName()` — `$var = 'literal'` seeds the scope, consulted when
+    that variable is later passed as a hook/template-part argument. Class constants
+    (`self::HOOK_NAME`) would need a separate, smaller lookup (constant name → literal value,
+    collected in the same pass) since they're not scope-local the way a variable is.
+
+- [ ] **Dynamic hook segment *before* the literal part isn't caught.** `classifyArgTokens` only
+  recognizes a resolvable *prefix* when the literal comes first (`'foo_' . $x` or
+  `"foo_{$x}"`); `do_action("{$this->id_base}_widget_updated")` — dynamic first, literal
+  suffix — yields no prefix at all, so any literal registration in that hook family always
+  reports unmatched. Rarer than the literal-first case in practice, since WP convention
+  overwhelmingly puts the static/plugin-specific prefix first and the dynamic per-instance part
+  last, but does occur (e.g. per-widget-ID or per-post-type hook naming).
+  - Fix shape: `classifyArgTokens` would need a fourth case mirroring the existing "literal +
+    concat" case, but checking the *last* token instead of the first two — same shape as the
+    `findTrailingStringLiteral` helper already introduced for `glob()`/include paths above,
+    just returning a literal *suffix* instead of treating the whole trailing segment as the
+    payload.
