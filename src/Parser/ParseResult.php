@@ -16,6 +16,8 @@ final class ParseResult
      * @param list<ClassDef>        $classDefs
      * @param list<string>          $classReferences
      * @param list<ScopedMethodCall> $scopedMethodCalls
+     * @param list<string>          $globIncludeDirs Directories a glob() call in this file scans
+     *                                                (see PhpTokenParser::parseGlobDirRef).
      */
     public function __construct(
         public readonly string $file,
@@ -28,6 +30,8 @@ final class ParseResult
         public readonly array $classDefs = [],
         public readonly array $classReferences = [],
         public readonly array $scopedMethodCalls = [],
+        public readonly array $globIncludeDirs = [],
+        public readonly bool $hasIncludeStatement = false,
         public readonly ?string $error = null,
     ) {}
 }

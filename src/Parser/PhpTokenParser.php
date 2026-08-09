@@ -20,6 +20,15 @@ final class PhpTokenParser
     private const INCLUDE_KEYWORDS = [T_INCLUDE, T_INCLUDE_ONCE, T_REQUIRE, T_REQUIRE_ONCE];
     // T_STRING: plain `Foo`. T_NAME_QUALIFIED: `Foo\Bar`. T_NAME_FULLY_QUALIFIED: `\Foo\Bar`.
     private const CLASS_NAME_TOKENS = [T_STRING, T_NAME_QUALIFIED, T_NAME_FULLY_QUALIFIED];
+    // Built-in/pseudo types that tokenize the same as a class name (T_STRING) in a type-hint
+    // position — must be excluded so e.g. `int $x` doesn't get treated as a reference to a
+    // class named "int". `array` and `callable` have their own dedicated tokens (T_ARRAY,
+    // T_CALLABLE) so they never reach this list in the first place; "iterable" doesn't have a
+    // dedicated token as of PHP 8.4, so it's listed here instead.
+    private const PRIMITIVE_TYPE_NAMES = [
+        'int', 'float', 'string', 'bool', 'object', 'iterable',
+        'mixed', 'void', 'never', 'null', 'false', 'true',
+    ];
 
     public function parse(string $file): ParseResult
     {
@@ -43,6 +52,14 @@ final class PhpTokenParser
         $classDefs = [];
         $classReferences = [];
         $scopedMethodCalls = [];
+        // glob(__DIR__ . '/inc/*.php') + a foreach/require loop is a common WP bulk-include
+        // pattern this tokenizer can't trace as dataflow (the require target is a plain loop
+        // variable, fully dynamic). $globIncludeDirs records every directory a glob() call in
+        // this file scans; $hasIncludeStatement records whether an include/require keyword
+        // appears anywhere in it too — FileAnalyzer only trusts a glob'd directory as "reachable"
+        // when both signals are present in the same file, a coarse but WP-idiomatic heuristic.
+        $globIncludeDirs = [];
+        $hasIncludeStatement = false;
 
         $count = count($tokens);
         $line = 1;
@@ -73,6 +90,11 @@ final class PhpTokenParser
         $expectingFunctionOpen = false;
         $functionDepthStack = [];
         $varTypesStack = [[]];
+        // Type-hinted parameters (`function foo(My_Class $x)`) seed the new scope's
+        // $varTypesStack the same way `$x = new My_Class()` does — computed when T_FUNCTION is
+        // seen, applied when its body's `{` actually opens the scope, mirroring the
+        // $pendingClassName pattern above.
+        $pendingParamTypes = [];
 
         for ($i = 0; $i < $count; $i++) {
             $token = $tokens[$i];
@@ -90,8 +112,9 @@ final class PhpTokenParser
                     }
                     if ($expectingFunctionOpen) {
                         $functionDepthStack[] = $braceDepth;
-                        $varTypesStack[] = [];
+                        $varTypesStack[] = $pendingParamTypes;
                         $expectingFunctionOpen = false;
+                        $pendingParamTypes = [];
                     }
                 } elseif ($token === '}') {
                     if ($interpolationDepth > 0) {
@@ -156,7 +179,36 @@ final class PhpTokenParser
             }
 
             if ($type === T_INTERFACE || $type === T_TRAIT || $type === T_ENUM) {
+                // These get their own ClassDef (so an unused interface/trait/enum can be
+                // flagged, same as an unused class) but deliberately do NOT set
+                // $pendingClassName/$pendingClassParent the way T_CLASS does below — method
+                // bodies inside them must keep resolving to the unscoped fallback pool
+                // (ownerClass stays null), exactly as before this change. Attributing methods
+                // to the trait/interface/enum itself would be actively wrong for traits: a
+                // trait method is really called on whatever class `use`s it, not on the trait,
+                // so scoping calls to the trait's own name would just create false positives.
                 $expectingClassOpen = true;
+                $kind = match ($type) {
+                    T_INTERFACE => 'interface',
+                    T_TRAIT => 'trait',
+                    default => 'enum',
+                };
+                $def = $this->parseClassDef($tokens, $i, $file, $kind);
+                if ($def !== null) {
+                    $classDefs[] = $def;
+                }
+                continue;
+            }
+
+            if ($type === T_USE && !empty($classDepthStack) && end($classDepthStack) === $braceDepth) {
+                // `use TraitName;` directly inside a class/trait/enum body — a trait reference,
+                // not the file-level `use Some\Namespace\Class;` import (guarded out: that's at
+                // $braceDepth 0, outside any class body) nor a closure's `function() use ($v)`
+                // (guarded out: that's nested inside a method body, one or more braces deeper
+                // than the class body's own depth).
+                foreach ($this->captureClassNameList($tokens, $i) as $ref) {
+                    $classReferences[] = $ref;
+                }
                 continue;
             }
 
@@ -178,9 +230,21 @@ final class PhpTokenParser
             if ($type === T_FUNCTION) {
                 $insideClass = !empty($classDepthStack);
                 $ownerClass = empty($classNameStack) ? null : end($classNameStack);
+                $ownerParent = empty($classParentStack) ? null : end($classParentStack);
                 $def = $this->parseFunctionDef($tokens, $i, $file, $insideClass, $ownerClass);
                 if ($def !== null) {
                     $functionDefs[] = $def;
+                }
+                // Type-hinted parameters: `function foo(My_Class $x)` both references My_Class
+                // and, same as `$x = new My_Class()`, tells us $x's type for the rest of the
+                // body — applies equally to anonymous functions/closures, which is why this
+                // runs unconditionally rather than only when $def !== null.
+                $parenIndex = $this->findParenAfterFunctionKeyword($tokens, $i);
+                if ($parenIndex !== null) {
+                    [$hintClassRefs, $pendingParamTypes] = $this->parseParamTypeHints($tokens, $parenIndex, $ownerClass, $ownerParent);
+                    foreach ($hintClassRefs as $ref) {
+                        $classReferences[] = $ref;
+                    }
                 }
                 $skipNextString = true;
                 // Every function/method/closure opens its own variable scope — including
@@ -304,6 +368,14 @@ final class PhpTokenParser
                     continue;
                 }
 
+                if ($name === 'glob') {
+                    $dir = $this->parseGlobDirRef($tokens, $i);
+                    if ($dir !== null) {
+                        $globIncludeDirs[] = $dir;
+                    }
+                    continue;
+                }
+
                 // Regular function call
                 $functionCalls[] = new FunctionCall($name, $line, $file);
                 continue;
@@ -339,6 +411,7 @@ final class PhpTokenParser
             }
 
             if (in_array($type, self::INCLUDE_KEYWORDS, true)) {
+                $hasIncludeStatement = true;
                 $ref = $this->parseIncludeRef($tokens, $i, $line, $file, token_name($type));
                 if ($ref !== null) {
                     $templateRefs[] = $ref;
@@ -357,6 +430,8 @@ final class PhpTokenParser
             classDefs: $classDefs,
             classReferences: $classReferences,
             scopedMethodCalls: $scopedMethodCalls,
+            globIncludeDirs: $globIncludeDirs,
+            hasIncludeStatement: $hasIncludeStatement,
         );
     }
 
@@ -394,6 +469,132 @@ final class PhpTokenParser
         }
 
         return new FunctionDef($next[1], $next[2], $file, $isMethod, $ownerClass);
+    }
+
+    /** @param list<Token> $tokens */
+    private function findParenAfterFunctionKeyword(array $tokens, int $i): ?int
+    {
+        $j = $i + 1;
+        while (isset($tokens[$j])) {
+            if (is_string($tokens[$j]) && $tokens[$j] === '(') {
+                return $j;
+            }
+            $j++;
+        }
+        return null;
+    }
+
+    /**
+     * Walks a parameter list looking for class-like type hints — `TypeName $var`,
+     * `?TypeName $var`, `self`/`static`/`parent`, and constructor-promoted properties
+     * (`public readonly TypeName $var`) — resolving each to a concrete class name. Every
+     * class-like type found is a genuine reference regardless of shape, so all of them are
+     * returned as references; but only an unambiguous single type seeds $varTypesStack, since
+     * a union (`A|B`) or intersection (`A&B`) type doesn't tell us which one $var actually is
+     * at runtime — same "don't guess" stance as the rest of this parser's variable tracking.
+     *
+     * @return array{list<string>, array<string,string>}  [classReferences, paramVar => className]
+     * @param list<Token> $tokens
+     */
+    private function parseParamTypeHints(array $tokens, int $parenIndex, ?string $ownerClass, ?string $ownerParent): array
+    {
+        $classRefs = [];
+        $varTypes = [];
+
+        $depth = 0;
+        $paramTokens = [];
+        $j = $parenIndex + 1;
+
+        while (isset($tokens[$j])) {
+            $t = $tokens[$j];
+
+            if (is_array($t) && $t[0] === T_ATTRIBUTE) {
+                // #[Attribute] before a parameter — its matching close is a plain "]" token,
+                // handled by the generic bracket-depth tracking below.
+                $depth++;
+                $j++;
+                continue;
+            }
+
+            if (is_string($t) && ($t === '(' || $t === '[')) {
+                $depth++;
+                $j++;
+                continue;
+            }
+
+            if (is_string($t) && ($t === ')' || $t === ']')) {
+                if ($depth === 0) {
+                    break; // end of parameter list
+                }
+                $depth--;
+                $j++;
+                continue;
+            }
+
+            if (is_string($t) && $t === ',' && $depth === 0) {
+                $this->collectParamTypeHint($paramTokens, $ownerClass, $ownerParent, $classRefs, $varTypes);
+                $paramTokens = [];
+                $j++;
+                continue;
+            }
+
+            if ($depth === 0) {
+                $paramTokens[] = $t;
+            }
+            $j++;
+        }
+
+        $this->collectParamTypeHint($paramTokens, $ownerClass, $ownerParent, $classRefs, $varTypes);
+
+        return [$classRefs, $varTypes];
+    }
+
+    /**
+     * Reads one parameter's already-collected top-level tokens (type hint, name, promotion
+     * modifiers — no default-value tokens, since those live at bracket depth > 0 and
+     * parseParamTypeHints never collects them) and records its resolved type(s).
+     *
+     * @param list<Token> $paramTokens
+     * @param list<string> $classRefs
+     * @param array<string,string> $varTypes
+     */
+    private function collectParamTypeHint(array $paramTokens, ?string $ownerClass, ?string $ownerParent, array &$classRefs, array &$varTypes): void
+    {
+        $typeNames = [];
+        $varName = null;
+
+        foreach ($paramTokens as $t) {
+            if (is_string($t)) {
+                continue; // '?', '|', '&', '=', ... — none of these are type-name tokens
+            }
+
+            if ($t[0] === T_VARIABLE) {
+                $varName = $t[1];
+                break; // the parameter's own name; nothing after it is part of its type
+            }
+
+            if (in_array($t[0], self::CLASS_NAME_TOKENS, true) || $t[0] === T_STATIC) {
+                $name = $t[0] === T_STATIC ? 'static' : $t[1];
+                $resolved = match (strtolower($name)) {
+                    'self', 'static' => $ownerClass,
+                    'parent' => $ownerParent,
+                    default => in_array(strtolower($name), self::PRIMITIVE_TYPE_NAMES, true)
+                        ? null
+                        : $this->shortClassName($name),
+                };
+                if ($resolved !== null) {
+                    $typeNames[] = $resolved;
+                }
+            }
+        }
+
+        foreach ($typeNames as $name) {
+            $classRefs[] = $name;
+        }
+
+        if ($varName !== null && count($typeNames) === 1) {
+            $varTypes[$varName] = $typeNames[0];
+        }
     }
 
     /** @param list<Token> $tokens */
@@ -462,6 +663,43 @@ final class PhpTokenParser
         // include 'path/to/file.php';
         // include dirname(__FILE__) . '/file.php';  — take the trailing literal segment
         // include $dynamic_var;                     — no literal anywhere, skip
+        $lastString = $this->findTrailingStringLiteral($tokens, $i);
+        if ($lastString === null) {
+            return null; // fully dynamic include — skip
+        }
+
+        return new TemplateRef($lastString, strtolower($keyword), (int) $line, $file);
+    }
+
+    /**
+     * glob()'s argument is a filename *pattern* ('inc/*.php'), not a directory — dirname()
+     * strips the wildcard/filename segment, leaving the directory glob() actually scans. A
+     * pattern with no directory component at all ('*.php', or the concatenated-literal-only
+     * remainder '/*.php') collapses to '.' or '/' — both mean "this file's own directory",
+     * which FileAnalyzer resolves against the calling file's own location, same as it does for
+     * a proper subdirectory.
+     *
+     * @param list<Token> $tokens
+     */
+    private function parseGlobDirRef(array $tokens, int $i): ?string
+    {
+        $pattern = $this->findTrailingStringLiteral($tokens, $i);
+        return $pattern === null ? null : dirname($pattern);
+    }
+
+    /**
+     * Walks tokens starting just after $i — an include/require keyword, or a function-call
+     * name like "glob" — tracking paren depth, and returns the last string literal seen before
+     * the enclosing statement/call argument ends. Handles every shape a path expression takes
+     * in practice: a bare literal, `dirname(__FILE__) . '/literal'`, or a longer concatenation
+     * chain — the trailing literal segment is what carries usable path information regardless
+     * of how much dynamic prefix comes before it. Returns null when there's no literal
+     * anywhere (a fully dynamic value).
+     *
+     * @param list<Token> $tokens
+     */
+    private function findTrailingStringLiteral(array $tokens, int $i): ?string
+    {
         $j = $i + 1;
         $depth = 0;
         $lastString = null;
@@ -487,11 +725,7 @@ final class PhpTokenParser
             $j++;
         }
 
-        if ($lastString === null) {
-            return null; // fully dynamic include — skip
-        }
-
-        return new TemplateRef($lastString, strtolower($keyword), (int) $line, $file);
+        return $lastString;
     }
 
     /**
@@ -603,8 +837,11 @@ final class PhpTokenParser
         return isset($tokens[$j]) && is_array($tokens[$j]) && $tokens[$j][0] === T_STRING;
     }
 
-    /** @param list<Token> $tokens */
-    private function parseClassDef(array $tokens, int $i, string $file): ?ClassDef
+    /**
+     * @param 'class'|'interface'|'trait'|'enum' $kind
+     * @param list<Token> $tokens
+     */
+    private function parseClassDef(array $tokens, int $i, string $file, string $kind = 'class'): ?ClassDef
     {
         $j = $i + 1;
         while (isset($tokens[$j]) && is_array($tokens[$j]) && $tokens[$j][0] === T_WHITESPACE) {
@@ -618,7 +855,7 @@ final class PhpTokenParser
 
         [$extends, $implements] = $this->findClassHierarchy($tokens, $j);
 
-        return new ClassDef($next[1], $next[2], $file, $extends, $implements);
+        return new ClassDef($next[1], $next[2], $file, $extends, $implements, $kind);
     }
 
     /**

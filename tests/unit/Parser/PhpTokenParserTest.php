@@ -198,6 +198,62 @@ include $file;
         self::assertEmpty($result->templateRefs);
     }
 
+    public function testGlobWithConcatenatedDirCapturesDirectory(): void
+    {
+        $result = $this->parse('<?php
+foreach (glob(__DIR__ . "/inc/*.php") as $f) {
+    require $f;
+}
+');
+        // dirname() keeps the leading slash from the concatenated literal ("/inc/*.php") —
+        // FileAnalyzer's resolveGlobExemptDir() trims it before joining, so this is fine as-is.
+        self::assertSame(['/inc'], $result->globIncludeDirs);
+        self::assertTrue($result->hasIncludeStatement);
+    }
+
+    public function testGlobWithLiteralPatternCapturesDirectory(): void
+    {
+        $result = $this->parse('<?php
+foreach (glob("modules/*.php") as $f) {
+    require_once $f;
+}
+');
+        self::assertSame(['modules'], $result->globIncludeDirs);
+    }
+
+    public function testGlobWithNoDirectoryComponentCollapsesToCurrentDir(): void
+    {
+        $result = $this->parse('<?php
+foreach (glob(__DIR__ . "/*.php") as $f) {
+    require $f;
+}
+');
+        // "/*.php" has no directory segment of its own — dirname() collapses it to "/",
+        // signalling "this file\'s own directory" to FileAnalyzer.
+        self::assertSame(['/'], $result->globIncludeDirs);
+    }
+
+    public function testFullyDynamicGlobIsSkipped(): void
+    {
+        $result = $this->parse('<?php
+$pattern = "*.php";
+foreach (glob($pattern) as $f) {
+    require $f;
+}
+');
+        self::assertEmpty($result->globIncludeDirs);
+        self::assertTrue($result->hasIncludeStatement);
+    }
+
+    public function testHasIncludeStatementIsFalseWithNoIncludeOrRequire(): void
+    {
+        $result = $this->parse('<?php
+$images = glob(__DIR__ . "/images/*.jpg");
+');
+        self::assertSame(['/images'], $result->globIncludeDirs);
+        self::assertFalse($result->hasIncludeStatement);
+    }
+
     public function testReportsCorrectLineNumbers(): void
     {
         $result = $this->parse("<?php
@@ -261,6 +317,114 @@ class My_Widget extends WP_Widget implements Countable {
         $methods = array_column($result->functionDefs, 'ownerClass', 'name');
         self::assertSame('My_Widget', $methods['widget']);
         self::assertSame('My_Widget', $methods['count']);
+    }
+
+    public function testInterfaceTraitEnumProduceClassDefsWithKind(): void
+    {
+        $result = $this->parse('<?php
+interface My_Interface {}
+trait My_Trait {}
+enum My_Enum {}
+class My_Class {}
+');
+        $kindsByName = array_column($result->classDefs, 'kind', 'name');
+        self::assertSame('interface', $kindsByName['My_Interface']);
+        self::assertSame('trait', $kindsByName['My_Trait']);
+        self::assertSame('enum', $kindsByName['My_Enum']);
+        self::assertSame('class', $kindsByName['My_Class']);
+    }
+
+    public function testMethodsInsideTraitsAndInterfacesHaveNoOwnerClass(): void
+    {
+        // Deliberate: a trait's methods belong to whatever class `use`s the trait, not the
+        // trait itself — scoping them to the trait's own name would be actively wrong (a call
+        // through the consuming class would never match). Must stay on the unscoped fallback
+        // pool exactly as before interface/trait/enum got their own ClassDef.
+        $result = $this->parse('<?php
+interface My_Interface {
+    public function do_it(): void;
+}
+trait My_Trait {
+    public function helper() {}
+}
+');
+        $methods = array_filter($result->functionDefs, fn($d) => $d->isMethod);
+        foreach ($methods as $m) {
+            self::assertNull($m->ownerClass, "{$m->name} should have no ownerClass");
+        }
+    }
+
+    public function testInterfaceExtendingMultipleInterfacesCapturesAll(): void
+    {
+        $result = $this->parse('<?php
+interface Base_A {}
+interface Base_B {}
+interface Combined extends Base_A, Base_B {}
+');
+        $defsByName = array_column($result->classDefs, null, 'name');
+        self::assertSame(['Base_A', 'Base_B'], $defsByName['Combined']->extends);
+    }
+
+    public function testEnumWithBackingTypeAndImplementsIsParsedCorrectly(): void
+    {
+        $result = $this->parse('<?php
+interface Has_Label {}
+enum Status: string implements Has_Label {
+    case Active = "active";
+}
+');
+        $defsByName = array_column($result->classDefs, null, 'name');
+        self::assertSame('enum', $defsByName['Status']->kind);
+        self::assertSame(['Has_Label'], $defsByName['Status']->implements);
+    }
+
+    public function testTraitUseInsideClassBodyIsClassReference(): void
+    {
+        $result = $this->parse('<?php
+trait My_Trait {}
+class My_Class {
+    use My_Trait;
+}
+');
+        self::assertContains('My_Trait', $result->classReferences);
+    }
+
+    public function testMultipleTraitUseWithConflictResolutionCapturesBothNames(): void
+    {
+        $result = $this->parse('<?php
+trait Trait_A { public function foo() {} }
+trait Trait_B { public function foo() {} }
+class My_Class {
+    use Trait_A, Trait_B {
+        Trait_A::foo insteadof Trait_B;
+        Trait_B::foo as bar;
+    }
+}
+');
+        self::assertContains('Trait_A', $result->classReferences);
+        self::assertContains('Trait_B', $result->classReferences);
+    }
+
+    public function testClosureUseIsNotMistakenForTraitUse(): void
+    {
+        $result = $this->parse('<?php
+class My_Class {
+    public function boot() {
+        $var = 1;
+        $fn = function() use ($var) { return $var; };
+    }
+}
+');
+        self::assertEmpty($result->classReferences);
+    }
+
+    public function testFileLevelUseImportIsNotMistakenForTraitUse(): void
+    {
+        $result = $this->parse('<?php
+use Some\Namespace\Thing;
+class My_Class {}
+');
+        self::assertEmpty($result->classReferences);
     }
 
     public function testStandaloneFunctionHasNoOwnerClass(): void
@@ -539,6 +703,108 @@ class MyClass {
         // this is a known trade-off per spec (acceptable false positives), asserted explicitly
         // here so a future tightening of looksLikeCallback() shows up as an intentional change.
         self::assertContains('init', $names);
+    }
+
+    public function testTypeHintedParameterSeedsScopedMethodCall(): void
+    {
+        $result = $this->parse('<?php
+class My_Service {
+    public function render() {}
+}
+function boot(My_Service $svc) {
+    $svc->render();
+}
+');
+        $calls = array_map(fn($c) => $c->receiverClass . '::' . $c->method, $result->scopedMethodCalls);
+        self::assertContains('My_Service::render', $calls);
+        self::assertContains('My_Service', $result->classReferences);
+    }
+
+    public function testNullableTypeHintedParameterSeedsScopedMethodCall(): void
+    {
+        $result = $this->parse('<?php
+class My_Service {
+    public function render() {}
+}
+function boot(?My_Service $svc) {
+    $svc->render();
+}
+');
+        $calls = array_map(fn($c) => $c->receiverClass . '::' . $c->method, $result->scopedMethodCalls);
+        self::assertContains('My_Service::render', $calls);
+    }
+
+    public function testSelfAndParentTypeHintsResolveAgainstOwnerClass(): void
+    {
+        $result = $this->parse('<?php
+class Base {
+    public function base_method() {}
+}
+class Child extends Base {
+    public function take_self(self $a) { $a->base_method(); }
+    public function take_parent(parent $b) { $b->base_method(); }
+}
+');
+        $calls = array_map(fn($c) => $c->receiverClass . '::' . $c->method, $result->scopedMethodCalls);
+        self::assertContains('Child::base_method', $calls);
+        self::assertContains('Base::base_method', $calls);
+    }
+
+    public function testUnionTypeHintedParameterIsReferencedButNotScoped(): void
+    {
+        $result = $this->parse('<?php
+class A { public function foo() {} }
+class B { public function foo() {} }
+function boot(A|B $x) {
+    $x->foo();
+}
+');
+        self::assertContains('A', $result->classReferences);
+        self::assertContains('B', $result->classReferences);
+        // Ambiguous — can\'t know which of A/B $x actually is, so no scoped call should be
+        // recorded; the call falls back to the generic unscoped pool instead.
+        $calls = array_map(fn($c) => $c->receiverClass . '::' . $c->method, $result->scopedMethodCalls);
+        self::assertEmpty($calls);
+        self::assertContains('foo', array_column($result->functionCalls, 'name'));
+    }
+
+    public function testPrimitiveTypeHintsAreNotTreatedAsClassReferences(): void
+    {
+        $result = $this->parse('<?php
+function boot(int $a, ?string $b, array $c, callable $d, iterable $e, mixed $f) {}
+');
+        self::assertEmpty($result->classReferences);
+    }
+
+    public function testPromotedConstructorPropertySeedsScopedMethodCall(): void
+    {
+        $result = $this->parse('<?php
+class My_Service {
+    public function render() {}
+}
+class My_Controller {
+    public function __construct(private readonly My_Service $svc) {
+        $this->svc;
+        $svc->render();
+    }
+}
+');
+        $calls = array_map(fn($c) => $c->receiverClass . '::' . $c->method, $result->scopedMethodCalls);
+        self::assertContains('My_Service::render', $calls);
+    }
+
+    public function testTypeHintedParameterDoesNotLeakAcrossFunctions(): void
+    {
+        $result = $this->parse('<?php
+class My_Service { public function render() {} }
+function first(My_Service $svc) {}
+function second() {
+    $svc = "not a service";
+    $svc->render();
+}
+');
+        $calls = array_map(fn($c) => $c->receiverClass . '::' . $c->method, $result->scopedMethodCalls);
+        self::assertNotContains('My_Service::render', $calls);
     }
 
     private function parse(string $code): \WpSpecter\Parser\ParseResult

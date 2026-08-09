@@ -7,16 +7,17 @@ scope limit that trades recall or precision for staying a single-pass, no-depend
 
 ## Class detection
 
-- [ ] **Interfaces/traits/enums are never tracked as a `ClassDef`.** Only `class Foo {}`
-  declarations produce one (`PhpTokenParser::parseClassDef`, only called from the `T_CLASS`
-  branch). `interface`/`trait`/`enum` bodies still open a brace context (so methods inside are
-  correctly marked `isMethod`), but the declaration itself is invisible to `ClassAnalyzer`'s
-  unused-class check. An unused interface, trait, or enum is never flagged, full stop.
-  - Fix shape: give `T_INTERFACE`/`T_TRAIT`/`T_ENUM` their own lookahead (mirroring
-    `parseClassDef`) and either extend `ClassDef` with a `kind` field or add a
-    parallel `InterfaceDef`/`TraitDef`/`EnumDef`. Also need to decide whether trait/enum
-    references should count the same way class references do (`use TraitName;` inside a class
-    body currently isn't captured as a classReference at all — a second gap bundled with this one).
+- [x] **Interfaces/traits/enums are never tracked as a `ClassDef`.** Fixed: `T_INTERFACE`/
+  `T_TRAIT`/`T_ENUM` now get their own `parseClassDef` call (kind param: `'class'|'interface'|
+  'trait'|'enum'`, stored on `ClassDef::$kind`), so `ClassAnalyzer::findUnusedClasses` — which
+  already iterated `classDefsByName` generically — now flags unused interfaces/traits/enums too
+  (with a `note` on the `Finding` distinguishing which kind). Deliberately does NOT set
+  `$pendingClassName`/`$pendingClassParent` for these bodies — a trait's methods are called on
+  whatever class `use`s the trait, not the trait itself, so they must stay on the unscoped
+  fallback pool exactly as before (attributing them to the trait's own name would create false
+  positives). Also fixed the bundled gap: `use TraitName;` directly inside a class/trait/enum
+  body (guarded by brace-depth so it's not confused with a top-level namespace `use` import or a
+  closure's `function() use (...)`) is now captured as a `classReference`.
 
 - [ ] **Class names passed as bare strings to WP APIs aren't references.** `register_widget('My_Widget')`,
   `is_a($x, 'My_Class')`, `class_exists('My_Class')` — none of these produce a `classReferences`
@@ -35,14 +36,13 @@ scope limit that trades recall or precision for staying a single-pass, no-depend
 
 ## Method detection
 
-- [ ] **Contract-method exemption (`ClassAnalyzer::isContractMethod`) only checks the declaring
-  class's own `extends`/`implements`, not the full inheritance chain.** A class that extends
-  `My_Base_Widget`, which itself extends `WP_Widget`, won't get the `widget()`/`form()`/`update()`
-  exemption — `ClassDef::$extends` only has `My_Base_Widget`, since each `ClassDef` only records
-  its *own* declaration's clause, and there's no cross-class resolution step.
-  - Fix shape: `ClassAnalyzer` already builds `$classDefsByName` — walk it (`$def->extends[0]`
-    repeatedly, bounded depth to survive a cycle/bad input) before checking contract methods,
-    instead of only checking one level.
+- [x] **Contract-method exemption (`ClassAnalyzer::isContractMethod`) only checks the declaring
+  class's own `extends`/`implements`, not the full inheritance chain.** Fixed: `isContractMethod`
+  now walks `$classDefsByName` via `$def->extends[0]` (bounded by `MAX_INHERITANCE_DEPTH = 50` to
+  survive a cycle/bad input), checking `implements` at every level visited too — so a class that
+  extends `My_Base_Widget`, which itself extends `WP_Widget`, still gets the
+  `widget()`/`form()`/`update()` exemption, and an interface attached higher up the chain rather
+  than redeclared on every subclass is still honored.
 
 - [ ] **Property types aren't tracked.** `$this->service = new My_Service(); $this->service->render();`
   — local variable tracking (`$varTypesStack`) only covers local variables, not object
@@ -53,16 +53,13 @@ scope limit that trades recall or precision for staying a single-pass, no-depend
     class-scoped rather than function-scoped and has to survive being set in one method and read
     in another.
 
-- [ ] **Type-hinted parameters don't seed variable tracking or count as class references.**
-  `function foo(My_Class $x) { $x->method(); }` — `$x`'s type is stated right there in the
-  signature but `parseFunctionDef` doesn't parse parameter types at all (only the function name).
-  Two independent gaps bundled here: (1) `$x->method()` stays unscoped even though the type is
-  statically known, (2) `My_Class` isn't added to `classReferences` from the type-hint alone, so
-  a class *only* ever used as a parameter type still looks unused.
-  - Fix shape: extend `parseFunctionDef`'s lookahead to walk the parameter list, capturing
-    `TypeHint $var` pairs, and seed the new function scope's `$varTypesStack` entry with them
-    (reuse `resolveClassNameToken` for `self`/`static` hints); push each hint type into
-    `classReferences` too.
+- [x] **Type-hinted parameters don't seed variable tracking or count as class references.**
+  Fixed: `parseParamTypeHints`/`collectParamTypeHint` in `PhpTokenParser` walk the parameter
+  list (including constructor-promoted properties), push every class-like hint into
+  `classReferences`, and seed the new function scope's `$varTypesStack` for an unambiguous
+  single type (`self`/`parent`/`static` resolved against the owner class). Union/intersection
+  types (`A|B`, `A&B`) are still recorded as references but deliberately don't seed tracking —
+  same "don't guess" stance as the rest of the parser's variable tracking.
 
 - [ ] **Return-type-based inference isn't attempted.** `$x = SomeFactory::make();` where `make()`
   has a declared `: My_Class` return type — not tracked. Would require correlating a call's
@@ -88,13 +85,55 @@ scope limit that trades recall or precision for staying a single-pass, no-depend
 
 ## Suggested priority if picked back up
 
-1. Type-hinted parameters (two gaps, one parser change, likely highest value-to-effort — WP OOP
-   code type-hints service/collaborator parameters constantly).
-2. Multi-level inheritance for contract-method exemption (small, bounded change to
-   `ClassAnalyzer`, removes a real false-positive source for any widget/walker/controller
-   subclass more than one level deep).
-3. Interface/trait/enum unused-detection (currently a complete blind spot, not just an
-   imprecision).
-4. Everything else — property types, return-type inference, control-flow awareness, namespaced
-   calls — is progressively more work for progressively rarer real-world patterns in typical
-   WordPress code.
+Items 1-3 below are done (see checked items above). Remaining, in rough priority order:
+
+1. Property types (`$this->service = new My_Service(); $this->service->render();`) — biggest
+   remaining precision gap for typical WP OOP code (service/collaborator properties set in the
+   constructor, used elsewhere in the class).
+2. Class names passed as bare strings to WP APIs (`register_widget('My_Widget')`,
+   `class_exists('My_Class')`) and dynamic instantiation (`new $class()`) — both false-negative
+   sources on the class-unused check specifically.
+3. Everything else — return-type inference, control-flow awareness, namespaced calls — is
+   progressively more work for progressively rarer real-world patterns in typical WordPress code.
+
+# File Detection — Open Issues
+
+Known gaps in `FileAnalyzer` (the `files` check). Same spirit as above: documented scope limits,
+not shipped bugs.
+
+- [x] **Composer PSR-4/classmap-autoloaded files are never counted as referenced.** Fixed:
+  `FileAnalyzer::loadComposerAutoloadPaths` reads the scanned target's own `composer.json`
+  (`$rootDir/composer.json`) `autoload`/`autoload-dev` blocks — `psr-4`/`psr-0` dirs (including
+  the multiple-dirs-per-prefix array form), `classmap` dirs/files, `files` — and exempts every
+  file under those mappings from candidacy entirely (`isComposerAutoloaded()`, same shape as the
+  existing `TEMPLATE_DIRS`/`index.php` exemptions in `isCandidate()`), rather than trying to
+  prove real per-class usage. A missing or malformed `composer.json` just leaves the exemption
+  list empty — most themes/plugins don't declare their own, and this analyzer already runs once
+  per scan target, so it's a no-op for them, not an error.
+
+- [x] **Dynamic bulk-include loops are a blind spot.** Fixed: `PhpTokenParser` now recognizes
+  `glob(...)` calls (`parseGlobDirRef`, sharing a `findTrailingStringLiteral` helper refactored
+  out of `parseIncludeRef` — the same "take the trailing literal segment of a possibly-dynamic
+  expression" logic applies to both) and records which directory each one scans
+  (`ParseResult::$globIncludeDirs`), plus whether the file contains an include/require keyword
+  at all (`$hasIncludeStatement`). `FileAnalyzer::loadGlobExemptDirs` only trusts a glob'd
+  directory as reachable when *both* signals are present in the same file — ruling out the
+  cheap false-exemption case of a `glob()` used for something unrelated to code-loading (image
+  galleries, asset lists) — and resolves the directory relative to the calling file's own
+  location (`__DIR__`/`dirname(__FILE__)` is how this pattern is written in practice), correctly
+  covering the "bootstrap file globs its own sibling directory" case too (empty/`.` directory
+  component ⇒ the caller's own directory). Deliberately a *separate*, strict prefix-only match
+  (`isUnderGlobExemptDir`) rather than folding into the existing loose `$referenced`/
+  `isReferencedByPartialMatch` index — that index's dash-suffix heuristic (for
+  `get_template_part('slug', $dynamic)`) would otherwise wrongly match an unrelated
+  similarly-prefixed directory (`inc` exempting `inc-legacy/`). Still coarse in one way the TODO
+  called out up front: it doesn't prove the `glob()` result is actually what gets `require`'d,
+  just that both appear somewhere in the same file.
+
+- [ ] **Legacy `spl_autoload_register()` class-map callbacks aren't recognized.** Pre-Composer (or
+  hybrid) WP plugins sometimes register their own autoloader mapping class name → file path
+  in code, rather than declaring `composer.json` autoload rules. Not currently detected at all.
+  Lower priority than the Composer case — much rarer in current WP code, and the callback body can
+  be arbitrary PHP (string manipulation, `str_replace` on the class name, etc.), so there's no
+  single fixed shape to pattern-match against the way `composer.json`'s declarative `autoload` key
+  offers.

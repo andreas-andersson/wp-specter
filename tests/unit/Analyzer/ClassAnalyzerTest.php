@@ -83,6 +83,55 @@ class Child_Class extends Base_Class {}
         self::assertNotContains('Base_Class', $unusedClasses);
     }
 
+    public function testReportsUnusedInterface(): void
+    {
+        $file = $this->write('<?php interface My_Unused_Interface {}');
+
+        $findings = $this->analyzer->analyze([$file]);
+
+        $unusedClasses = array_values(array_filter($findings, fn($f) => $f->type === FindingType::UnusedClass));
+        self::assertCount(1, $unusedClasses);
+        self::assertSame('My_Unused_Interface', $unusedClasses[0]->name);
+        self::assertSame('unused interface', $unusedClasses[0]->note);
+    }
+
+    public function testReportsUnusedTrait(): void
+    {
+        $file = $this->write('<?php trait My_Unused_Trait {}');
+
+        $findings = $this->analyzer->analyze([$file]);
+
+        $unusedClasses = array_values(array_filter($findings, fn($f) => $f->type === FindingType::UnusedClass));
+        self::assertCount(1, $unusedClasses);
+        self::assertSame('My_Unused_Trait', $unusedClasses[0]->name);
+        self::assertSame('unused trait', $unusedClasses[0]->note);
+    }
+
+    public function testReportsUnusedEnum(): void
+    {
+        $file = $this->write('<?php enum My_Unused_Enum {}');
+
+        $findings = $this->analyzer->analyze([$file]);
+
+        $unusedClasses = array_values(array_filter($findings, fn($f) => $f->type === FindingType::UnusedClass));
+        self::assertCount(1, $unusedClasses);
+        self::assertSame('My_Unused_Enum', $unusedClasses[0]->name);
+        self::assertSame('unused enum', $unusedClasses[0]->note);
+    }
+
+    public function testDoesNotReportTraitUsedViaUseStatement(): void
+    {
+        $file = $this->write('<?php
+trait My_Trait {}
+class My_Class {
+    use My_Trait;
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedClasses = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedClass), 'name');
+        self::assertNotContains('My_Trait', $unusedClasses);
+    }
+
     public function testDoesNotReportInterfaceImplementedElsewhere(): void
     {
         $file = $this->write('<?php
@@ -338,6 +387,61 @@ class My_Collection implements Countable, Iterator {
         // extends/implements, not the method name in isolation.
         $file = $this->write('<?php
 class Not_A_Widget {
+    public function widget() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertContains('widget', $unusedMethods);
+    }
+
+    public function testExcludesWpWidgetContractMethodsThroughMultiLevelInheritance(): void
+    {
+        // My_Widget doesn't extend WP_Widget directly — it extends My_Base_Widget, which
+        // extends WP_Widget. The widget()/form()/update() exemption must still apply, since
+        // WP core reaches these methods via reflection on the final concrete subclass,
+        // regardless of how many intermediate base classes sit in between.
+        $file = $this->write('<?php
+class My_Base_Widget extends WP_Widget {}
+class My_Widget extends My_Base_Widget {
+    public function widget($args, $instance) {}
+    public function form($instance) {}
+    public function update($new_instance, $old_instance) { return $new_instance; }
+    public function truly_unused() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('widget', $unusedMethods);
+        self::assertNotContains('form', $unusedMethods);
+        self::assertNotContains('update', $unusedMethods);
+        self::assertContains('truly_unused', $unusedMethods);
+    }
+
+    public function testExcludesInterfaceContractMethodsAttachedHigherInChain(): void
+    {
+        // Countable is implemented by the base class, not re-declared on the subclass — the
+        // exemption should still reach count() on Child.
+        $file = $this->write('<?php
+class Collection_Base implements Countable {
+    public function count(): int { return 0; }
+}
+class Collection_Child extends Collection_Base {
+    public function count(): int { return 1; }
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('count', $unusedMethods);
+    }
+
+    public function testContractMethodExemptionDoesNotLeakThroughUnrelatedChain(): void
+    {
+        // Not_A_Widget's chain never reaches WP_Widget at any depth — widget() must still be
+        // reported as unused.
+        $file = $this->write('<?php
+class Not_A_Widget_Base {}
+class Not_A_Widget extends Not_A_Widget_Base {
     public function widget() {}
 }
 ');

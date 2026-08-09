@@ -34,6 +34,11 @@ final class ClassAnalyzer
         'Walker' => ['start_lvl', 'end_lvl', 'start_el', 'end_el'],
     ];
 
+    // Bounds the extends-chain walk in isContractMethod() so a cyclic or malformed extends
+    // graph (which would never happen in valid PHP, but this is a token parser with no
+    // semantic validation) can't spin forever.
+    private const MAX_INHERITANCE_DEPTH = 50;
+
     public function __construct(private readonly PhpTokenParser $parser) {}
 
     /**
@@ -82,6 +87,7 @@ final class ClassAnalyzer
                     file: $def->file,
                     line: $def->line,
                     certainty: FindingCertainty::Error,
+                    note: $def->kind === 'class' ? null : 'unused ' . $def->kind,
                 );
             }
         }
@@ -147,28 +153,46 @@ final class ClassAnalyzer
         return $findings;
     }
 
-    /** @param array<string,ClassDef> $classDefsByName */
+    /**
+     * Walks the full extends chain from $ownerClass upward — not just its own declaration's
+     * clause — since a class extending My_Base_Widget, which itself extends WP_Widget, still
+     * inherits the widget()/form()/update() contract even though "WP_Widget" never appears on
+     * $ownerClass's own ClassDef. implements is checked at every level walked too, so an
+     * interface attached higher up the chain (rather than redeclared on every subclass) is
+     * still honored. Bounded depth (MAX_INHERITANCE_DEPTH) guards against a cyclic/malformed
+     * extends graph.
+     *
+     * @param array<string,ClassDef> $classDefsByName
+     */
     private function isContractMethod(string $methodName, ?string $ownerClass, array $classDefsByName): bool
     {
         if ($ownerClass === null) {
             return false;
         }
 
-        $def = $classDefsByName[$ownerClass] ?? null;
-        if ($def === null) {
-            return false;
-        }
-
-        foreach ($def->implements as $interface) {
-            if (in_array($methodName, self::INTERFACE_CONTRACT_METHODS[$interface] ?? [], true)) {
-                return true;
+        $className = $ownerClass;
+        for ($depth = 0; $depth < self::MAX_INHERITANCE_DEPTH; $depth++) {
+            $def = $classDefsByName[$className] ?? null;
+            if ($def === null) {
+                return false;
             }
-        }
 
-        foreach ($def->extends as $base) {
+            foreach ($def->implements as $interface) {
+                if (in_array($methodName, self::INTERFACE_CONTRACT_METHODS[$interface] ?? [], true)) {
+                    return true;
+                }
+            }
+
+            $base = $def->extends[0] ?? null;
+            if ($base === null) {
+                return false;
+            }
+
             if (in_array($methodName, self::BASE_CLASS_CONTRACT_METHODS[$base] ?? [], true)) {
                 return true;
             }
+
+            $className = $base;
         }
 
         return false;
