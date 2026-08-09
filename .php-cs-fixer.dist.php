@@ -8,6 +8,7 @@ $finder = (new PhpCsFixer\Finder())
     // Fake WP theme/plugin files used as scan targets in integration tests — deliberately varied
     // real-world style, not our code, and not meant to be normalized.
     ->exclude('fixtures')
+    ->in(__DIR__ . '/tools')
     ->append([__DIR__ . '/bin/wp-specter']);
 
 return (new PhpCsFixer\Config())

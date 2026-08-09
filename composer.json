@@ -36,7 +36,8 @@
         "lint": "vendor/bin/php-cs-fixer fix --dry-run --diff",
         "lint:fix": "vendor/bin/php-cs-fixer fix",
         "phpstan": "vendor/bin/phpstan analyse",
-        "check": ["@lint", "@phpstan", "@test"]
+        "check": ["@lint", "@phpstan", "@test"],
+        "update-wp-stubs": "php tools/generate-wp-hooks-stub.php"
     },
     "config": {
         "sort-packages": true
