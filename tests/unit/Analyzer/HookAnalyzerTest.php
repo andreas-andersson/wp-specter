@@ -126,7 +126,6 @@ wp_schedule_single_event( time(), 'one_off_cron' );
     {
         $file = $this->write("<?php
 add_filter( 'use_widgets_block_editor', '__return_false' );
-add_filter( 'gutenberg_use_widgets_block_editor', '__return_false' );
 add_filter( 'should_load_separate_core_block_assets', '__return_true' );
 ");
 

@@ -32,7 +32,7 @@ final class FileAnalyzerTest extends TestCase
         $findings = $this->analyzer->analyze([$orphan], $this->tmp);
 
         self::assertCount(1, $findings);
-        self::assertSame('inc/orphan', $findings[0]->name);
+        self::assertSame('orphan.php', $findings[0]->name);
     }
 
     public function testDoesNotReportFileReferencedByLiteralInclude(): void
@@ -96,7 +96,7 @@ acf_register_block_type(array(
         $hero = $this->write('acf-blocks/hero.php', '<?php // render');
 
         $names = array_column($this->analyzer->analyze([$register, $hero], $this->tmp), 'name');
-        self::assertNotContains('acf-blocks/hero', $names);
+        self::assertNotContains('hero.php', $names);
     }
 
     public function testDynamicGetTemplatePartSuffixMatchesSiblingFiles(): void
@@ -108,7 +108,7 @@ get_template_part("inc/shortcodes/variants/$variant", null);
         $variant = $this->write('inc/shortcodes/variants/lg.php', '<?php // variant');
 
         $names = array_column($this->analyzer->analyze([$caller, $variant], $this->tmp), 'name');
-        self::assertNotContains('inc/shortcodes/variants/lg', $names);
+        self::assertNotContains('lg.php', $names);
     }
 
     public function testFileReferencedByBlockJsonRenderIsNotReported(): void
@@ -191,7 +191,7 @@ get_template_part("inc/shortcodes/variants/$variant", null);
         $orphan = $this->write('inc/orphan.php', '<?php // not under src/');
 
         $names = array_column($this->analyzer->analyze([$orphan], $this->tmp), 'name');
-        self::assertContains('inc/orphan', $names);
+        self::assertContains('orphan.php', $names);
     }
 
     public function testSimilarlyNamedDirIsNotExemptByPrefixCollision(): void
@@ -204,7 +204,7 @@ get_template_part("inc/shortcodes/variants/$variant", null);
         $legacy = $this->write('src-legacy/Old.php', '<?php // not actually under src/');
 
         $names = array_column($this->analyzer->analyze([$legacy], $this->tmp), 'name');
-        self::assertContains('src-legacy/Old', $names);
+        self::assertContains('Old.php', $names);
     }
 
     public function testGlobLoopBulkIncludeExemptsSubdirectory(): void
@@ -217,7 +217,7 @@ foreach (glob(__DIR__ . "/inc/*.php") as $f) {
         $module = $this->write('inc/module.php', '<?php // loaded by the glob loop above');
 
         $names = array_column($this->analyzer->analyze([$bootstrap, $module], $this->tmp), 'name');
-        self::assertNotContains('inc/module', $names);
+        self::assertNotContains('module.php', $names);
     }
 
     public function testGlobLoopBulkIncludeExemptsOwnSiblingDirectory(): void
@@ -235,7 +235,7 @@ foreach (glob(__DIR__ . "/*.php") as $f) {
         $sibling = $this->write('inc/module.php', '<?php // sibling loaded by the loop above');
 
         $names = array_column($this->analyzer->analyze([$bootstrap, $sibling], $this->tmp), 'name');
-        self::assertNotContains('inc/module', $names);
+        self::assertNotContains('module.php', $names);
     }
 
     public function testGlobWithoutIncludeStatementDoesNotExemptDirectory(): void
@@ -248,7 +248,7 @@ $images = glob(__DIR__ . "/assets/*.jpg");
         $unrelated = $this->write('assets/orphan.php', '<?php // not actually reachable');
 
         $names = array_column($this->analyzer->analyze([$gallery, $unrelated], $this->tmp), 'name');
-        self::assertContains('assets/orphan', $names);
+        self::assertContains('orphan.php', $names);
     }
 
     public function testGlobbedDirectoryDoesNotLeakToSimilarlyNamedDirectory(): void
@@ -261,7 +261,7 @@ foreach (glob(__DIR__ . "/inc/*.php") as $f) {
         $unrelated = $this->write('inc-legacy/orphan.php', '<?php // different directory entirely');
 
         $names = array_column($this->analyzer->analyze([$bootstrap, $unrelated], $this->tmp), 'name');
-        self::assertContains('inc-legacy/orphan', $names);
+        self::assertContains('orphan.php', $names);
     }
 
     public function testNoComposerJsonDoesNotBreakAnalysis(): void
@@ -269,7 +269,7 @@ foreach (glob(__DIR__ . "/inc/*.php") as $f) {
         $orphan = $this->write('inc/orphan.php', '<?php // no composer.json in this fixture');
 
         $names = array_column($this->analyzer->analyze([$orphan], $this->tmp), 'name');
-        self::assertContains('inc/orphan', $names);
+        self::assertContains('orphan.php', $names);
     }
 
     public function testMalformedComposerJsonIsIgnoredGracefully(): void
@@ -278,7 +278,7 @@ foreach (glob(__DIR__ . "/inc/*.php") as $f) {
         $orphan = $this->write('inc/orphan.php', '<?php // still reported, malformed composer.json ignored');
 
         $names = array_column($this->analyzer->analyze([$orphan], $this->tmp), 'name');
-        self::assertContains('inc/orphan', $names);
+        self::assertContains('orphan.php', $names);
     }
 
     /** @param array<string,mixed> $data */

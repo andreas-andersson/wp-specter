@@ -68,7 +68,7 @@ final class FileAnalyzer
 
             $findings[] = new Finding(
                 type: FindingType::UnusedFile,
-                name: $relative,
+                name: basename($file),
                 file: $file,
                 line: 1,
                 certainty: FindingCertainty::Warning,
@@ -371,9 +371,6 @@ final class FileAnalyzer
     private function normalizePath(string $path): string
     {
         $path = trim($path, '/');
-        if (str_ends_with($path, '.php')) {
-            $path = substr($path, 0, -4);
-        }
         return $path;
     }
 

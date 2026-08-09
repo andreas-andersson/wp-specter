@@ -89,7 +89,7 @@ final class TemplateAnalyzer
             ) {
                 $findings[] = new Finding(
                     type: FindingType::UnusedTemplate,
-                    name: $relativePath ?: basename($templateFile),
+                    name: basename($templateFile),
                     file: $templateFile,
                     line: 1,
                     certainty: FindingCertainty::Error,
@@ -189,10 +189,6 @@ final class TemplateAnalyzer
     private function normalizePath(string $path): string
     {
         $path = trim($path, '/');
-        // Strip .php extension for comparison
-        if (str_ends_with($path, '.php')) {
-            $path = substr($path, 0, -4);
-        }
         return $path;
     }
 

@@ -16,6 +16,7 @@ final class TerminalReporter
 
     public function printHeader(string $path, ?WpMode $mode, int $fileCount): void
     {
+        $this->line('');
         $this->line($this->bold('WP-Specter'));
         $this->line($this->dim('  Path:   ' . $path));
         $this->line($this->dim('  Mode:   ' . ($mode?->label() ?? 'unknown')));
@@ -26,6 +27,7 @@ final class TerminalReporter
     /** @param list<ScanTarget> $targets */
     public function printProjectHeader(string $projectRoot, array $targets, int $fileCount, string $sourceLabel, string $targetsNote): void
     {
+        $this->line('');
         $this->line($this->bold('WP-Specter'));
         $this->line($this->dim('  Project: ' . $projectRoot . '  (' . $sourceLabel . ')'));
         $this->line($this->dim('  Targets: ' . count($targets) . ' ' . $targetsNote));
