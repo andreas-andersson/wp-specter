@@ -128,6 +128,17 @@ final class ClassAnalyzer
             }
         }
 
+        // trait name => list of classes/traits whose body directly `use`s it (see TraitUsage /
+        // the T_USE handling in PhpTokenParser). A trait's own methods are never called on the
+        // trait itself — only through whatever `use`s it — so isUsedByTraitConsumer() walks this
+        // graph to widen the check below for methods owned by a trait.
+        $traitUsers = [];
+        foreach ($parseResults as $result) {
+            foreach ($result->traitUsages as $usage) {
+                $traitUsers[$usage->trait][] = $usage->user;
+            }
+        }
+
         $findings = [];
         foreach ($parseResults as $result) {
             foreach ($result->functionDefs as $def) {
@@ -137,6 +148,7 @@ final class ClassAnalyzer
                     || isset($called[$def->name])
                     || isset($scopedCalled[$def->ownerClass ?? ''][$def->name])
                     || $this->isContractMethod($def->name, $def->ownerClass, $classDefsByName)
+                    || $this->isUsedByTraitConsumer($def->ownerClass, $def->name, $classDefsByName, $traitUsers, $scopedCalled)
                 ) {
                     continue;
                 }
@@ -193,6 +205,49 @@ final class ClassAnalyzer
             }
 
             $className = $base;
+        }
+
+        return false;
+    }
+
+    /**
+     * A trait's own method is never called on the trait directly (PHP doesn't allow that) — it's
+     * used when a class (or another trait) that `use`s this trait, directly or transitively (one
+     * trait `use`-ing another), calls it through a scoped receiver ($this->, self::, a tracked
+     * variable) belonging to that consumer. Walks $traitUsers breadth-first from $ownerClass,
+     * bounded and cycle-guarded the same way isContractMethod() walks the extends chain, checking
+     * every consumer reached against $scopedCalled. No-ops (returns false immediately) unless
+     * $ownerClass is itself a trait, since only a trait-owned method needs this indirection —
+     * scopedCalled[$ownerClass][...] already covers a method owned by a real class.
+     *
+     * @param array<string,ClassDef> $classDefsByName
+     * @param array<string,list<string>> $traitUsers
+     * @param array<string,array<string,bool>> $scopedCalled
+     */
+    private function isUsedByTraitConsumer(?string $ownerClass, string $methodName, array $classDefsByName, array $traitUsers, array $scopedCalled): bool
+    {
+        if ($ownerClass === null || ($classDefsByName[$ownerClass]->kind ?? null) !== 'trait') {
+            return false;
+        }
+
+        $queue = $traitUsers[$ownerClass] ?? [];
+        $visited = [];
+
+        for ($depth = 0; $queue !== [] && $depth < self::MAX_INHERITANCE_DEPTH; $depth++) {
+            $next = [];
+            foreach ($queue as $user) {
+                if (isset($visited[$user])) {
+                    continue;
+                }
+                $visited[$user] = true;
+
+                if (isset($scopedCalled[$user][$methodName])) {
+                    return true;
+                }
+
+                array_push($next, ...($traitUsers[$user] ?? []));
+            }
+            $queue = $next;
         }
 
         return false;

@@ -132,6 +132,109 @@ class My_Class {
         self::assertNotContains('My_Trait', $unusedClasses);
     }
 
+    public function testDoesNotReportTraitMethodCalledViaThisFromConsumingClass(): void
+    {
+        // greet() is never called on the trait itself — only via $this->greet() inside the
+        // class that use()s the trait. Its own FunctionDef has ownerClass = the trait's name,
+        // so this only passes via the trait-consumer widening in isUsedByTraitConsumer().
+        $file = $this->write('<?php
+trait Greetable {
+    public function greet() {
+        return "hi";
+    }
+}
+class Person {
+    use Greetable;
+
+    public function hello() {
+        return $this->greet();
+    }
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('greet', $unusedMethods);
+    }
+
+    public function testReportsTraitMethodNeverCalledByAnyConsumer(): void
+    {
+        $file = $this->write('<?php
+trait Greetable {
+    public function greet() {
+        return "hi";
+    }
+    public function never_called() {
+        return "dead";
+    }
+}
+class Person {
+    use Greetable;
+
+    public function hello() {
+        return $this->greet();
+    }
+}
+$p = new Person();
+$p->hello();
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertContains('never_called', $unusedMethods);
+        self::assertNotContains('greet', $unusedMethods);
+    }
+
+    public function testDoesNotReportTraitMethodUsedThroughTransitiveTraitUse(): void
+    {
+        // Consumer uses Mid, which itself uses Base — base_method() must be recognized as used
+        // even though Consumer never `use`s Base directly.
+        $file = $this->write('<?php
+trait Base {
+    public function base_method() {
+        return "base";
+    }
+}
+trait Mid {
+    use Base;
+}
+class Consumer {
+    use Mid;
+
+    public function run() {
+        return $this->base_method();
+    }
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('base_method', $unusedMethods);
+    }
+
+    public function testTraitMethodScopingDoesNotLeakToUnrelatedClass(): void
+    {
+        // Other_Class doesn't use Greetable at all — greet() being called on it must not count
+        // as evidence that the trait method is used.
+        $file = $this->write('<?php
+trait Greetable {
+    public function greet() {
+        return "hi";
+    }
+}
+class Person {
+    use Greetable;
+}
+class Other_Class {
+    public function greet() {
+        return "unrelated";
+    }
+}
+$o = new Other_Class();
+$o->greet();
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertContains('greet', $unusedMethods);
+    }
+
     public function testDoesNotReportInterfaceImplementedElsewhere(): void
     {
         $file = $this->write('<?php

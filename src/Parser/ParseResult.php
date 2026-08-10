@@ -16,6 +16,10 @@ final class ParseResult
      * @param list<ClassDef>        $classDefs
      * @param list<string>          $classReferences
      * @param list<ScopedMethodCall> $scopedMethodCalls
+     * @param list<TraitUsage>      $traitUsages Each `use TraitName;` seen directly inside a
+     *                                            class/trait body, paired with the enclosing
+     *                                            class/trait's own name (see PhpTokenParser's
+     *                                            T_USE handling).
      * @param list<string>          $globIncludeDirs Directories a glob() call in this file scans
      *                                                (see PhpTokenParser::parseGlobDirRef).
      */
@@ -30,6 +34,7 @@ final class ParseResult
         public readonly array $classDefs = [],
         public readonly array $classReferences = [],
         public readonly array $scopedMethodCalls = [],
+        public readonly array $traitUsages = [],
         public readonly array $globIncludeDirs = [],
         public readonly bool $hasIncludeStatement = false,
         public readonly ?string $error = null,

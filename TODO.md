@@ -12,12 +12,26 @@ scope limit that trades recall or precision for staying a single-pass, no-depend
   'trait'|'enum'`, stored on `ClassDef::$kind`), so `ClassAnalyzer::findUnusedClasses` — which
   already iterated `classDefsByName` generically — now flags unused interfaces/traits/enums too
   (with a `note` on the `Finding` distinguishing which kind). Deliberately does NOT set
-  `$pendingClassName`/`$pendingClassParent` for these bodies — a trait's methods are called on
-  whatever class `use`s the trait, not the trait itself, so they must stay on the unscoped
-  fallback pool exactly as before (attributing them to the trait's own name would create false
-  positives). Also fixed the bundled gap: `use TraitName;` directly inside a class/trait/enum
-  body (guarded by brace-depth so it's not confused with a top-level namespace `use` import or a
+  `$pendingClassName`/`$pendingClassParent` for interface/enum bodies — untouched, same as
+  before. Also fixed the bundled gap: `use TraitName;` directly inside a class/trait/enum body
+  (guarded by brace-depth so it's not confused with a top-level namespace `use` import or a
   closure's `function() use (...)`) is now captured as a `classReference`.
+
+- [x] **A trait's own method looked unused whenever it was only ever called through the
+  consuming class** (`$this->method()` inside the class that `use`s the trait, or a tracked
+  variable of that class's type) — the trait method's `FunctionDef` had `ownerClass = null` (by
+  the design above), but the call itself was correctly scoped to the *consuming* class
+  (`scopedCalled['Person']['greet']`, not `scopedCalled[null]`), so the two never matched and a
+  perfectly-used trait method reported `UnusedMethod`. Fixed in two parts: (1) `T_TRAIT` now DOES
+  set `$pendingClassName` to the trait's own name, so a trait method's `FunctionDef::$ownerClass`
+  is the trait, and an intra-trait `$this->otherMethod()` call resolves precisely instead of
+  leaking into the unscoped fallback pool; (2) `PhpTokenParser` records every `use TraitName;`
+  as a `TraitUsage` (consuming class/trait ⇒ trait name), and `ClassAnalyzer::analyze()`
+  aggregates these into a trait ⇒ consumers map, walked (bounded, cycle-guarded, same shape as
+  `isContractMethod`'s extends-chain walk — `isUsedByTraitConsumer`) so a trait method counts as
+  used when *any* class that `use`s the trait, directly or transitively (trait-uses-trait), calls
+  it through a scoped receiver. A trait method that's never called by any consumer, anywhere, is
+  still correctly flagged.
 
 - [ ] **Class names passed as bare strings to WP APIs aren't references.** `register_widget('My_Widget')`,
   `is_a($x, 'My_Class')`, `class_exists('My_Class')` — none of these produce a `classReferences`

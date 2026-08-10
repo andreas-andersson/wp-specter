@@ -52,6 +52,7 @@ final class PhpTokenParser
         $classDefs = [];
         $classReferences = [];
         $scopedMethodCalls = [];
+        $traitUsages = [];
         // glob(__DIR__ . '/inc/*.php') + a foreach/require loop is a common WP bulk-include
         // pattern this tokenizer can't trace as dataflow (the require target is a plain loop
         // variable, fully dynamic). $globIncludeDirs records every directory a glob() call in
@@ -179,14 +180,20 @@ final class PhpTokenParser
             }
 
             if ($type === T_INTERFACE || $type === T_TRAIT || $type === T_ENUM) {
-                // These get their own ClassDef (so an unused interface/trait/enum can be
-                // flagged, same as an unused class) but deliberately do NOT set
-                // $pendingClassName/$pendingClassParent the way T_CLASS does below — method
-                // bodies inside them must keep resolving to the unscoped fallback pool
-                // (ownerClass stays null), exactly as before this change. Attributing methods
-                // to the trait/interface/enum itself would be actively wrong for traits: a
-                // trait method is really called on whatever class `use`s it, not on the trait,
-                // so scoping calls to the trait's own name would just create false positives.
+                // Interfaces/enums deliberately do NOT set $pendingClassName/$pendingClassParent
+                // the way T_CLASS does below — interface bodies have no method bodies to begin
+                // with, and enum-method scoping isn't attempted yet, so their bodies keep
+                // resolving to the unscoped fallback pool (ownerClass stays null).
+                //
+                // Traits are different: $pendingClassName IS set to the trait's own name, so
+                // $this->method() calls made *within* the trait's own methods resolve precisely
+                // to that name (ScopedMethodCall) instead of silently falling through to the
+                // unscoped pool. That alone would make a trait method that's only ever called
+                // via $this-> from the consuming class (not the trait itself) look unused — a
+                // trait's methods are never called on the trait directly, only through whatever
+                // class `use`s it. ClassAnalyzer closes that gap using $traitUsages below (every
+                // `use TraitName;` paired with its enclosing class/trait) to widen a trait
+                // method's "used" check to every class that use()s it, transitively.
                 $expectingClassOpen = true;
                 $kind = match ($type) {
                     T_INTERFACE => 'interface',
@@ -196,6 +203,9 @@ final class PhpTokenParser
                 $def = $this->parseClassDef($tokens, $i, $file, $kind);
                 if ($def !== null) {
                     $classDefs[] = $def;
+                    if ($kind === 'trait') {
+                        $pendingClassName = $def->name;
+                    }
                 }
                 continue;
             }
@@ -206,8 +216,12 @@ final class PhpTokenParser
                 // $braceDepth 0, outside any class body) nor a closure's `function() use ($v)`
                 // (guarded out: that's nested inside a method body, one or more braces deeper
                 // than the class body's own depth).
+                $user = empty($classNameStack) ? null : end($classNameStack);
                 foreach ($this->captureClassNameList($tokens, $i) as $ref) {
                     $classReferences[] = $ref;
+                    if ($user !== null) {
+                        $traitUsages[] = new TraitUsage($user, $ref);
+                    }
                 }
                 continue;
             }
@@ -430,6 +444,7 @@ final class PhpTokenParser
             classDefs: $classDefs,
             classReferences: $classReferences,
             scopedMethodCalls: $scopedMethodCalls,
+            traitUsages: $traitUsages,
             globIncludeDirs: $globIncludeDirs,
             hasIncludeStatement: $hasIncludeStatement,
         );

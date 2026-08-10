@@ -91,12 +91,12 @@ wp-specter version       # Print version
 
 ### 3e. Classes and Methods (`--type=classes`)
 
-- **Collect:** All `class Foo {}` declarations (interfaces/traits/enums are not yet tracked as declarations — see note below)
-- **Mark a class used** if referenced anywhere via `new Foo()`, `Foo::method()`/`Foo::CONST`/`Foo::class`, `instanceof Foo`, or `extends`/`implements Foo`. Purely dynamic instantiation (`$c = 'Foo'; new $c()`) or class names passed only as strings to WP APIs (`register_widget('Foo')`) aren't recognized — syntactic references only
-- **Collect:** All class method definitions (magic methods excluded)
+- **Collect:** All `class Foo {}`, `interface Foo {}`, `trait Foo {}`, and `enum Foo {}` declarations
+- **Mark a class/interface/trait/enum used** if referenced anywhere via `new Foo()`, `Foo::method()`/`Foo::CONST`/`Foo::class`, `instanceof Foo`, `extends`/`implements Foo`, or `use Foo;` inside a class/trait/enum body. Purely dynamic instantiation (`$c = 'Foo'; new $c()`) or class names passed only as strings to WP APIs (`register_widget('Foo')`) aren't recognized — syntactic references only
+- **Collect:** All class/trait method definitions (magic methods excluded)
 - **Mark a method used** if called with a statically-resolvable receiver — `$this->method()`, `self::`/`parent::`/`static::method()`, a literal `Class::method()`, the equivalent array-callback shapes (`[$this, 'method']`, `[Class::class, 'method']`, `['Class', 'method']`, both `[...]` and `array(...)` syntax), or a local variable directly assigned `new ClassName(...)` earlier in the same function/method body — scoped per declaring class, so two unrelated classes sharing a method name don't suppress each other's findings. Anything that can't be resolved to a class this way (an arbitrary-typed variable, a property, a function's return value) falls back to a name-only match across the whole project — the source of this check's Warning (not Error) certainty
+- **Trait methods:** a trait method is scoped to the trait's own name (so an intra-trait `$this->` call resolves precisely), but is never "called on the trait" directly — it's marked used when *any* class or trait that `use`s the trait, directly or transitively, calls it through a scoped receiver
 - **Contract exemption:** a method required by a contract the *declaring* class directly `implements`/`extends` (not further up the chain) is exempt: PHP SPL interfaces (`ArrayAccess`, `Iterator`, `IteratorAggregate`, `Countable`, `JsonSerializable`, `Serializable`) and WordPress base classes (`WP_Widget`, `WP_REST_Controller`, `Walker`)
-- **Known gap:** interfaces, traits, and enums aren't tracked as declarations at all yet, so an unused one is never flagged. See `PARSING-TODO.md` for this and other open parsing limitations.
 
 ---
 
@@ -265,5 +265,4 @@ wp-specter/
 - JSON/HTML report formats (terminal only)
 - WP-CLI integration
 - Multi-project / workspace scanning
-- Unused interface/trait/enum detection (declarations aren't tracked yet — see `PARSING-TODO.md`)
 - Real type inference (property types, type-hinted parameters, return-type-based inference, control-flow-aware variable tracking) — the parser resolves what it can from local syntax alone, documented trade-offs in `PARSING-TODO.md`

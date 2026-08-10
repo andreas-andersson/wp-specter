@@ -334,23 +334,37 @@ class My_Class {}
         self::assertSame('class', $kindsByName['My_Class']);
     }
 
-    public function testMethodsInsideTraitsAndInterfacesHaveNoOwnerClass(): void
+    public function testMethodsInsideInterfacesHaveNoOwnerClass(): void
     {
-        // Deliberate: a trait's methods belong to whatever class `use`s the trait, not the
-        // trait itself — scoping them to the trait's own name would be actively wrong (a call
-        // through the consuming class would never match). Must stay on the unscoped fallback
-        // pool exactly as before interface/trait/enum got their own ClassDef.
+        // Interface method declarations never have a body, so there's no $this-> scoping to
+        // resolve inside them — ownerClass stays null, same as before interfaces got their own
+        // ClassDef.
         $result = $this->parse('<?php
 interface My_Interface {
     public function do_it(): void;
 }
+');
+        $methods = array_filter($result->functionDefs, fn($d) => $d->isMethod);
+        foreach ($methods as $m) {
+            self::assertNull($m->ownerClass, "{$m->name} should have no ownerClass");
+        }
+    }
+
+    public function testMethodsInsideTraitsAreOwnedByTheTrait(): void
+    {
+        // A trait's own method IS scoped to the trait's own name — this lets an intra-trait
+        // $this->method() call resolve precisely instead of leaking into the unscoped fallback
+        // pool. A trait's methods are never called on the trait directly though; it's
+        // ClassAnalyzer's job (via TraitUsage) to widen "used" to whatever class `use`s the
+        // trait, not the parser's.
+        $result = $this->parse('<?php
 trait My_Trait {
     public function helper() {}
 }
 ');
         $methods = array_filter($result->functionDefs, fn($d) => $d->isMethod);
         foreach ($methods as $m) {
-            self::assertNull($m->ownerClass, "{$m->name} should have no ownerClass");
+            self::assertSame('My_Trait', $m->ownerClass, "{$m->name} should be owned by My_Trait");
         }
     }
 
