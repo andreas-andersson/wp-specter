@@ -201,6 +201,28 @@ function acf_get_setting($name, $value = null) {
         self::assertSame(2, $exit);
     }
 
+    public function testDefaultOutputFilenameIsDotPrefixedToMatchAutoLoadConvention(): void
+    {
+        // With no --output and no project config, the default output filename must match the
+        // dot-prefixed convention `scan` auto-loads (ProjectConfigLoader::STUBS_FILENAME) — not
+        // the old undotted "wp-specter-stubs.json", which `scan` never picked up on its own.
+        file_put_contents($this->tmp . '/plugin.php', "<?php\ndo_action('my_plugin_init');\n");
+
+        $cwd = getcwd();
+        self::assertIsString($cwd);
+        chdir($this->tmp);
+        try {
+            ob_start();
+            $exit = $this->app->run(['wp-specter', 'generate-stubs', $this->tmp]);
+            ob_get_clean();
+        } finally {
+            chdir($cwd);
+        }
+
+        self::assertSame(0, $exit);
+        self::assertFileExists($this->tmp . '/.wp-specter.stubs.json');
+    }
+
     public function testStubsFileSuppressesHooksInScan(): void
     {
         // Setup: theme with a hook fired only in a sibling "plugin" dir

@@ -27,7 +27,7 @@ use WpSpecter\Support\GlobExpander;
 
 class Application
 {
-    private const VERSION = '0.2.2';
+    private const VERSION = '0.4.2';
 
     /** @param list<string> $argv */
     public function run(array $argv): int
@@ -76,7 +76,7 @@ class Application
                                   and exit (requires --generate-config to have run first)
 
         Generate-stubs options:
-          --output=<file>        Output path for the stubs file (default: wp-specter-stubs.json)
+          --output=<file>        Output path for the stubs file (default: .wp-specter.stubs.json)
           (with no <path>, uses "stubsFrom" from .wp-specter.config.json if present)
 
         Project files (auto-discovered by walking upward from <path>):
@@ -475,7 +475,7 @@ class Application
         }
 
         if ($output === null) {
-            $output = 'wp-specter-stubs.json';
+            $output = ProjectConfigLoader::STUBS_FILENAME;
         }
 
         $scanner = new FileScanner();

@@ -81,18 +81,13 @@ Found: 3 unused function(s), 1 unmatched hook(s), 3 unused file(s), 1 unused cla
 
 wp-specter is published on [Packagist](https://packagist.org/packages/andreas-andersson/wp-specter).
 
-### As a project dev-dependency
-
 ```bash
+# As a project dev-dependency
 composer require --dev andreas-andersson/wp-specter
-```
 
-Run it via `vendor/bin/wp-specter scan ...`.
-
-### Globally (one `wp-specter` command everywhere)
-
-```bash
+# Globally
 composer global require andreas-andersson/wp-specter
+
 ```
 
 Make sure Composer's global bin dir is on your `PATH` (`composer global config bin-dir --absolute` prints it — usually `~/.config/composer/vendor/bin` or `~/.composer/vendor/bin`).
@@ -187,10 +182,17 @@ wp-specter generate-stubs <path> [--output=<file>]
 
 ```bash
 # Scan your plugins folder and write a stubs file
-wp-specter generate-stubs ./plugins --output=.wp-specter-stubs.json
+wp-specter generate-stubs ./plugins
 
-# Then use the stubs file when scanning your theme
-wp-specter scan ./themes/my-theme --stubs=.wp-specter-stubs.json
+# ..or set a custom output file
+wp-specter generate-stubs ./plugins --output=whatever.json
+
+
+# The stubs file will be auto-loaded on your next scan if using the default filename
+wp-specter scan ./themes/my-theme
+
+# ..if using a custom stub-filename you need to pass it with
+wp-specter generate-stubs ./plugins --stubs=whatevern.json
 ```
 
 The generated file looks like:
