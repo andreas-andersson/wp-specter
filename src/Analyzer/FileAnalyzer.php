@@ -20,7 +20,9 @@ use WpSpecter\Parser\PhpTokenParser;
  */
 final class FileAnalyzer
 {
-    private const TEMPLATE_DIRS = ['templates', 'template-parts', 'parts'];
+    // "resources/views" is Roots Sage/Acorn's Blade views root — same hand-off-to-TemplateAnalyzer
+    // reasoning as the other three, it's just a framework-specific convention rather than a WP one.
+    private const TEMPLATE_DIRS = ['templates', 'template-parts', 'parts', 'resources/views'];
     private const BLOCK_JSON_RENDER_KEYS = ['render', 'renderCallback'];
     // Composer autoload sections that map namespaces/paths to a class loader rather than a
     // literal include() — "autoload-dev" covers test-support classes under the same scheme.

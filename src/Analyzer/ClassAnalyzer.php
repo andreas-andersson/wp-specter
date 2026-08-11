@@ -34,6 +34,19 @@ final class ClassAnalyzer
         'Walker' => ['start_lvl', 'end_lvl', 'start_el', 'end_el'],
     ];
 
+    // Base classes whose subclasses get called entirely through framework naming-convention /
+    // reflection, not through any fixed method-name contract — so no BASE_CLASS_CONTRACT_METHODS
+    // list could ever be exhaustive. Every method (and the class itself) on a subclass is exempt.
+    // Keyed by short name, same collision trade-off already accepted by the other curated lists
+    // above (e.g. "Walker" isn't qualified either).
+    private const FULLY_EXEMPT_BASE_CLASSES = [
+        // Roots\Acorn\View\Composer (Sage 10+/Acorn theme scaffolding): subclass methods are
+        // Blade-view data providers, discovered by matching an author-chosen method name against
+        // the view's requested variable name at render time — never a literal call anywhere in
+        // project code.
+        'Composer' => true,
+    ];
+
     // Bounds the extends-chain walk in isContractMethod() so a cyclic or malformed extends
     // graph (which would never happen in valid PHP, but this is a token parser with no
     // semantic validation) can't spin forever.
@@ -43,9 +56,10 @@ final class ClassAnalyzer
 
     /**
      * @param list<string> $files
+     * @param list<string> $vendorAutoloadPaths
      * @return list<Finding>
      */
-    public function analyze(array $files): array
+    public function analyze(array $files, array $vendorAutoloadPaths = []): array
     {
         $parseResults = array_map(fn(string $f) => $this->parser->parse($f), $files);
 
@@ -56,8 +70,21 @@ final class ClassAnalyzer
             }
         }
 
+        $reflector = new VendorClassReflector($vendorAutoloadPaths);
+
+        // Short name/alias => FQCN from every file's `use` imports, merged globally — same
+        // "flat, whole-project namespace" trade-off $classDefsByName already makes. Lets
+        // isContractMethod resolve an extends/implements short name (PhpTokenParser only ever
+        // records short names) back to a real, autoloadable vendor class name.
+        $useImports = [];
+        foreach ($parseResults as $result) {
+            foreach ($result->useImports as $alias => $fqcn) {
+                $useImports[$alias] = $fqcn;
+            }
+        }
+
         $findings = $this->findUnusedClasses($parseResults, $classDefsByName);
-        array_push($findings, ...$this->findUnusedMethods($parseResults, $classDefsByName));
+        array_push($findings, ...$this->findUnusedMethods($parseResults, $classDefsByName, $reflector, $useImports));
 
         usort($findings, fn(Finding $a, Finding $b) => $a->file <=> $b->file ?: $a->line <=> $b->line);
 
@@ -81,6 +108,9 @@ final class ClassAnalyzer
         $findings = [];
         foreach ($classDefsByName as $name => $def) {
             if (!isset($referenced[$name])) {
+                if ($this->isFullyExemptClass($name, $classDefsByName)) {
+                    continue;
+                }
                 $findings[] = new Finding(
                     type: FindingType::UnusedClass,
                     name: $name,
@@ -98,9 +128,10 @@ final class ClassAnalyzer
     /**
      * @param list<ParseResult> $parseResults
      * @param array<string,ClassDef> $classDefsByName
+     * @param array<string,string> $useImports
      * @return list<Finding>
      */
-    private function findUnusedMethods(array $parseResults, array $classDefsByName): array
+    private function findUnusedMethods(array $parseResults, array $classDefsByName, VendorClassReflector $reflector, array $useImports): array
     {
         // Calls PhpTokenParser could resolve to a concrete receiver class — $this->method(),
         // self::/parent::/static::method(), and Foo::method() with a literal class name — are
@@ -147,7 +178,8 @@ final class ClassAnalyzer
                     || $this->isMagicMethod($def->name)
                     || isset($called[$def->name])
                     || isset($scopedCalled[$def->ownerClass ?? ''][$def->name])
-                    || $this->isContractMethod($def->name, $def->ownerClass, $classDefsByName)
+                    || $this->isFullyExemptClass($def->ownerClass, $classDefsByName)
+                    || $this->isContractMethod($def->name, $def->ownerClass, $classDefsByName, $reflector, $useImports)
                     || $this->isUsedByTraitConsumer($def->ownerClass, $def->name, $classDefsByName, $traitUsers, $scopedCalled)
                 ) {
                     continue;
@@ -174,9 +206,22 @@ final class ClassAnalyzer
      * still honored. Bounded depth (MAX_INHERITANCE_DEPTH) guards against a cyclic/malformed
      * extends graph.
      *
+     * Once the walk steps off the edge of what was scanned (an extends/implements target with
+     * no ClassDef — a vendor dependency), $reflector takes over: PHP's own autoloader/Reflection
+     * can see inside vendor code the token parser never touched. If that external class or
+     * interface already declares $methodName, this is a real override of a vendor contract, not
+     * dead code — a strict generalization of the curated lists above that needs no per-framework
+     * entry, but only fires when a vendor autoloader was actually found (see
+     * VendorClassReflector::isAvailable).
+     *
+     * $useImports resolves a short name to a real vendor FQCN before handing it to $reflector —
+     * PhpTokenParser only ever records the short name off an extends/implements clause, but
+     * class_exists()/ReflectionClass need the real name to find a `use`-imported vendor class.
+     *
      * @param array<string,ClassDef> $classDefsByName
+     * @param array<string,string> $useImports
      */
-    private function isContractMethod(string $methodName, ?string $ownerClass, array $classDefsByName): bool
+    private function isContractMethod(string $methodName, ?string $ownerClass, array $classDefsByName, VendorClassReflector $reflector, array $useImports): bool
     {
         if ($ownerClass === null) {
             return false;
@@ -186,11 +231,14 @@ final class ClassAnalyzer
         for ($depth = 0; $depth < self::MAX_INHERITANCE_DEPTH; $depth++) {
             $def = $classDefsByName[$className] ?? null;
             if ($def === null) {
-                return false;
+                return $reflector->classHasMethod($useImports[$className] ?? $className, $methodName);
             }
 
             foreach ($def->implements as $interface) {
-                if (in_array($methodName, self::INTERFACE_CONTRACT_METHODS[$interface] ?? [], true)) {
+                if (
+                    in_array($methodName, self::INTERFACE_CONTRACT_METHODS[$interface] ?? [], true)
+                    || $reflector->classHasMethod($useImports[$interface] ?? $interface, $methodName)
+                ) {
                     return true;
                 }
             }
@@ -201,6 +249,41 @@ final class ClassAnalyzer
             }
 
             if (in_array($methodName, self::BASE_CLASS_CONTRACT_METHODS[$base] ?? [], true)) {
+                return true;
+            }
+
+            $className = $base;
+        }
+
+        return false;
+    }
+
+    /**
+     * Walks the extends chain the same way isContractMethod() does, checking each base short
+     * name against FULLY_EXEMPT_BASE_CLASSES rather than a per-method list. $className is either
+     * a class's own name (whole-class check from findUnusedClasses) or a method's owner class
+     * (findUnusedMethods).
+     *
+     * @param array<string,ClassDef> $classDefsByName
+     */
+    private function isFullyExemptClass(?string $className, array $classDefsByName): bool
+    {
+        if ($className === null) {
+            return false;
+        }
+
+        for ($depth = 0; $depth < self::MAX_INHERITANCE_DEPTH; $depth++) {
+            $def = $classDefsByName[$className] ?? null;
+            if ($def === null) {
+                return false;
+            }
+
+            $base = $def->extends[0] ?? null;
+            if ($base === null) {
+                return false;
+            }
+
+            if (isset(self::FULLY_EXEMPT_BASE_CLASSES[$base])) {
                 return true;
             }
 

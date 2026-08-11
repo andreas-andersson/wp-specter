@@ -441,6 +441,44 @@ class My_Class {}
         self::assertEmpty($result->classReferences);
     }
 
+    public function testFileLevelUseImportIsRecorded(): void
+    {
+        $result = $this->parse('<?php
+use Some\Namespace\Thing;
+use Other\Space\Base as Aliased;
+class My_Class {}
+');
+        self::assertSame('Some\Namespace\Thing', $result->useImports['Thing']);
+        self::assertSame('Other\Space\Base', $result->useImports['Aliased']);
+        self::assertArrayNotHasKey('Base', $result->useImports);
+    }
+
+    public function testUseFunctionAndUseConstImportsAreNotRecordedAsClasses(): void
+    {
+        $result = $this->parse('<?php
+use function My\Ns\helper;
+use const My\Ns\SOME_CONST;
+class My_Class {}
+');
+        self::assertEmpty($result->useImports);
+    }
+
+    public function testGroupUseImportDoesNotCorruptSubsequentParsing(): void
+    {
+        // Group use isn\'t supported for the import map (bails out without recording anything),
+        // but its braces must not desync brace-depth tracking for the rest of the file.
+        $result = $this->parse('<?php
+use App\{Foo, Bar as B};
+class My_Class {
+    public function used() {}
+}
+$x = new My_Class();
+$x->used();
+');
+        self::assertContains('My_Class', $result->classReferences);
+        self::assertNotEmpty($result->scopedMethodCalls);
+    }
+
     public function testStandaloneFunctionHasNoOwnerClass(): void
     {
         $result = $this->parse('<?php function standalone() {}');

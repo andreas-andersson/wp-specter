@@ -22,6 +22,11 @@ final class ParseResult
      *                                            T_USE handling).
      * @param list<string>          $globIncludeDirs Directories a glob() call in this file scans
      *                                                (see PhpTokenParser::parseGlobDirRef).
+     * @param array<string,string>  $useImports Short name/alias => fully-qualified name, from
+     *                                           this file's top-level `use Some\Namespace\Name;`
+     *                                           imports (see PhpTokenParser::parseUseImports).
+     *                                           Used to resolve an extends/implements target to
+     *                                           a real vendor class for VendorClassReflector.
      */
     public function __construct(
         public readonly string $file,
@@ -37,6 +42,7 @@ final class ParseResult
         public readonly array $traitUsages = [],
         public readonly array $globIncludeDirs = [],
         public readonly bool $hasIncludeStatement = false,
+        public readonly array $useImports = [],
         public readonly ?string $error = null,
     ) {}
 }

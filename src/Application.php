@@ -27,7 +27,7 @@ use WpSpecter\Support\GlobExpander;
 
 class Application
 {
-    private const VERSION = '0.4.2';
+    private const VERSION = '0.4.3';
 
     /** @param list<string> $argv */
     public function run(array $argv): int
@@ -282,7 +282,8 @@ class Application
         }
 
         if ($config->wantsType('classes')) {
-            $findings = array_merge($findings, (new ClassAnalyzer($parser))->analyze($allFiles));
+            $vendorAutoloadPaths = $this->resolveVendorAutoloadPaths($composerRoot, $targets);
+            $findings = array_merge($findings, (new ClassAnalyzer($parser))->analyze($allFiles, $vendorAutoloadPaths));
         }
 
         // Templates and files need a specific root to know what's "root-level" and which mode's
@@ -545,6 +546,38 @@ class Application
             }
         }
         return null;
+    }
+
+    /**
+     * Finds every vendor/autoload.php ClassAnalyzer's reflection fallback (see
+     * VendorClassReflector) should load — the detected composer project root's (a Bedrock-style
+     * layout where vendor/ sits above every target) AND each target's own (a theme/plugin with
+     * its own composer.json, e.g. Roots Sage requiring Acorn directly) — since either can hold
+     * classes the other doesn't. Returns an empty list when neither exists; the reflection
+     * fallback is simply unavailable then, same as it always was before this existed.
+     *
+     * @param list<ScanTarget> $targets
+     * @return list<string>
+     */
+    private function resolveVendorAutoloadPaths(?string $composerRoot, array $targets): array
+    {
+        $paths = [];
+
+        if ($composerRoot !== null) {
+            $path = rtrim($composerRoot, '/') . '/vendor/autoload.php';
+            if (is_file($path)) {
+                $paths[$path] = true;
+            }
+        }
+
+        foreach ($targets as $target) {
+            $path = rtrim($target->path, '/') . '/vendor/autoload.php';
+            if (is_file($path)) {
+                $paths[$path] = true;
+            }
+        }
+
+        return array_keys($paths);
     }
 
     private function resolveMode(Config $config, WpModeDetector $modeDetector): ?WpMode

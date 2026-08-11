@@ -553,6 +553,133 @@ class Not_A_Widget extends Not_A_Widget_Base {
         self::assertContains('widget', $unusedMethods);
     }
 
+    // ── whole-class exemption (Acorn/Sage-style reflection-dispatch base classes) ──────────
+
+    public function testExcludesFullyExemptBaseClassMethods(): void
+    {
+        // Roots\Acorn\View\Composer subclasses (recorded here by its short name, "Composer",
+        // same as every other curated base-class list) are called entirely by matching an
+        // author-chosen method name against a Blade view's requested variable at render time —
+        // no fixed contract method name exists to check against.
+        $file = $this->write('<?php
+class App extends Composer {
+    public function siteName() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        self::assertEmpty(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod));
+    }
+
+    public function testExcludesFullyExemptBaseClassFromUnusedClasses(): void
+    {
+        $file = $this->write('<?php
+class App extends Composer {
+    public function siteName() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        self::assertEmpty(array_filter($findings, fn($f) => $f->type === FindingType::UnusedClass));
+    }
+
+    public function testFullyExemptBaseClassDoesNotLeakToUnrelatedClasses(): void
+    {
+        $file = $this->write('<?php
+class Not_A_Composer {
+    public function siteName() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertContains('siteName', $unusedMethods);
+    }
+
+    // ── vendor reflection fallback (contract methods on classes outside the scan) ──────────
+
+    public function testExcludesMethodOverridingVendorClassViaReflection(): void
+    {
+        // Simulates a Composer dependency: a base class the token parser never sees because
+        // it isn't part of the files handed to analyze() — only reachable via the vendor
+        // autoloader path, resolved through the `use` import on the project file below.
+        $vendorAutoload = $this->write('<?php
+namespace Vendor\Acme;
+class ServiceProvider {
+    public function register() {}
+}
+');
+        $file = $this->write('<?php
+use Vendor\Acme\ServiceProvider;
+class My_Provider extends ServiceProvider {
+    public function register() {}
+    public function truly_unused() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file], [$vendorAutoload]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('register', $unusedMethods);
+        self::assertContains('truly_unused', $unusedMethods);
+    }
+
+    public function testVendorReflectionFallbackIsUnusedWithoutAnAutoloadPath(): void
+    {
+        // Same shape as above, but analyze() is called without a vendor autoload path (the
+        // common case — no composer.json/vendor found) — the override should be reported like
+        // any other unresolved method, exactly as it always was before the reflection fallback.
+        // Deliberately no vendor autoload fixture written: ServiceProvider is unresolvable
+        // either way, with or without one, since analyze() never gets a path to it.
+        $file = $this->write('<?php
+use Vendor\Acme2\ServiceProvider;
+class My_Provider2 extends ServiceProvider {
+    public function register() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertContains('register', $unusedMethods);
+    }
+
+    public function testExcludesMethodOverridingVendorInterfaceViaReflection(): void
+    {
+        $vendorAutoload = $this->write('<?php
+namespace Vendor\Acme3;
+interface Renderable {
+    public function render(): string;
+}
+');
+        $file = $this->write('<?php
+use Vendor\Acme3\Renderable;
+class My_View implements Renderable {
+    public function render(): string { return ""; }
+}
+');
+        $findings = $this->analyzer->analyze([$file], [$vendorAutoload]);
+        self::assertEmpty(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod));
+    }
+
+    public function testExcludesMultipleVendorAutoloadPaths(): void
+    {
+        // The Bedrock-style case: two separate vendor/ directories (the project root's, and a
+        // theme's own) each define a piece of the picture — the reflector must consult both.
+        $baseAutoload = $this->write('<?php
+namespace Vendor\Base;
+class Base {
+    public function boot() {}
+}
+');
+        $subAutoload = $this->write('<?php
+namespace Vendor\Sub;
+use Vendor\Base\Base;
+class Sub extends Base {}
+');
+        $file = $this->write('<?php
+use Vendor\Sub\Sub;
+class My_App extends Sub {
+    public function boot() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file], [$baseAutoload, $subAutoload]);
+        self::assertEmpty(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod));
+    }
+
     public function testExcludesMagicMethodsFromUnusedMethods(): void
     {
         $file = $this->write('<?php

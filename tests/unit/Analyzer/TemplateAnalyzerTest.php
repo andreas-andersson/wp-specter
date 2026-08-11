@@ -121,6 +121,128 @@ acf_register_block_type(array(
         self::assertEmpty($findings);
     }
 
+    // ── Sage/Acorn Blade views (resources/views) ────────────────────────────────────────────
+
+    public function testReportsUnreferencedBladeView(): void
+    {
+        $themeDir = $this->tmp;
+        $view = $this->writeBlade('resources/views/partials/dead.blade.php', '<p>dead</p>');
+
+        $findings = $this->analyzer->analyze([$view], WpMode::Hybrid, $themeDir);
+
+        self::assertCount(1, $findings);
+        self::assertStringContainsString('dead.blade.php', $findings[0]->name);
+    }
+
+    public function testDoesNotReportBladeViewReferencedViaExtends(): void
+    {
+        $themeDir = $this->tmp;
+        $layout = $this->writeBlade('resources/views/layouts/app.blade.php', '<html></html>');
+        $page = $this->writeBlade('resources/views/page.blade.php', "@extends('layouts.app')");
+
+        $findings = $this->analyzer->analyze([$layout, $page], WpMode::Hybrid, $themeDir);
+
+        self::assertEmpty(array_filter($findings, fn($f) => str_contains($f->name, 'app.blade.php')));
+    }
+
+    public function testDoesNotReportBladeViewReferencedViaInclude(): void
+    {
+        // "site-nav" is deliberately not a WP hierarchy name/prefix, so this only passes if the
+        // @include directive itself is what resolved the reference.
+        $themeDir = $this->tmp;
+        $partial = $this->writeBlade('resources/views/partials/site-nav.blade.php', '<nav></nav>');
+        $page = $this->writeBlade('resources/views/page.blade.php', "@include('partials.site-nav')");
+
+        $findings = $this->analyzer->analyze([$partial, $page], WpMode::Hybrid, $themeDir);
+
+        self::assertEmpty(array_filter($findings, fn($f) => str_contains($f->name, 'site-nav')));
+    }
+
+    public function testDoesNotReportBladeViewReferencedInsideIncludeFirstArray(): void
+    {
+        // @includeFirst(['partials.content-' . get_post_type(), 'partials.content-custom']) —
+        // the first element is dynamic (unresolvable), the second is a real literal alongside
+        // it in the same array; every quoted literal inside the parens must be captured.
+        $themeDir = $this->tmp;
+        $content = $this->writeBlade('resources/views/partials/content-custom.blade.php', '<article></article>');
+        $index = $this->writeBlade(
+            'resources/views/index.blade.php',
+            "@includeFirst(['partials.content-' . get_post_type(), 'partials.content-custom'])",
+        );
+
+        $findings = $this->analyzer->analyze([$content, $index], WpMode::Hybrid, $themeDir);
+
+        self::assertEmpty(array_filter($findings, fn($f) => str_contains($f->name, 'content-custom')));
+    }
+
+    public function testDoesNotReportBladeComponentReferencedViaXTag(): void
+    {
+        $themeDir = $this->tmp;
+        $component = $this->writeBlade('resources/views/components/alert.blade.php', '<div></div>');
+        $page = $this->writeBlade('resources/views/page.blade.php', '<x-alert type="warning"></x-alert>');
+
+        $findings = $this->analyzer->analyze([$component, $page], WpMode::Hybrid, $themeDir);
+
+        self::assertEmpty(array_filter($findings, fn($f) => str_contains($f->name, 'alert')));
+    }
+
+    public function testExemptsBladeHierarchyTemplates(): void
+    {
+        // WP hierarchy names carried over verbatim as .blade.php basenames — same exemption as
+        // classic root-level single.php/archive.php, just nested under resources/views and with
+        // the double extension that templateBasename() has to strip as a unit.
+        $themeDir = $this->tmp;
+        $single = $this->writeBlade('resources/views/single.blade.php', '<article></article>');
+
+        $findings = $this->analyzer->analyze([$single], WpMode::Hybrid, $themeDir);
+
+        self::assertEmpty($findings);
+    }
+
+    public function testExemptsBladeCustomPageTemplateHeader(): void
+    {
+        // "template-custom" isn't a hierarchy name or prefix, so this only passes if the
+        // Template Name: header check applies to TemplateAnalyzer's candidates too (previously
+        // only FileAnalyzer had it) — and works through Blade's {{-- --}} comment syntax, since
+        // the check is a raw-text regex that doesn't care which comment syntax wraps it.
+        $themeDir = $this->tmp;
+        $view = $this->writeBlade(
+            'resources/views/template-custom.blade.php',
+            "{{--\n  Template Name: Custom Template\n--}}\n\n@extends('layouts.app')",
+        );
+
+        $findings = $this->analyzer->analyze([$view], WpMode::Hybrid, $themeDir);
+
+        self::assertEmpty($findings);
+    }
+
+    public function testResourcesViewsIndexIsNotMistakenForBootstrapIndexPhp(): void
+    {
+        // Block mode doesn't apply the hierarchy exemption, so this file can only end up NOT
+        // reported by being wrongly filtered out during collection — the same
+        // functions.php/index.php skip meant for the theme's root bootstrap files. Asserting it
+        // IS reported here proves it was correctly collected as a real template candidate
+        // instead.
+        $themeDir = $this->tmp;
+        $view = $this->writeBlade('resources/views/index.blade.php', '<div>home</div>');
+
+        $findings = $this->analyzer->analyze([$view], WpMode::Block, $themeDir);
+
+        self::assertCount(1, $findings);
+        self::assertStringContainsString('index.blade.php', $findings[0]->name);
+    }
+
+    private function writeBlade(string $relative, string $content): string
+    {
+        $path = $this->tmp . '/' . $relative;
+        $dir = dirname($path);
+        if (!is_dir($dir)) {
+            mkdir($dir, 0755, true);
+        }
+        file_put_contents($path, $content);
+        return $path;
+    }
+
     private function touch(string $relative): string
     {
         $path = $this->tmp . '/' . $relative;

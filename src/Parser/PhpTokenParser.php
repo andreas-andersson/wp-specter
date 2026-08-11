@@ -61,6 +61,7 @@ final class PhpTokenParser
         // when both signals are present in the same file, a coarse but WP-idiomatic heuristic.
         $globIncludeDirs = [];
         $hasIncludeStatement = false;
+        $useImports = [];
 
         $count = count($tokens);
         $line = 1;
@@ -206,6 +207,19 @@ final class PhpTokenParser
                     if ($kind === 'trait') {
                         $pendingClassName = $def->name;
                     }
+                }
+                continue;
+            }
+
+            if ($type === T_USE && empty($classDepthStack) && $this->peekNextMeaningful($tokens, $i) !== '(') {
+                // File-level `use Some\Namespace\Name [as Alias];` import — distinguished from a
+                // closure's `function() use ($v)` by that guard (a closure's `use` is always
+                // immediately followed by `(`) and from the in-class-body trait `use` below by
+                // $classDepthStack being empty here. Recorded so VendorClassReflector can resolve
+                // an extends/implements short name (PhpTokenParser only ever keeps short names,
+                // see shortClassName) back to a real, autoloadable vendor class.
+                foreach ($this->parseUseImports($tokens, $i) as $alias => $fqcn) {
+                    $useImports[$alias] = $fqcn;
                 }
                 continue;
             }
@@ -447,6 +461,7 @@ final class PhpTokenParser
             traitUsages: $traitUsages,
             globIncludeDirs: $globIncludeDirs,
             hasIncludeStatement: $hasIncludeStatement,
+            useImports: $useImports,
         );
     }
 
@@ -990,6 +1005,75 @@ final class PhpTokenParser
         }
 
         return $names;
+    }
+
+    /**
+     * Parses a file-level `use Name\Space\Foo [as Alias], Other\Bar;` statement starting at the
+     * T_USE token, returning alias/short-name => fully-qualified name. Handles multiple
+     * comma-separated imports on one line and `as` aliasing. Deliberately does NOT support
+     * group-use (`use App\{Foo, Bar as B};`) — bails out (returning whatever it already
+     * collected) the moment it sees `{`, rather than guessing; the main token loop's own generic
+     * brace-depth tracking still balances that `{`/`}` pair correctly on its own since they're
+     * real, matched tokens, so bailing here doesn't corrupt anything downstream. `use function
+     * ...`/`use const ...` imports aren't classes either, so they're skipped entirely.
+     *
+     * @param list<Token> $tokens
+     * @return array<string,string>
+     */
+    private function parseUseImports(array $tokens, int $i): array
+    {
+        $j = $i + 1;
+        while (isset($tokens[$j]) && is_array($tokens[$j]) && $tokens[$j][0] === T_WHITESPACE) {
+            $j++;
+        }
+
+        if (isset($tokens[$j]) && is_array($tokens[$j]) && in_array($tokens[$j][0], [T_FUNCTION, T_CONST], true)) {
+            return [];
+        }
+
+        $imports = [];
+        while (isset($tokens[$j])) {
+            $t = $tokens[$j];
+
+            if (is_string($t)) {
+                if ($t === ';' || $t === '{') {
+                    break;
+                }
+                $j++;
+                continue;
+            }
+
+            if ($t[0] === T_WHITESPACE) {
+                $j++;
+                continue;
+            }
+
+            if (in_array($t[0], self::CLASS_NAME_TOKENS, true)) {
+                $fqcn = ltrim($t[1], '\\');
+                $alias = $this->shortClassName($fqcn);
+
+                $k = $j + 1;
+                while (isset($tokens[$k]) && is_array($tokens[$k]) && $tokens[$k][0] === T_WHITESPACE) {
+                    $k++;
+                }
+                if (isset($tokens[$k]) && is_array($tokens[$k]) && $tokens[$k][0] === T_AS) {
+                    $k++;
+                    while (isset($tokens[$k]) && is_array($tokens[$k]) && $tokens[$k][0] === T_WHITESPACE) {
+                        $k++;
+                    }
+                    if (isset($tokens[$k]) && is_array($tokens[$k]) && $tokens[$k][0] === T_STRING) {
+                        $alias = $tokens[$k][1];
+                        $j = $k;
+                    }
+                }
+
+                $imports[$alias] = $fqcn;
+            }
+
+            $j++;
+        }
+
+        return $imports;
     }
 
     private function shortClassName(string $name): string

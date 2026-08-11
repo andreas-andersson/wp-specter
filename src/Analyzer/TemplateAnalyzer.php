@@ -13,8 +13,21 @@ use WpSpecter\Parser\PhpTokenParser;
 
 final class TemplateAnalyzer
 {
-    private const TEMPLATE_DIRS = ['templates', 'template-parts', 'parts'];
+    // "resources/views" is Roots Sage/Acorn's Blade views root — Sage's WP hierarchy files
+    // (index.blade.php, single.blade.php, ...) and partials both live there instead of at the
+    // theme root / template-parts, so it needs the same treatment as the other three.
+    private const TEMPLATE_DIRS = ['templates', 'template-parts', 'parts', 'resources/views'];
     private const BLOCK_JSON_RENDER_KEYS = ['render', 'renderCallback'];
+
+    // Blade directives whose argument(s) name another view, dot-notation (Blade's own path
+    // separator — "layouts.app" means resources/views/layouts/app.blade.php). Every literal
+    // string found inside the directive's parens is treated as a candidate view name (rather
+    // than trying to identify "the" argument precisely) — @includeFirst(['a.b', 'a.c']) and
+    // @includeWhen($cond, 'a.b') both need every quoted literal, not just the first.
+    private const BLADE_INCLUDE_DIRECTIVES = [
+        'extends', 'include', 'includeIf', 'includeWhen', 'includeUnless',
+        'includeFirst', 'each', 'component', 'componentFirst',
+    ];
 
     public function __construct(
         private readonly PhpTokenParser $parser,
@@ -57,6 +70,30 @@ final class TemplateAnalyzer
             }
         }
 
+        // Blade's @extends/@include-family directives and <x-component> tags aren't PHP syntax
+        // at all — a .blade.php file is almost entirely inline HTML/text from a tokenizer's
+        // point of view, so PhpTokenParser's include-ref detection (which fires on real
+        // T_INCLUDE/T_REQUIRE tokens) never sees them. Scanned separately, straight off the raw
+        // file content, for every file actually named *.blade.php among $files.
+        foreach ($files as $file) {
+            if (!str_ends_with($file, '.blade.php')) {
+                continue;
+            }
+            $content = @file_get_contents($file);
+            if ($content === false) {
+                continue;
+            }
+            foreach ($this->extractBladeReferences($content) as $ref) {
+                $normalized = $this->normalizePath($ref);
+                if ($normalized === '') {
+                    continue;
+                }
+                $referenced[$normalized] = true;
+                $referenced[basename($normalized)] = true;
+                $referenced[pathinfo($normalized, PATHINFO_FILENAME)] = true;
+            }
+        }
+
         // In block mode, also parse block.json render fields
         if ($mode === WpMode::Block || $mode === WpMode::Hybrid) {
             foreach ($this->collectBlockJsonRefs($themeDir) as $ref) {
@@ -72,10 +109,21 @@ final class TemplateAnalyzer
 
         $findings = [];
         foreach ($templateFiles as $templateFile) {
-            $basename = basename($templateFile, '.php');
+            $basename = $this->templateBasename($templateFile);
 
             // Exempt WP core hierarchy templates (exact names + pattern variants) in classic/hybrid mode
             if ($mode !== WpMode::Block && $this->modeDetector->isHierarchyTemplate($basename)) {
+                continue;
+            }
+
+            // WP Page Templates are selected from the admin UI by this header comment — WP loads
+            // them by scanning the theme, never through a visible include()/require() call, same
+            // reasoning as FileAnalyzer::hasPageTemplateHeader(). A custom-named page template
+            // (author-chosen name — the whole point of a custom page template) has no hierarchy
+            // name to match the check above, so it needs this separate exemption. Works for
+            // Blade's `{{-- Template Name: ... --}}` comment syntax too: the regex only cares
+            // about the raw text, not which comment syntax wraps it.
+            if ($this->hasPageTemplateHeader($templateFile)) {
                 continue;
             }
 
@@ -127,9 +175,12 @@ final class TemplateAnalyzer
 
             $relative = ltrim(str_replace($themeDir, '', $file), '/');
 
-            // Always skip non-template files
-            $basename = basename($file, '.php');
-            if (in_array($basename, ['functions', 'index'], true)) {
+            // Always skip the theme's own root-level bootstrap files — matched by their exact
+            // root-relative path, not just basename, so a same-named file in a nested template
+            // dir (e.g. Sage's resources/views/index.blade.php, a real hierarchy template once
+            // its .blade.php is stripped down to "index") is never mistaken for theme root
+            // index.php.
+            if ($relative === 'functions.php' || $relative === 'index.php') {
                 continue;
             }
 
@@ -186,10 +237,94 @@ final class TemplateAnalyzer
         return $refs;
     }
 
+    private function hasPageTemplateHeader(string $file): bool
+    {
+        $content = file_get_contents($file, length: 4096);
+        return $content !== false && (bool) preg_match('/Template\s+Name\s*:/i', $content);
+    }
+
     private function normalizePath(string $path): string
     {
         $path = trim($path, '/');
         return $path;
+    }
+
+    /**
+     * basename($file, '.php') only strips the final ".php" — on "single.blade.php" that leaves
+     * "single.blade", which never matches WpModeDetector's hierarchy name list ("single"). Blade
+     * views need their double extension stripped as a unit for hierarchy/reference matching to
+     * work at all.
+     */
+    private function templateBasename(string $file): string
+    {
+        $name = basename($file);
+        if (str_ends_with($name, '.blade.php')) {
+            return substr($name, 0, -strlen('.blade.php'));
+        }
+        return basename($file, '.php');
+    }
+
+    /**
+     * Pulls every candidate view name out of a .blade.php file's Blade directives and anonymous
+     * component tags — see BLADE_INCLUDE_DIRECTIVES for why "every quoted literal in the parens"
+     * rather than trying to identify a specific argument position. Dot notation is converted to
+     * slashes (Blade's own path separator matches this project's directory-relative convention
+     * for everything else referenced-index related).
+     *
+     * @return list<string>
+     */
+    private function extractBladeReferences(string $content): array
+    {
+        $refs = [];
+
+        foreach (self::BLADE_INCLUDE_DIRECTIVES as $directive) {
+            $needle = '@' . $directive . '(';
+            $offset = 0;
+            while (($pos = strpos($content, $needle, $offset)) !== false) {
+                $openParen = $pos + strlen($needle) - 1;
+                $closeParen = $this->findMatchingParen($content, $openParen);
+                if ($closeParen === null) {
+                    break;
+                }
+
+                $args = substr($content, $openParen + 1, $closeParen - $openParen - 1);
+                if (preg_match_all('/([\'"])((?:(?!\1).)*)\1/', $args, $matches)) {
+                    foreach ($matches[2] as $literal) {
+                        $refs[] = str_replace('.', '/', $literal);
+                    }
+                }
+
+                $offset = $closeParen + 1;
+            }
+        }
+
+        // Anonymous Blade components: <x-alert ...> => components/alert.blade.php,
+        // <x-forms.input ...> => components/forms/input.blade.php.
+        if (preg_match_all('/<x[-:]([a-zA-Z0-9_.\-]+)/', $content, $matches)) {
+            foreach ($matches[1] as $name) {
+                $refs[] = 'components/' . str_replace('.', '/', $name);
+            }
+        }
+
+        return $refs;
+    }
+
+    /** Finds the index of the ')' matching the '(' at $openPos, honoring nested parens. */
+    private function findMatchingParen(string $content, int $openPos): ?int
+    {
+        $depth = 0;
+        $length = strlen($content);
+        for ($i = $openPos; $i < $length; $i++) {
+            if ($content[$i] === '(') {
+                $depth++;
+            } elseif ($content[$i] === ')') {
+                $depth--;
+                if ($depth === 0) {
+                    return $i;
+                }
+            }
+        }
+        return null;
     }
 
     /** @param array<string,bool> $referenced */

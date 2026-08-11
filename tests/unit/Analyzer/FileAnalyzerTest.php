@@ -77,6 +77,14 @@ include_once \$path . '/storm.php';
         self::assertEmpty($this->analyzer->analyze([$part], $this->tmp));
     }
 
+    public function testSageResourcesViewsDirIsExempt(): void
+    {
+        // resources/views (Roots Sage/Acorn's Blade views root) belongs to TemplateAnalyzer too.
+        $view = $this->write('resources/views/partials/content.blade.php', '<article></article>');
+
+        self::assertEmpty($this->analyzer->analyze([$view], $this->tmp));
+    }
+
     public function testPageTemplateHeaderIsExempt(): void
     {
         // WP Page Templates are selected from the admin UI via this header — never included

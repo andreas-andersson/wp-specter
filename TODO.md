@@ -97,6 +97,56 @@ scope limit that trades recall or precision for staying a single-pass, no-depend
   (`findScopedCallTarget`'s receiver-side checks) that's T_STRING-only). Low priority: WP
   plugin/theme code is overwhelmingly written in the global namespace.
 
+- [x] **Contract-method exemption (and the class-unused check) only ever knew about base
+  classes/interfaces the scan itself parsed — a class extending a real Composer dependency
+  (`vendor/`, never part of `$files`) always dead-ended and got flagged.** Found by running
+  wp-specter against a real Roots Sage (Acorn) theme: `ThemeServiceProvider extends
+  SageServiceProvider` (vendor) overriding `register()`/`boot()`, and `App`/`Post`/`Comments`
+  extending `Roots\Acorn\View\Composer` (vendor) with zero syntactic reference anywhere in
+  project code (Acorn auto-discovers both by PSR-4 directory convention, not a literal call) —
+  10 false-positive unused methods and 3 false-positive unused classes, all real-world, all
+  idiomatic code. Fixed in three parts:
+  1. **`VendorClassReflector`** (`src/Analyzer/VendorClassReflector.php`): given a list of
+     `vendor/autoload.php` paths, answers "does class/interface X declare method Y" via PHP's
+     own autoloader + `ReflectionClass` — sees the *real* inheritance chain, including further
+     vendor ancestors, with no per-framework list to maintain. `isContractMethod`'s
+     extends/implements walk falls back to it the moment it steps off the edge of
+     `$classDefsByName` (a vendor target), generalizing the existing curated
+     `BASE_CLASS_CONTRACT_METHODS`/`INTERFACE_CONTRACT_METHODS` lists rather than replacing them
+     (those stay as the fast path, and remain the only path for classes that aren't
+     Composer-autoloadable at all, e.g. WP core's `WP_Widget`/`Walker`). Deliberately opt-in and
+     best-effort: every entry point is wrapped in `try/catch \Throwable` per path, so a
+     missing/broken/side-effecting vendor file degrades to "no answer," never a fatal scan.
+  2. **`FULLY_EXEMPT_BASE_CLASSES`** in `ClassAnalyzer` (currently just `'Composer'` — Acorn's
+     `Roots\Acorn\View\Composer`): reflection can't help here since there's no fixed method name
+     to check against — a Composer subclass's methods are Blade-view data providers, discovered
+     by matching an author-chosen method name against the view's requested variable at render
+     time. `isFullyExemptClass()` walks the extends chain the same bounded way
+     `isContractMethod()` does, and is checked by *both* `findUnusedClasses` and
+     `findUnusedMethods` — the first curated list in this file that suppresses a class-level
+     finding, not just a method-level one.
+  3. **`PhpTokenParser::parseUseImports`**: file-level `use Some\Namespace\Name [as Alias];`
+     imports were never tracked at all before this (only the in-class-body trait-`use` case was)
+     — without it, `VendorClassReflector` had no way to turn `extends SageServiceProvider` (the
+     short name `parseClassDef` always stores) back into the real, autoloadable
+     `Roots\Acorn\Sage\SageServiceProvider`. Recorded on `ParseResult::$useImports` (short
+     name/alias => FQCN), merged globally across files the same way `$classDefsByName` already
+     is. Deliberately does NOT support group-use (`use App\{Foo, Bar as B};`) — bails out
+     without recording anything the moment it sees `{`, rather than guessing; verified this
+     doesn't desync the main loop's brace-depth tracking, since those are still real, balanced
+     braces the generic `{`/`}` handling counts correctly either way.
+
+  Also fixed along the way: `Application::resolveVendorAutoloadPaths` collects vendor
+  autoloaders from *both* the detected composer project root AND every scan target's own
+  directory (not just one or the other) — a Bedrock-style layout has its own root `vendor/`,
+  but a theme like Sage that requires Acorn directly has a second, separate `vendor/` right
+  under the theme, and the classes a scan needs to reflect on can live in either.
+
+  Considered and rejected: shelling out to PHPStan for this. Its open-source engine has no
+  built-in unused-code rule at all (that's a Pro-only paid feature) — pulling it in wouldn't
+  have solved the actual problem, just added a heavy, BC-unstable-internals dependency to a
+  currently zero-runtime-dependency tool for a job plain Reflection already does.
+
 ## Suggested priority if picked back up
 
 Items 1-3 below are done (see checked items above). Remaining, in rough priority order:
@@ -161,22 +211,63 @@ way the class/method/file gaps above were found; nothing here has been fixed yet
 
 ## Template detection
 
-- [ ] **`TemplateAnalyzer` doesn't know about `Template Name:` custom page templates.** WP Page
-  Templates are selected from the admin UI by scanning the theme for this header comment — never
-  through a literal `include()`/`get_template_part()` call anywhere in project code, which is
-  exactly why `FileAnalyzer::hasPageTemplateHeader()` exists as an exemption. But a root-level
-  `.php` file is routed to `TemplateAnalyzer` instead (`FileAnalyzer::isCandidate()` returns
-  `false` for any root-level file before it would even reach that check — root-level files are
-  explicitly TemplateAnalyzer's job). `TemplateAnalyzer::analyze()` only exempts WP's fixed
-  template-hierarchy names (`WpModeDetector::isHierarchyTemplate()`); a custom-named page template
-  like `template-landing.php` or `page-fullwidth.php` — an extremely common WP theme pattern,
-  since the whole point of a custom page template is an author-chosen name — has no hierarchy
-  name to match and gets falsely flagged `UnusedTemplate`. Highest-impact item in this section:
-  it's a confirmed false positive on completely ordinary theme code, not an edge case.
-  - Fix shape: `TemplateAnalyzer` already has every candidate file's full path in
-    `collectTemplateFiles()` — give it the same `Template\s+Name\s*:` header check
-    `FileAnalyzer::hasPageTemplateHeader()` already does (read first ~4KB, regex match) and
-    exempt on a match, right alongside the existing `isHierarchyTemplate()` check.
+- [x] **`TemplateAnalyzer` doesn't know about `Template Name:` custom page templates.** Fixed:
+  `TemplateAnalyzer` now has its own `hasPageTemplateHeader()` (same regex as
+  `FileAnalyzer`'s), checked right alongside `isHierarchyTemplate()` for every collected
+  template file. WP Page Templates are selected from the admin UI by scanning the theme for
+  this header comment — never through a literal `include()`/`get_template_part()` call
+  anywhere in project code — so a custom-named page template like `template-landing.php` (an
+  author-chosen name is the whole point of a custom page template) has no hierarchy name to
+  match and, before this fix, always got falsely flagged `UnusedTemplate`.
+
+- [x] **Roots Sage/Acorn's Blade views (`resources/views/`) were invisible as a template
+  concept entirely and fell through to `FileAnalyzer` as generic "unused files."** Found by
+  running wp-specter against a real Sage theme: 18 false-positive `UnusedFile` findings, every
+  `.blade.php` in the theme. Root causes and fixes:
+  1. `resources/views` wasn't in either analyzer's `TEMPLATE_DIRS` list, so `FileAnalyzer`
+     treated every Blade view as a generic support file instead of handing it to
+     `TemplateAnalyzer` — added to both, same hand-off convention as `templates`/
+     `template-parts`/`parts`.
+  2. `TemplateAnalyzer` computed a template's basename via `basename($file, '.php')`, which
+     only strips the final `.php` — on `single.blade.php` that leaves `single.blade`, never
+     matching `WpModeDetector`'s hierarchy name list (`single`). New
+     `TemplateAnalyzer::templateBasename()` strips `.blade.php` as a unit first. This alone
+     fixed most of Sage's default views: its WP-hierarchy-equivalent files
+     (`index`/`single`/`page`/`404`/`search.blade.php`) and several partials that happen to
+     share a name with a real hierarchy entry (`sections/header.blade.php`,
+     `sections/footer.blade.php`, `sections/sidebar.blade.php`, `partials/comments.blade.php`,
+     `partials/page-header.blade.php` via the existing `page-` prefix match) were already
+     covered by the existing hierarchy-exemption logic once the basename was computed
+     correctly — no Blade-specific handling needed for those.
+  3. The remaining views (`layouts/app`, `partials/content*`, `partials/entry-meta`,
+     `components/alert`) are only reachable through Blade's own directive syntax
+     (`@extends('layouts.app')`, `@include('partials.x')`, `@includeFirst([...])`,
+     `<x-alert>`), which isn't PHP syntax at all — a `.blade.php` file is almost entirely
+     inline HTML/text from a tokenizer's point of view, so `PhpTokenParser`'s
+     `T_INCLUDE`/`T_REQUIRE`-based include-ref detection never sees any of it. New
+     `TemplateAnalyzer::extractBladeReferences()` scans a `.blade.php` file's raw content
+     directly (regex/manual paren-matching, not tokenizing) for a curated list of
+     include-family directives (`BLADE_INCLUDE_DIRECTIVES`) plus anonymous component tags
+     (`<x-name>` → `components/name.blade.php`), converting Blade's dot notation to slashes.
+     Deliberately grabs every quoted string literal inside a directive's parens rather than
+     trying to identify "the" argument — `@includeFirst(['partials.content-' .
+     get_post_type(), 'partials.content'])` needs the second array element even though the
+     first is dynamic, and `@includeWhen($cond, 'partials.entry-meta')`'s view name isn't the
+     first argument.
+  4. Bug caught fixing this: `collectTemplateFiles()`'s "always skip functions.php/index.php"
+     guard matched on basename alone, so `resources/views/index.blade.php` (a real,
+     legitimately-used hierarchy template) was being silently filtered out before ever
+     becoming a template candidate — same failure mode as the bootstrap `index.php` exemption,
+     just colliding on name. Fixed to match the exact root-relative path instead.
+
+  Not attempted: Acorn's own internal view-resolution conventions with zero literal reference
+  anywhere in project code at all (e.g. `forms/search.blade.php`, wired to `get_search_form()`
+  by Acorn's own vendor code, not project code) — turned out to be a non-issue in practice
+  here purely by naming coincidence (`search` is already a real WP hierarchy name so it's
+  exempted either way), but a differently-named case of the same pattern would still be a
+  false positive. Same category of gap as the View Composer/ServiceProvider auto-discovery
+  case documented under Class detection above; not worth a special case without a second
+  real-world example motivating it.
 
 ## Function detection
 
