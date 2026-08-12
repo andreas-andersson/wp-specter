@@ -20,6 +20,7 @@ final class Config
         public readonly bool $noColor,
         public readonly bool $generateConfig = false,
         public readonly bool $generateBaseline = false,
+        public readonly bool $noVendorReflection = false,
     ) {}
 
     public function wantsType(string $type): bool

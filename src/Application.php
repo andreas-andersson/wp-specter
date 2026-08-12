@@ -69,11 +69,17 @@ class Application
           --verbose              Show matched references alongside findings
           --no-color             Disable ANSI color output
           --generate-config      Write resolved scan targets to .wp-specter.config.json and exit.
-                                  Written to the composer project root if detected, else to the
-                                  current directory — run this from your project root, not from
-                                  inside the scanned theme/plugin directory.
+                                  Written to the current directory — run this from your project
+                                  root, not from inside the scanned theme/plugin directory.
           --generate-baseline    Save current findings as suppressions in .wp-specter.config.json
                                   and exit (requires --generate-config to have run first)
+          --no-vendor-reflection Don't load the scanned project's vendor/autoload.php for the
+                                  class-contract reflection fallback (see below). Loading it
+                                  executes that project's own Composer autoload code (including
+                                  any "files"-autoload entries) inside this process — pass this
+                                  flag to keep the scan strictly static, at the cost of possible
+                                  false-positive unused-class/method findings on classes that only
+                                  extend/implement a vendor dependency outside the scan.
 
         Generate-stubs options:
           --output=<file>        Output path for the stubs file (default: .wp-specter.stubs.json)
@@ -179,9 +185,10 @@ class Application
                 fn(string $dir) => new ScanTarget(basename($dir), $dir, $modeDetector->detect($dir)),
                 $matches,
             );
-            // Still worth detecting a real composer root here (for --generate-config to prefer
-            // over cwd) — a wildcard match can perfectly well live inside a composer-managed
-            // project even though it wasn't reached via composer auto-discovery.
+            // Still worth detecting a real composer root here — used for the header's project
+            // label below, and by resolveVendorAutoloadPaths() — a wildcard match can perfectly
+            // well live inside a composer-managed project even though it wasn't reached via
+            // composer auto-discovery.
             $composerRoot = (new ComposerProjectDetector($modeDetector))->findProjectRoot($configSearchPath);
             $projectInfo = new ProjectInfo(
                 $composerRoot ?? $configSearchPath,
@@ -243,7 +250,7 @@ class Application
         }
 
         if ($config->generateConfig) {
-            return $this->writeGeneratedConfig($targets, $projectConfig, $composerRoot, $isGlobPath ? $config->path : null);
+            return $this->writeGeneratedConfig($targets, $projectConfig, $isGlobPath ? $config->path : null);
         }
 
         $scanner = new FileScanner();
@@ -282,7 +289,11 @@ class Application
         }
 
         if ($config->wantsType('classes')) {
-            $vendorAutoloadPaths = $this->resolveVendorAutoloadPaths($composerRoot, $targets);
+            // Resolving these paths at all is what triggers VendorClassReflector to require_once
+            // them later — --no-vendor-reflection skips it here so a scan can stay strictly
+            // static (no target-project code ever executes), never even reaching the point where
+            // that would happen.
+            $vendorAutoloadPaths = $config->noVendorReflection ? [] : $this->resolveVendorAutoloadPaths($composerRoot, $targets);
             $findings = array_merge($findings, (new ClassAnalyzer($parser))->analyze($allFiles, $vendorAutoloadPaths));
         }
 
@@ -320,7 +331,7 @@ class Application
     }
 
     /** @param list<ScanTarget> $targets */
-    private function writeGeneratedConfig(array $targets, ?ProjectConfig $projectConfig, ?string $composerRoot, ?string $globPattern): int
+    private function writeGeneratedConfig(array $targets, ?ProjectConfig $projectConfig, ?string $globPattern): int
     {
         if ($projectConfig !== null) {
             return $this->error(
@@ -329,29 +340,28 @@ class Application
             );
         }
 
-        // A detected composer project root (found via composer.json/vendor detection) is an
-        // authoritative anchor — prefer it over cwd, since every target (composer-discovered or
-        // matched by a CLI wildcard) necessarily lives under it already. Otherwise default to
-        // cwd, matching how most CLI tools (phpstan, eslint, ...) resolve their config file —
-        // but only when cwd is actually an ancestor of every scanned target: ProjectConfigLoader
-        // only ever walks *upward* from a scan path to find the config, so writing it anywhere
-        // else makes it permanently undiscoverable on the next run.
-        if ($composerRoot !== null) {
-            $writeDir = $composerRoot;
-        } else {
-            try {
-                $writeDir = $this->requireCwd();
-            } catch (\RuntimeException $e) {
-                return $this->error($e->getMessage());
-            }
-            foreach ($targets as $target) {
-                if (!$this->isAncestorOrSame($writeDir, $target->path)) {
-                    return $this->error(
-                        'Cannot write ' . ProjectConfigLoader::CONFIG_FILENAME . " to the current directory ({$writeDir}) "
-                        . "— it is not an ancestor of the scanned path ({$target->path}). Run this command from the "
-                        . 'project root (an ancestor of everything you scan).'
-                    );
-                }
+        // Always cwd — same convention as generate-stubs' default output filename, and how most
+        // CLI tools (phpstan, eslint, ...) resolve their config file. A detected composer project
+        // root used to be preferred here instead, but that's the wrong anchor whenever the
+        // scanned target has its own nested composer.json (e.g. a Roots Sage theme requiring
+        // Acorn, sitting inside a larger Bedrock project) — detection stops at the nearest
+        // composer.json, which put the config file inside the theme instead of the real project
+        // root. cwd is simple and, unlike a detected root, exactly where the user ran the command
+        // from — but it must be an ancestor of every scanned target: ProjectConfigLoader only
+        // ever walks *upward* from a scan path to find the config, so writing it anywhere else
+        // makes it permanently undiscoverable on the next run.
+        try {
+            $writeDir = $this->requireCwd();
+        } catch (\RuntimeException $e) {
+            return $this->error($e->getMessage());
+        }
+        foreach ($targets as $target) {
+            if (!$this->isAncestorOrSame($writeDir, $target->path)) {
+                return $this->error(
+                    'Cannot write ' . ProjectConfigLoader::CONFIG_FILENAME . " to the current directory ({$writeDir}) "
+                    . "— it is not an ancestor of the scanned path ({$target->path}). Run this command from the "
+                    . 'project root (an ancestor of everything you scan).'
+                );
             }
         }
 
@@ -609,6 +619,7 @@ class Application
         $noColor = false;
         $generateConfig = false;
         $generateBaseline = false;
+        $noVendorReflection = false;
 
         foreach ($args as $arg) {
             if (str_starts_with($arg, '--stubs=')) {
@@ -638,6 +649,8 @@ class Application
                 $generateConfig = true;
             } elseif ($arg === '--generate-baseline') {
                 $generateBaseline = true;
+            } elseif ($arg === '--no-vendor-reflection') {
+                $noVendorReflection = true;
             } elseif (!str_starts_with($arg, '--')) {
                 $path = $arg;
             } else {
@@ -672,6 +685,7 @@ class Application
             noColor: $noColor,
             generateConfig: $generateConfig,
             generateBaseline: $generateBaseline,
+            noVendorReflection: $noVendorReflection,
         );
     }
 

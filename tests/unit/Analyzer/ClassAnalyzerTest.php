@@ -593,6 +593,45 @@ class Not_A_Composer {
         self::assertContains('siteName', $unusedMethods);
     }
 
+    public function testFullyExemptBaseClassStillAppliesWhenImportResolvesToTheRealFqcn(): void
+    {
+        // Same shape as the collision test below, but the `use` import this time resolves
+        // "Composer" to the actual Roots\Acorn\View\Composer FQCN — the exemption must still
+        // apply, same as when there's no import at all (the bare short-name fallback case
+        // covered by testExcludesFullyExemptBaseClassMethods above).
+        $file = $this->write('<?php
+use Roots\Acorn\View\Composer;
+class App extends Composer {
+    public function siteName() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        self::assertEmpty(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod));
+        self::assertEmpty(array_filter($findings, fn($f) => $f->type === FindingType::UnusedClass));
+    }
+
+    public function testFullyExemptBaseClassNameCollisionWithUnrelatedImportIsNotExempted(): void
+    {
+        // A project's own "Composer" class, unrelated to Roots\Acorn\View\Composer, explicitly
+        // imported from a different namespace via `use`. The short name matches
+        // FULLY_EXEMPT_BASE_CLASSES, but the resolved FQCN doesn't — this must NOT be treated as
+        // the Acorn base class, or every subclass's methods (and the subclass itself, if
+        // unreferenced) would be silently exempted by name collision alone.
+        $file = $this->write('<?php
+use My\App\Composer;
+class Not_Acorn extends Composer {
+    public function siteName() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertContains('siteName', $unusedMethods);
+        self::assertContains(
+            'Not_Acorn',
+            array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedClass), 'name'),
+        );
+    }
+
     // ── vendor reflection fallback (contract methods on classes outside the scan) ──────────
 
     public function testExcludesMethodOverridingVendorClassViaReflection(): void

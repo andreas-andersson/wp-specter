@@ -309,15 +309,35 @@ final class TemplateAnalyzer
         return $refs;
     }
 
-    /** Finds the index of the ')' matching the '(' at $openPos, honoring nested parens. */
+    /**
+     * Finds the index of the ')' matching the '(' at $openPos, honoring nested parens. Skips
+     * over single/double-quoted string literals while scanning — a literal paren inside a quoted
+     * view name (e.g. `@include('partials.header (v2)')`) must not be counted as real nesting,
+     * or the scan desyncs and either truncates the args before the real close paren or drifts
+     * into the wrong literal boundaries entirely.
+     */
     private function findMatchingParen(string $content, int $openPos): ?int
     {
         $depth = 0;
         $length = strlen($content);
+        $quote = null;
         for ($i = $openPos; $i < $length; $i++) {
-            if ($content[$i] === '(') {
+            $ch = $content[$i];
+
+            if ($quote !== null) {
+                if ($ch === '\\') {
+                    $i++; // Skip the escaped character (e.g. \' inside a '...' literal).
+                } elseif ($ch === $quote) {
+                    $quote = null;
+                }
+                continue;
+            }
+
+            if ($ch === "'" || $ch === '"') {
+                $quote = $ch;
+            } elseif ($ch === '(') {
                 $depth++;
-            } elseif ($content[$i] === ')') {
+            } elseif ($ch === ')') {
                 $depth--;
                 if ($depth === 0) {
                     return $i;

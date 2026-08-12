@@ -89,11 +89,11 @@ final class TerminalReporterTest extends TestCase
         self::assertStringNotContainsString("\033[", $plain);
     }
 
-    public function testEmptyFindingsPrintsAllClear(): void
+    public function testEmptyFindingsPrintsNothing(): void
     {
         $reporter = new TerminalReporter(noColor: true);
         $output = $this->capture(fn() => $reporter->printFindings([]));
-        self::assertStringContainsString('No issues found', $output);
+        self::assertSame('', $output);
     }
 
     public function testSummaryShowsCounts(): void

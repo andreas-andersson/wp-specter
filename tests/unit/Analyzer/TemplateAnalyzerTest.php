@@ -175,6 +175,23 @@ acf_register_block_type(array(
         self::assertEmpty(array_filter($findings, fn($f) => str_contains($f->name, 'content-custom')));
     }
 
+    public function testDoesNotReportBladeViewWithUnbalancedParenInReferencedName(): void
+    {
+        // A lone, unbalanced ')' inside a quoted view-name string must not be counted as the
+        // directive's real closing paren by findMatchingParen() — otherwise the paren-matching
+        // desyncs at that point, truncating the args substring mid-string (with the literal's
+        // opening quote left unterminated), and the reference is never captured at all. A
+        // balanced pair inside the string wouldn't actually expose this — it takes an unbalanced
+        // one to desync the depth counter.
+        $themeDir = $this->tmp;
+        $partial = $this->writeBlade('resources/views/partials/a)custom.blade.php', '<div></div>');
+        $page = $this->writeBlade('resources/views/page.blade.php', "@include('partials.a)custom')");
+
+        $findings = $this->analyzer->analyze([$partial, $page], WpMode::Hybrid, $themeDir);
+
+        self::assertEmpty(array_filter($findings, fn($f) => str_contains($f->name, 'a)custom')));
+    }
+
     public function testDoesNotReportBladeComponentReferencedViaXTag(): void
     {
         $themeDir = $this->tmp;

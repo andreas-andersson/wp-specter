@@ -98,7 +98,7 @@ function cache_unused() { return 1; }
         self::assertStringNotContainsString('vendor_unused', $output);
     }
 
-    public function testGenerateConfigWithCliWildcardPrefersComposerRootOverCwd(): void
+    public function testGenerateConfigWithCliWildcardWritesToCwdNotComposerRoot(): void
     {
         $project = $this->tmp . '/project';
         $this->writeJson('project/composer.json', [
@@ -110,19 +110,20 @@ function cache_unused() { return 1; }
         $this->write('project/wp-content/plugins/custom-a/custom-a.php', '<?php // a');
         $this->write('project/wp-content/plugins/custom-b/custom-b.php', '<?php // b');
 
-        // No chdir — cwd stays wherever the test runner started, unrelated to $project. The
-        // composer-detected root should still win, same as the non-wildcard case.
-        [$exit, $output] = $this->runApp([
+        // Run from $this->tmp — an ancestor of $project, but not $project (the composer root)
+        // itself — same reasoning as the non-wildcard case in GenerateConfigAndBaselineTest.
+        [$exit, $output] = $this->runFromTmp([
             'wp-specter', 'scan', $project . '/wp-content/plugins/custom-*', '--no-color', '--generate-config',
         ]);
 
         self::assertSame(0, $exit);
-        $configFile = $project . '/' . ProjectConfigLoader::CONFIG_FILENAME;
+        $configFile = $this->tmp . '/' . ProjectConfigLoader::CONFIG_FILENAME;
         self::assertStringContainsString($configFile, $output);
         self::assertFileExists($configFile);
+        self::assertFileDoesNotExist($project . '/' . ProjectConfigLoader::CONFIG_FILENAME);
 
         $data = $this->readJson($configFile);
-        self::assertSame(['wp-content/plugins/custom-*'], $data['targets']);
+        self::assertSame(['project/wp-content/plugins/custom-*'], $data['targets']);
     }
 
     /** @return array<string,mixed> */

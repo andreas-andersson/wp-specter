@@ -46,8 +46,6 @@ final class TerminalReporter
     public function printFindings(array $findings, bool $verbose = false, array $targets = []): void
     {
         if (empty($findings)) {
-            $this->line($this->green('  ✓ No issues found.'));
-            $this->line('');
             return;
         }
 

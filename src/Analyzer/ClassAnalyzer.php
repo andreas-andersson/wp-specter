@@ -37,14 +37,18 @@ final class ClassAnalyzer
     // Base classes whose subclasses get called entirely through framework naming-convention /
     // reflection, not through any fixed method-name contract — so no BASE_CLASS_CONTRACT_METHODS
     // list could ever be exhaustive. Every method (and the class itself) on a subclass is exempt.
-    // Keyed by short name, same collision trade-off already accepted by the other curated lists
-    // above (e.g. "Walker" isn't qualified either).
+    // Keyed by short name (same collision trade-off already accepted by the other curated lists
+    // above, e.g. "Walker" isn't qualified either), value is the real FQCN. Unlike the other
+    // lists, exempting a whole class is a big effect for a name collision to trigger by accident
+    // (a project's own unrelated "Composer" class, say) — so isFullyExemptClass() checks the
+    // FQCN via $useImports whenever the extending file actually imported one, and only falls
+    // back to the bare short-name match when no import resolved it either way.
     private const FULLY_EXEMPT_BASE_CLASSES = [
         // Roots\Acorn\View\Composer (Sage 10+/Acorn theme scaffolding): subclass methods are
         // Blade-view data providers, discovered by matching an author-chosen method name against
         // the view's requested variable name at render time — never a literal call anywhere in
         // project code.
-        'Composer' => true,
+        'Composer' => 'Roots\Acorn\View\Composer',
     ];
 
     // Bounds the extends-chain walk in isContractMethod() so a cyclic or malformed extends
@@ -83,7 +87,7 @@ final class ClassAnalyzer
             }
         }
 
-        $findings = $this->findUnusedClasses($parseResults, $classDefsByName);
+        $findings = $this->findUnusedClasses($parseResults, $classDefsByName, $useImports);
         array_push($findings, ...$this->findUnusedMethods($parseResults, $classDefsByName, $reflector, $useImports));
 
         usort($findings, fn(Finding $a, Finding $b) => $a->file <=> $b->file ?: $a->line <=> $b->line);
@@ -94,9 +98,10 @@ final class ClassAnalyzer
     /**
      * @param list<ParseResult> $parseResults
      * @param array<string,ClassDef> $classDefsByName
+     * @param array<string,string> $useImports
      * @return list<Finding>
      */
-    private function findUnusedClasses(array $parseResults, array $classDefsByName): array
+    private function findUnusedClasses(array $parseResults, array $classDefsByName, array $useImports = []): array
     {
         $referenced = [];
         foreach ($parseResults as $result) {
@@ -108,7 +113,7 @@ final class ClassAnalyzer
         $findings = [];
         foreach ($classDefsByName as $name => $def) {
             if (!isset($referenced[$name])) {
-                if ($this->isFullyExemptClass($name, $classDefsByName)) {
+                if ($this->isFullyExemptClass($name, $classDefsByName, $useImports)) {
                     continue;
                 }
                 $findings[] = new Finding(
@@ -178,7 +183,7 @@ final class ClassAnalyzer
                     || $this->isMagicMethod($def->name)
                     || isset($called[$def->name])
                     || isset($scopedCalled[$def->ownerClass ?? ''][$def->name])
-                    || $this->isFullyExemptClass($def->ownerClass, $classDefsByName)
+                    || $this->isFullyExemptClass($def->ownerClass, $classDefsByName, $useImports)
                     || $this->isContractMethod($def->name, $def->ownerClass, $classDefsByName, $reflector, $useImports)
                     || $this->isUsedByTraitConsumer($def->ownerClass, $def->name, $classDefsByName, $traitUsers, $scopedCalled)
                 ) {
@@ -264,9 +269,18 @@ final class ClassAnalyzer
      * a class's own name (whole-class check from findUnusedClasses) or a method's owner class
      * (findUnusedMethods).
      *
+     * Exempting an entire class is a much bigger effect than the per-method curated lists above,
+     * so a bare short-name match isn't good enough on its own: a project with its own unrelated
+     * "Composer" base class would otherwise get every subclass silently exempted. Whenever the
+     * extending file actually `use`-imported the base name, $useImports must resolve it to the
+     * real FQCN in FULLY_EXEMPT_BASE_CLASSES before this counts as a match — only falling back to
+     * the bare short-name comparison (the original, collision-prone behavior) when no import
+     * resolved it either way, since then there's no FQCN to check against at all.
+     *
      * @param array<string,ClassDef> $classDefsByName
+     * @param array<string,string> $useImports
      */
-    private function isFullyExemptClass(?string $className, array $classDefsByName): bool
+    private function isFullyExemptClass(?string $className, array $classDefsByName, array $useImports = []): bool
     {
         if ($className === null) {
             return false;
@@ -283,8 +297,12 @@ final class ClassAnalyzer
                 return false;
             }
 
-            if (isset(self::FULLY_EXEMPT_BASE_CLASSES[$base])) {
-                return true;
+            $expectedFqcn = self::FULLY_EXEMPT_BASE_CLASSES[$base] ?? null;
+            if ($expectedFqcn !== null) {
+                $importedFqcn = $useImports[$base] ?? null;
+                if ($importedFqcn === null || $importedFqcn === $expectedFqcn) {
+                    return true;
+                }
             }
 
             $className = $base;

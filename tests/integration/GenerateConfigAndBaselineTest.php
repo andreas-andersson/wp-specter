@@ -68,8 +68,14 @@ add_action( 'never_fired_hook', 'used_fn' );
         self::assertFileDoesNotExist($this->tmp . '/' . ProjectConfigLoader::CONFIG_FILENAME);
     }
 
-    public function testGenerateConfigPrefersComposerRootOverCwd(): void
+    public function testGenerateConfigWritesToCwdNotComposerRoot(): void
     {
+        // A composer-detected project root used to win over cwd here. It shouldn't: a scanned
+        // target with its own nested composer.json (a Roots Sage theme requiring Acorn, say)
+        // would make detection stop there instead of at the real outer project, silently writing
+        // the config file inside the theme. cwd is simple and predictable instead — same
+        // convention generate-stubs' default output already uses — as long as it's an ancestor
+        // of every scanned target.
         $project = $this->tmp . '/project';
         $this->writeJson('project/composer.json', [
             'extra' => ['installer-paths' => [
@@ -81,17 +87,42 @@ add_action( 'never_fired_hook', 'used_fn' );
         $this->write('project/wp-content/themes/mytheme/style.css', "/*\nTheme Name: My Theme\n*/");
         $this->write('project/wp-content/themes/mytheme/functions.php', '<?php function theme_unused() { return 1; }');
 
-        // No chdir at all — cwd stays wherever the test runner started, unrelated to $project.
-        // The composer-detected root should still win, so this must succeed anyway.
-        [$exit, $output] = $this->runApp(['wp-specter', 'scan', $project, '--no-color', '--generate-config']);
+        // Run from $this->tmp — an ancestor of $project, but not $project (the composer root)
+        // itself — so the two locations can't coincidentally agree.
+        [$exit, $output] = $this->runFromTmp(['wp-specter', 'scan', $project, '--no-color', '--generate-config']);
 
         self::assertSame(0, $exit);
-        $configFile = $project . '/' . ProjectConfigLoader::CONFIG_FILENAME;
+        $configFile = $this->tmp . '/' . ProjectConfigLoader::CONFIG_FILENAME;
         self::assertStringContainsString($configFile, $output);
         self::assertFileExists($configFile);
+        self::assertFileDoesNotExist($project . '/' . ProjectConfigLoader::CONFIG_FILENAME);
 
         $data = $this->readJson($configFile);
-        self::assertContains('wp-content/themes/mytheme', $data['targets']);
+        self::assertContains('project/wp-content/themes/mytheme', $data['targets']);
+    }
+
+    public function testGenerateConfigErrorsWhenCwdIsNotAnAncestorOfTarget(): void
+    {
+        // cwd is unrelated to the scanned target entirely — ProjectConfigLoader only ever walks
+        // upward from a scan path, so writing the config anywhere else would make it permanently
+        // undiscoverable on the next run. Must error instead of silently picking somewhere else.
+        $project = $this->tmp . '/project';
+        $this->write('project/wp-content/themes/mytheme/style.css', "/*\nTheme Name: My Theme\n*/");
+        $unrelated = $this->tmp . '/unrelated';
+        mkdir($unrelated, 0755, true);
+
+        $cwd = getcwd();
+        self::assertIsString($cwd);
+        chdir($unrelated);
+        try {
+            [$exit, $output] = $this->runApp(['wp-specter', 'scan', $project . '/wp-content/themes/mytheme', '--no-color', '--generate-config']);
+        } finally {
+            chdir($cwd);
+        }
+
+        self::assertSame(2, $exit);
+        self::assertStringContainsString('not an ancestor', $output);
+        self::assertFileDoesNotExist($unrelated . '/' . ProjectConfigLoader::CONFIG_FILENAME);
     }
 
     public function testGenerateConfigErrorsWhenAlreadyExists(): void
@@ -127,7 +158,7 @@ add_action( 'never_fired_hook', 'used_fn' );
         [$exit, $output] = $this->runFromTmp(['wp-specter', 'scan', $this->tmp, '--no-color']);
 
         self::assertSame(0, $exit);
-        self::assertStringContainsString('No issues found', $output);
+        self::assertStringContainsString('All clear.', $output);
         self::assertStringContainsString('2 finding(s) suppressed by baseline', $output);
     }
 
