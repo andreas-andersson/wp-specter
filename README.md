@@ -1,7 +1,7 @@
 # WP Specter
 
 <p align="center">
-	<img src="https://github.com/andreas-andersson/wp-specter/specter.png" alt="WP-Specter" width="200" height="200">
+	<img src="specter.png" alt="WP-Specter" width="200" height="200">
 </p>
 
 **Has your WordPress project grown over the years? Or did you inherit one — thousands
