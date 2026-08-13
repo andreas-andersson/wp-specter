@@ -71,6 +71,21 @@ Unused Methods
 Found: 3 unused function(s), 1 unmatched hook(s), 3 unused file(s), 1 unused class(es), 2 unused method(s)
 ```
 
+## Contents
+
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Usage](#usage)
+  - [Scan a theme or plugin](#scan-a-theme-or-plugin)
+  - [Scan a composer-managed project (Bedrock and similar)](#scan-a-composer-managed-project-bedrock-and-similar)
+  - [generate-stubs](#generate-stubs)
+  - [Project config: `.wp-specter.config.json`](#project-config-wp-specterconfigjson)
+  - [Project stubs: `.wp-specter.stubs.json`](#project-stubs-wp-specterstubsjson)
+- [What it checks](#what-it-checks)
+- [Supported theme types](#supported-theme-types)
+- [Project structure](#project-structure)
+- [Running tests](#running-tests)
+- [License](#license)
 
 ## Requirements
 
@@ -147,6 +162,9 @@ fires isn't reported as unmatched.
 | `--ignore=<globs>` | Comma-separated glob patterns to exclude from scanning |
 | `--verbose` | Show extra detail alongside findings |
 | `--no-color` | Disable ANSI colour output |
+| `--generate-config` | Write resolved scan targets to `.wp-specter.config.json` and exit (see [Project config](#project-config-wp-specterconfigjson)) |
+| `--generate-baseline` | Save the current findings as suppressions in `.wp-specter.config.json` and exit (see [Baselining existing findings](#baselining-existing-findings)) |
+| `--no-vendor-reflection` | Don't load the scanned project's `vendor/autoload.php` for the class-contract reflection fallback (see [Unused classes](#unused-classes)) |
 
 #### Run only specific checks
 
@@ -187,12 +205,11 @@ wp-specter generate-stubs ./plugins
 # ..or set a custom output file
 wp-specter generate-stubs ./plugins --output=whatever.json
 
-
 # The stubs file will be auto-loaded on your next scan if using the default filename
 wp-specter scan ./themes/my-theme
 
 # ..if using a custom stub-filename you need to pass it with
-wp-specter generate-stubs ./plugins --stubs=whatevern.json
+wp-specter scan ./themes/my-theme --stubs=whatever.json
 ```
 
 The generated file looks like:
@@ -200,7 +217,7 @@ The generated file looks like:
 ```json
 {
     "generated": "2026-08-07",
-    "source": "/path/to/plugins",
+    "source": "web/app/plugins",
     "hooks": [
         "my_plugin_action",
         "my_plugin_filter"
@@ -232,6 +249,15 @@ every time — drop a `.wp-specter.config.json` anywhere at or above the path yo
 }
 ```
 
+You can write this file by hand, or let wp-specter generate the `targets` list for you by running
+`--generate-config` from your project root — auto-detection runs as normal (composer discovery
+included) and the resolved targets are written out instead of scanned:
+
+```bash
+# From the project root, not from inside the scanned theme/plugin directory
+wp-specter scan --generate-config
+```
+
 All paths are resolved relative to the config file's own directory.
 
 - **`targets`** — exactly which theme/plugin directories to scan. When present, this replaces
@@ -252,6 +278,58 @@ All paths are resolved relative to the config file's own directory.
   one anchored at the config file's own location. Useful for a plugin project scanned from its own
   root, where the plugin's `tests/` directory would otherwise be scanned for unused code alongside
   the plugin itself.
+- **`baseline`** — findings to suppress on every future scan, written by `--generate-baseline`
+  (see below) rather than edited by hand. Each entry's `type` is one of `unused_function`,
+  `unmatched_hook`, `unused_template`, `unused_file`, `unused_class`, `unused_method`.
+
+#### Baselining existing findings
+
+Adopting wp-specter on an established project can turn up a pile of pre-existing findings you
+don't want to fix right now. `--generate-baseline` snapshots the current findings into
+`.wp-specter.config.json` so they're suppressed on every future scan, leaving only new findings to
+fail CI. It requires `--generate-config` to have been run first — `--generate-baseline` writes
+into the same `.wp-specter.config.json`, it doesn't create one:
+
+```bash
+# From the project root, once .wp-specter.config.json exists (see above)
+wp-specter scan --generate-config    # first time only
+wp-specter scan --generate-baseline
+```
+
+Each suppressed finding is recorded under `baseline` as its type, name, and file path (relative to
+the config file, no line number — an unrelated edit above the flagged spot shouldn't silently
+break the match):
+
+```json
+{
+    "baseline": [
+        { "type": "unused_function", "name": "old_helper", "file": "inc/helpers.php" }
+    ]
+}
+```
+
+Commit this alongside your project. As you clean up baselined findings, re-run
+`--generate-baseline` to shrink the list — there's no way to remove individual entries other than
+fixing the finding and regenerating.
+
+#### Full example
+
+Every option together — `targets` and `baseline` are normally machine-written (by
+`--generate-config` and `--generate-baseline` respectively) rather than typed by hand, but this is
+everything `.wp-specter.config.json` supports:
+
+```json
+{
+    "targets": ["web/app/themes/sage", "web/app/plugins/my-plugin"],
+    "stubsFrom": ["web/app/plugins", "web/app/mu-plugins"],
+    "stubs": ".wp-specter.stubs.json",
+    "exclude": ["tests", "vendor"],
+    "baseline": [
+        { "type": "unused_function", "name": "old_helper", "file": "inc/helpers.php" },
+        { "type": "unmatched_hook", "name": "legacy/deprecated_hook", "file": "inc/hooks.php" }
+    ]
+}
+```
 
 ### Project stubs: `.wp-specter.stubs.json`
 
@@ -358,3 +436,7 @@ tests/
 ```bash
 composer test
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
