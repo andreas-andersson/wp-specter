@@ -1,4 +1,4 @@
-# WP Specter
+<h1 align="center">WP Specter - Find unused code and files</h1>
 
 <p align="center">
 	<img src="specter.png" alt="WP-Specter" width="200" height="200">
@@ -77,32 +77,31 @@ Found: 3 unused function(s), 1 unmatched hook(s), 3 unused file(s), 1 unused cla
 
 ## Contents
 
-- [WP Specter](#wp-specter)
-  - [Contents](#contents)
-  - [Requirements](#requirements)
-  - [Installation](#installation)
-    - [From source (contributing to wp-specter itself)](#from-source-contributing-to-wp-specter-itself)
-  - [Usage](#usage)
-    - [Scan a theme or plugin](#scan-a-theme-or-plugin)
-    - [Scan a composer-managed project (Bedrock and similar)](#scan-a-composer-managed-project-bedrock-and-similar)
-      - [Scan options](#scan-options)
-      - [Run only specific checks](#run-only-specific-checks)
-      - [Exit codes](#exit-codes)
-    - [generate-stubs](#generate-stubs)
-    - [Project config: `.wp-specter.config.json`](#project-config-wp-specterconfigjson)
-      - [Baselining existing findings](#baselining-existing-findings)
-      - [Full example](#full-example)
-    - [Project stubs: `.wp-specter.stubs.json`](#project-stubs-wp-specterstubsjson)
-  - [What it checks](#what-it-checks)
-    - [Unused functions](#unused-functions)
-    - [Unmatched hooks](#unmatched-hooks)
-    - [Unused templates](#unused-templates)
-    - [Unused classes](#unused-classes)
-    - [Unused methods](#unused-methods)
-  - [Supported theme types](#supported-theme-types)
-  - [Project structure](#project-structure)
-  - [Running tests](#running-tests)
-  - [License](#license)
+- [Contents](#contents)
+- [Requirements](#requirements)
+- [Installation](#installation)
+  - [From source (contributing to wp-specter itself)](#from-source-contributing-to-wp-specter-itself)
+- [Usage](#usage)
+  - [Scan a theme or plugin](#scan-a-theme-or-plugin)
+  - [Scan a composer-managed project (Bedrock and similar)](#scan-a-composer-managed-project-bedrock-and-similar)
+    - [Scan options](#scan-options)
+    - [Run only specific checks](#run-only-specific-checks)
+    - [Exit codes](#exit-codes)
+  - [generate-stubs](#generate-stubs)
+  - [Project config: `.wp-specter.config.json`](#project-config-wp-specterconfigjson)
+    - [Baselining existing findings](#baselining-existing-findings)
+    - [Full example](#full-example)
+  - [Project stubs: `.wp-specter.stubs.json`](#project-stubs-wp-specterstubsjson)
+- [What it checks](#what-it-checks)
+  - [Unused functions](#unused-functions)
+  - [Unmatched hooks](#unmatched-hooks)
+  - [Unused templates](#unused-templates)
+  - [Unused classes](#unused-classes)
+  - [Unused methods](#unused-methods)
+- [Supported theme types](#supported-theme-types)
+- [Project structure](#project-structure)
+- [Running tests](#running-tests)
+- [License](#license)
 
 ## Requirements
 
