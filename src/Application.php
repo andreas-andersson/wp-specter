@@ -448,7 +448,12 @@ class Application
         }
 
         $sources = [];
-        $projectConfig = null;
+
+        try {
+            $projectConfig = (new ProjectConfigLoader())->load($this->requireCwd());
+        } catch (\RuntimeException $e) {
+            return $this->error($e->getMessage());
+        }
 
         if ($path !== null) {
             $resolved = realpath($path) ?: $path;
@@ -456,37 +461,30 @@ class Application
                 return $this->error("Path does not exist or is not a directory: {$resolved}");
             }
             $sources[] = $resolved;
-        } else {
+        } elseif ($projectConfig !== null && !empty($projectConfig->stubsFrom)) {
             // No path given — fall back to .wp-specter.config.json's "stubsFrom" list, so a
             // project can just run `generate-stubs` with no arguments and get every declared
             // vendor/plugins source scanned in one shot instead of one --stubs invocation per dir.
+            foreach ($projectConfig->stubsFrom as $dir) {
+                if (!is_dir($dir)) {
+                    return $this->error("Configured stubsFrom path does not exist: {$dir}");
+                }
+                $sources[] = $dir;
+            }
+        } else {
             try {
-                $projectConfig = (new ProjectConfigLoader())->load($this->requireCwd());
+                $sources[] = $this->requireCwd();
             } catch (\RuntimeException $e) {
                 return $this->error($e->getMessage());
             }
-
-            if ($projectConfig !== null && !empty($projectConfig->stubsFrom)) {
-                foreach ($projectConfig->stubsFrom as $dir) {
-                    if (!is_dir($dir)) {
-                        return $this->error("Configured stubsFrom path does not exist: {$dir}");
-                    }
-                    $sources[] = $dir;
-                }
-                if ($output === null) {
-                    $output = $projectConfig->stubsPath ?? ($projectConfig->configDir . '/' . ProjectConfigLoader::STUBS_FILENAME);
-                }
-            } else {
-                try {
-                    $sources[] = $this->requireCwd();
-                } catch (\RuntimeException $e) {
-                    return $this->error($e->getMessage());
-                }
-            }
         }
 
+        // --output wins outright; otherwise the config's "stubs" override applies regardless of
+        // how $sources was resolved above, falling back to the default filename next to the
+        // config file (or in cwd, when there's no config).
         if ($output === null) {
-            $output = ProjectConfigLoader::STUBS_FILENAME;
+            $output = $projectConfig->stubsPath
+                ?? ($projectConfig !== null ? $projectConfig->configDir . '/' . ProjectConfigLoader::STUBS_FILENAME : ProjectConfigLoader::STUBS_FILENAME);
         }
 
         $scanner = new FileScanner();
@@ -523,9 +521,19 @@ class Application
         $hookList = array_keys($hooks);
         $prefixList = array_keys($prefixes);
 
+        // Relative to the project root (the config file's directory, or cwd when there's no
+        // config) rather than absolute — so the stubs file doesn't embed a path that's only
+        // meaningful on the machine that generated it.
+        try {
+            $root = $projectConfig->configDir ?? $this->requireCwd();
+        } catch (\RuntimeException $e) {
+            return $this->error($e->getMessage());
+        }
+        $relativeSources = array_map(fn(string $s) => BaselineEntry::relativize($s, $root), $sources);
+
         $data = [
             'generated' => date('Y-m-d'),
-            'source'    => count($sources) === 1 ? $sources[0] : $sources,
+            'source'    => count($relativeSources) === 1 ? $relativeSources[0] : $relativeSources,
             'hooks'     => $hookList,
             'prefixes'  => $prefixList,
         ];
