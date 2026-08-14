@@ -27,7 +27,7 @@ use WpSpecter\Support\GlobExpander;
 
 class Application
 {
-    private const VERSION = '0.4.3';
+    private const VERSION = '0.4.4';
 
     /** @param list<string> $argv */
     public function run(array $argv): int
