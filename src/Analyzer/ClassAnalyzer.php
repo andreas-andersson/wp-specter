@@ -32,6 +32,19 @@ final class ClassAnalyzer
         'WP_Widget' => ['widget', 'form', 'update'],
         'WP_REST_Controller' => ['register_routes'],
         'Walker' => ['start_lvl', 'end_lvl', 'start_el', 'end_el'],
+        // WP core's own Walker subclasses. A project class rarely extends Walker directly — it
+        // extends one of these (e.g. `class My_Nav_Walker extends Walker_Nav_Menu`), which sits
+        // between it and Walker in the chain. Since these core classes are never present as a
+        // ClassDef (they're WP core, not project code) and never reflectable either (WP core
+        // isn't a Composer-autoloaded vendor package), the chain walk in isContractMethod()
+        // would otherwise dead-end at the reflector and return false. Same four method names as
+        // 'Walker' above, since that's the full contract every one of these overrides from.
+        'Walker_Nav_Menu' => ['start_lvl', 'end_lvl', 'start_el', 'end_el'],
+        'Walker_Category' => ['start_lvl', 'end_lvl', 'start_el', 'end_el'],
+        'Walker_CategoryDropdown' => ['start_lvl', 'end_lvl', 'start_el', 'end_el'],
+        'Walker_Page' => ['start_lvl', 'end_lvl', 'start_el', 'end_el'],
+        'Walker_PageDropdown' => ['start_lvl', 'end_lvl', 'start_el', 'end_el'],
+        'Walker_Comment' => ['start_lvl', 'end_lvl', 'start_el', 'end_el'],
     ];
 
     // Base classes whose subclasses get called entirely through framework naming-convention /

@@ -467,6 +467,31 @@ class My_Widget extends WP_Widget {
         self::assertContains('truly_unused', $unusedMethods);
     }
 
+    public function testExcludesWalkerNavMenuContractMethodsThroughCoreSubclass(): void
+    {
+        // WP core dispatches start_lvl/end_lvl/start_el/end_el by calling them on the object
+        // passed into wp_nav_menu()'s 'walker' arg — never by a visible name reference in
+        // project code. The class extends Walker_Nav_Menu (a WP core class one level below
+        // Walker itself, never present as a project ClassDef or reflectable vendor class), so
+        // the exemption must be resolved from the curated list rather than reflection.
+        $file = $this->write('<?php
+class My_Nav_Walker extends Walker_Nav_Menu {
+    public function start_lvl(&$output, $depth = 0, $args = null) {}
+    public function end_lvl(&$output, $depth = 0, $args = null) {}
+    public function start_el(&$output, $item, $depth = 0, $args = null, $id = 0) {}
+    public function end_el(&$output, $item, $depth = 0, $args = null) {}
+    public function truly_unused() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('start_lvl', $unusedMethods);
+        self::assertNotContains('end_lvl', $unusedMethods);
+        self::assertNotContains('start_el', $unusedMethods);
+        self::assertNotContains('end_el', $unusedMethods);
+        self::assertContains('truly_unused', $unusedMethods);
+    }
+
     public function testExcludesInterfaceContractMethods(): void
     {
         $file = $this->write('<?php

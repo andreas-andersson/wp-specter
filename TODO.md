@@ -87,6 +87,10 @@ scope limit that trades recall or precision for staying a single-pass, no-depend
   only tracks whichever assignment is last in source order, not "could be either." Fixing this
   properly means real branch-aware dataflow analysis, out of scope for a token-based parser.
 
+- [ ] **`BASE_CLASS_CONTRACT_METHODS`/`INTERFACE_CONTRACT_METHODS` (`ClassAnalyzer`) are hand-curated, not generated from WP core** the way `WpCoreHooks` is from `tools/generate-wp-hooks-stub.php`. Found while fixing a false-positive `UnusedMethod` on a class extending `Walker_Nav_Menu` (added to the curated list by hand) — the same gap exists for every other WP core base class designed for subclassing that isn't already on the list.
+  - Harder than the hooks case: a `do_action()`/`apply_filters()` call in core is an unambiguous fact (that string IS a hook), but "this method is a template method WP core dispatches polymorphically on a subclass" has no equivalent literal marker in core source — no mechanical way to distinguish an override-intended method from an ordinary internal helper that just happens to be called via `$this->` too.
+  - Fix shape: scan WP core with the project's own `PhpTokenParser`/`ScopedMethodCall` machinery for methods invoked as `$this->method()` from *within another method of the same class* — that's the actual "dispatches on self, possibly the subclass" signature `Walker`/`WP_Widget`/`WP_REST_Controller` all share. Over-broad relative to the current list (would likely pull in some internal helpers not really meant for override), but that trade-off already exists by design elsewhere in this file (favor false negatives over false positives) — would need spot-checking against real WP core output before trusting it unattended the way the hooks generator is.
+
 - [ ] **Namespaced static calls aren't scoped.** `Some\Namespace\Foo::method()` — the receiver-token
   branches that resolve `self::`/`parent::`/`Foo::` (in the `T_STRING` branch of the main loop)
   only match `T_STRING`, never `T_NAME_QUALIFIED`/`T_NAME_FULLY_QUALIFIED`. Falls back to the
