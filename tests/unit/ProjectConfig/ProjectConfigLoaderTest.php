@@ -16,6 +16,11 @@ final class ProjectConfigLoaderTest extends TestCase
     {
         $this->tmp = sys_get_temp_dir() . '/wp-specter-projectconfig-' . uniqid();
         mkdir($this->tmp, 0755, true);
+        // realpath() it now that it exists — the loader resolves targets with realpath()
+        // internally, and on macOS sys_get_temp_dir() returns a path through the /var ->
+        // /private/var symlink, which would otherwise make expected/actual paths diverge only
+        // by that unresolved prefix.
+        $this->tmp = realpath($this->tmp) ?: $this->tmp;
         $this->loader = new ProjectConfigLoader();
     }
 
