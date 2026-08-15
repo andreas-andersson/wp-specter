@@ -24,6 +24,11 @@ function unused_fn() { return 2; }
 add_action( 'init', 'used_fn' );
 add_action( 'never_fired_hook', 'used_fn' );
 ");
+        // realpath() it now that it exists — the app resolves scan targets with realpath()
+        // internally, and on macOS sys_get_temp_dir() returns a path through the /var ->
+        // /private/var symlink, which would otherwise make expected/actual paths diverge only
+        // by that unresolved prefix.
+        $this->tmp = realpath($this->tmp) ?: $this->tmp;
     }
 
     protected function tearDown(): void

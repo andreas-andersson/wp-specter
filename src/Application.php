@@ -679,6 +679,16 @@ class Application
             if (!str_starts_with($resolvedPath, '/')) {
                 $resolvedPath = $cwd . '/' . $resolvedPath;
             }
+            // Resolve symlinks in the pattern's literal leading segment (e.g. macOS's
+            // /var -> /private/var) and reattach the wildcard remainder as-is, so the ancestor
+            // check in writeGeneratedConfig() — comparing against getcwd(), which PHP always
+            // returns fully resolved — isn't thrown off by a symlink present only in the path
+            // as the caller typed it.
+            $base = GlobExpander::baseDir($resolvedPath);
+            $realBase = realpath($base);
+            if ($realBase !== false && $realBase !== $base) {
+                $resolvedPath = $realBase . substr($resolvedPath, strlen($base));
+            }
         } else {
             $resolvedPath = realpath($resolvedPath) ?: $resolvedPath;
         }

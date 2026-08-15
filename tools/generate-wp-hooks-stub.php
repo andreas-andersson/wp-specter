@@ -332,4 +332,8 @@ function writeStubFile(array $hooksByFile, array $prefixes, string $wpVersion): 
     file_put_contents(TARGET_FILE, $content);
 }
 
-exit(main($argv));
+// $_SERVER['argv'], not the bare $argv global: the CLI SAPI always populates both regardless
+// of the register_argc_argv ini setting, but PHPStan's variable.undefined check for $argv goes
+// off that setting — which defaults to Off in stock php.ini (e.g. Homebrew's), unlike some
+// distros' CLI-specific ini that turns it on.
+exit(main($_SERVER['argv']));
