@@ -108,6 +108,13 @@ final class WpModeDetectorTest extends TestCase
             'sidebar'        => ['sidebar'],
             'functions'      => ['functions'],
             'comments'       => ['comments'],
+            'embed'          => ['embed'],
+            // Not on the public template-hierarchy doc page — a separate, newer WP core
+            // mechanism (5.2's fatal-error/maintenance-mode protection) — but auto-located by WP
+            // core via locate_template() the same way. Real-world finding: Kadence ships both,
+            // unreferenced anywhere in its own code.
+            '500'            => ['500'],
+            'offline'        => ['offline'],
         ];
     }
 

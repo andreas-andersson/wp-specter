@@ -334,11 +334,14 @@ class My_Class {}
         self::assertSame('class', $kindsByName['My_Class']);
     }
 
-    public function testMethodsInsideInterfacesHaveNoOwnerClass(): void
+    public function testMethodsInsideInterfacesAreOwnedByTheInterface(): void
     {
-        // Interface method declarations never have a body, so there's no $this-> scoping to
-        // resolve inside them — ownerClass stays null, same as before interfaces got their own
-        // ClassDef.
+        // Regression: interface method declarations never have a body, so there's no $this->
+        // scoping to resolve *inside* them — but leaving ownerClass null made the declaration
+        // itself unmatchable by anything (ClassAnalyzer::isContractMethod short-circuits on a
+        // null ownerClass before checking any contract, and a scoped call through a
+        // this-exact-interface-typed variable had nothing to match against). It must be owned by
+        // the interface, same as a trait's own methods are owned by the trait.
         $result = $this->parse('<?php
 interface My_Interface {
     public function do_it(): void;
@@ -346,7 +349,7 @@ interface My_Interface {
 ');
         $methods = array_filter($result->functionDefs, fn($d) => $d->isMethod);
         foreach ($methods as $m) {
-            self::assertNull($m->ownerClass, "{$m->name} should have no ownerClass");
+            self::assertSame('My_Interface', $m->ownerClass, "{$m->name} should be owned by My_Interface");
         }
     }
 

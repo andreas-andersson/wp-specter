@@ -70,6 +70,34 @@ final class TemplateAnalyzer
             }
         }
 
+        // get_header( helper_fn() ) / get_template_part( $var ) where `$var = helper_fn();` —
+        // helper_fn() is a project-defined function whose own `return` statements resolve to one
+        // or more literal paths (see PhpTokenParser's T_RETURN handling). Merged across every
+        // scanned file first, since the helper and its caller are routinely in different files —
+        // same mechanism FileAnalyzer uses for template refs that land outside TEMPLATE_DIRS.
+        $functionLiteralReturns = [];
+        foreach ($parseResults as $result) {
+            foreach ($result->functionLiteralReturns as $fnName => $literals) {
+                if (!isset($functionLiteralReturns[$fnName])) {
+                    $functionLiteralReturns[$fnName] = [];
+                }
+                array_push($functionLiteralReturns[$fnName], ...$literals);
+            }
+        }
+        foreach ($parseResults as $result) {
+            foreach ($result->pendingTemplateHelperCalls as $pending) {
+                foreach ($functionLiteralReturns[$pending->helperFunction] ?? [] as $literal) {
+                    $normalized = $this->normalizePath($this->prefixTemplateHelperPath($literal, $pending->templateFunction));
+                    if ($normalized === '') {
+                        continue;
+                    }
+                    $referenced[$normalized] = true;
+                    $referenced[basename($normalized)] = true;
+                    $referenced[pathinfo($normalized, PATHINFO_FILENAME)] = true;
+                }
+            }
+        }
+
         // Blade's @extends/@include-family directives and <x-component> tags aren't PHP syntax
         // at all — a .blade.php file is almost entirely inline HTML/text from a tokenizer's
         // point of view, so PhpTokenParser's include-ref detection (which fires on real
@@ -247,6 +275,23 @@ final class TemplateAnalyzer
     {
         $path = trim($path, '/');
         return $path;
+    }
+
+    /**
+     * Mirrors PhpTokenParser::parseTemplateRef()'s own get_header('x')/get_footer('x')/
+     * get_sidebar('x') => header-x/footer-x/sidebar-x prefixing, for a literal resolved via
+     * $functionLiteralReturns instead of a direct string argument — the same stem-prefix
+     * convention applies regardless of which of the two ways the literal was discovered.
+     */
+    private function prefixTemplateHelperPath(string $literal, string $templateFunction): string
+    {
+        $prefix = match ($templateFunction) {
+            'get_header' => 'header',
+            'get_footer' => 'footer',
+            'get_sidebar' => 'sidebar',
+            default => null,
+        };
+        return $prefix !== null && $literal !== '' ? $prefix . '-' . $literal : $literal;
     }
 
     /**
