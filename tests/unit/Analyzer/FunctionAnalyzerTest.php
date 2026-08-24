@@ -46,11 +46,59 @@ my_func();
         self::assertEmpty($this->analyzer->analyze([$file]));
     }
 
+    public function testCallInsideClosureIsNotSwallowedAsTheClosuresOwnName(): void
+    {
+        // Regression (found via Blocksy theme): $skipNextString exists to skip a *named*
+        // declaration's own name token ("foo" in `function foo(`) so it's never mistaken for a
+        // call to itself. It was being set unconditionally even for an anonymous closure/arrow
+        // function, which has no name token to skip — so it silently ate whatever T_STRING token
+        // came next instead, which is exactly the first real call inside the closure body for the
+        // extremely common `add_action('x', function () { my_helper(); });` shape.
+        $file = $this->write('<?php
+function my_helper() {}
+add_action("admin_notices", function () {
+    my_helper();
+});
+');
+        self::assertEmpty($this->analyzer->analyze([$file]));
+    }
+
+    public function testFunctionExistsGuardDoesNotCountAsCall(): void
+    {
+        // Regression: `if ( ! function_exists( 'my_helper' ) ) { function my_helper() {} }` is
+        // an extremely common WP redeclaration guard, self-referencing the very thing it's about
+        // to define — not a real usage signal. Its own string argument was flowing into the same
+        // generic name pool a real call would, permanently masking a genuinely-unused function.
+        $file = $this->write("<?php
+if ( ! function_exists( 'my_helper' ) ) {
+    function my_helper() {}
+}
+");
+        $findings = $this->analyzer->analyze([$file]);
+        self::assertCount(1, $findings);
+        self::assertSame('my_helper', $findings[0]->name);
+    }
+
     public function testStringCallbackCountsAsCall(): void
     {
         $file = $this->write("<?php
 function my_handler() {}
 add_action( 'init', 'my_handler' );
+");
+        self::assertEmpty($this->analyzer->analyze([$file]));
+    }
+
+    public function testNamespaceConcatenatedStringCallbackCountsAsCall(): void
+    {
+        // Real-world regression (Sakurairo theme): namespaced files commonly build a fully
+        // qualified callback string as `__NAMESPACE__ . '\my_handler'`. The concatenation itself
+        // isn't tracked, but the literal '\my_handler' must still count as a call to
+        // my_handler() — its leading "\" was making the whole literal fail the callback-name
+        // regex and silently going unmatched, so the definition looked unused despite the call.
+        $file = $this->write("<?php
+namespace My_Theme;
+function my_handler() {}
+add_action( 'init', __NAMESPACE__ . '\\my_handler' );
 ");
         self::assertEmpty($this->analyzer->analyze([$file]));
     }
@@ -131,6 +179,36 @@ class MyClass {
     }
     public function second() {}
 }
+');
+        self::assertEmpty($this->analyzer->analyze([$file]));
+    }
+
+    public function testDoesNotReportUseFunctionImportOfHookRegisterFunc(): void
+    {
+        // Regression: `use function add_action;` (a namespaced file importing a WP core global
+        // into scope, common in e.g. WP Rig) tokenizes as T_FUNCTION T_STRING just like a real
+        // declaration, but with `;` instead of `(` after the name. Misparsing it as a definition
+        // created a phantom "add_action" FunctionDef that add_action()'s own real calls below can
+        // never satisfy, since those calls are diverted into hookRegistrations, not
+        // functionCalls — so it was reported unused despite being called four lines down.
+        $file = $this->write('<?php
+namespace My_Theme;
+use function add_action;
+use function add_filter;
+add_action("init", "my_handler");
+add_filter("the_content", "my_filter");
+');
+        self::assertEmpty($this->analyzer->analyze([$file]));
+    }
+
+    public function testDoesNotReportUnusedUseFunctionImportAsUnusedFunction(): void
+    {
+        // Same misparsing, but for an import that really is never called anywhere in the file —
+        // it must not surface as "Unused Functions" either, since the project never defined it in
+        // the first place; it's an unused import, a different (currently unimplemented) concern.
+        $file = $this->write('<?php
+namespace My_Theme;
+use function pings_open;
 ');
         self::assertEmpty($this->analyzer->analyze([$file]));
     }

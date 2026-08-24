@@ -39,6 +39,58 @@ final class ClassAnalyzerTest extends TestCase
         self::assertSame(FindingCertainty::Error, $findings[0]->certainty);
     }
 
+    public function testDoesNotReportClassPassedAsStringToCustomizerRegisterType(): void
+    {
+        // Real-world finding (Astra theme): WP_Customize_Manager::register_panel_type()/
+        // register_section_type()/register_control_type() take a class name as a plain string —
+        // WP core does `new $that_string(...)` internally, never a `new`/`instanceof`/`extends`/
+        // `implements`/`::` reference this parser tracks directly.
+        $file = $this->write('<?php
+class Astra_WP_Customize_Panel extends WP_Customize_Panel {}
+function register_custom_types( $wp_customize ) {
+    $wp_customize->register_panel_type( "Astra_WP_Customize_Panel" );
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        self::assertEmpty(array_filter($findings, fn($f) => $f->type === FindingType::UnusedClass));
+    }
+
+    public function testDoesNotReportClassReturnedAsStringFromFilterCallback(): void
+    {
+        // Real-world finding (Blocksy theme): the 'block_parser_class'/
+        // 'customize_dynamic_partial_class' WP core filters expect the callback to *return* a
+        // class name string, which WP then instantiates itself — same "string, not a visible
+        // new/instanceof/::" shape as the Customizer register_*_type() case above, just via a
+        // filter's return value instead of a direct method argument.
+        $file = $this->write('<?php
+class Blocksy_WP_Block_Parser {}
+add_filter( "block_parser_class", function () {
+    return "Blocksy_WP_Block_Parser";
+} );
+');
+        $findings = $this->analyzer->analyze([$file]);
+        self::assertEmpty(array_filter($findings, fn($f) => $f->type === FindingType::UnusedClass));
+    }
+
+    public function testReportsClassWrappedInOwnClassExistsGuard(): void
+    {
+        // Regression found while verifying the fallback above: `if ( ! class_exists( 'X' ) ) {
+        // class X {} }` is an extremely common WP redeclaration guard, self-referencing the very
+        // thing it's about to define — not a real usage signal, the opposite in fact (it exists
+        // specifically to avoid a fatal redeclaration error). Real-world finding (GeneratePress
+        // theme): all 8 of its deprecated Customizer control classes use exactly this guard and
+        // must still be flagged, or the class-name-via-string fallback above would permanently
+        // mask genuinely dead deprecated code.
+        $file = $this->write('<?php
+if ( ! class_exists( "My_Deprecated_Control" ) ) {
+    class My_Deprecated_Control extends WP_Customize_Control {}
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedClasses = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedClass), 'name');
+        self::assertContains('My_Deprecated_Control', $unusedClasses);
+    }
+
     public function testDoesNotReportClassInstantiatedWithNew(): void
     {
         $file = $this->write('<?php
@@ -306,6 +358,29 @@ add_action("init", [My_Class::class, "static_callback_method"]);
         self::assertEmpty(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod));
     }
 
+    public function testMagicClassConcatenatedStringCallbackCountsAsCall(): void
+    {
+        // Real-world regression (GeneratePress theme): `__CLASS__ . '::admin_updates'` builds a
+        // "ClassName::method" callable string via concatenation, same shape as the already-fixed
+        // `__NAMESPACE__ . '\name'` case but with "::" instead of "\" as the separator. The
+        // literal token alone is '::admin_updates' — its leading "::" was making the whole
+        // literal fail looksLikeCallback()'s identifier regex, so the method looked unused
+        // despite being registered as an add_action callback right there.
+        $file = $this->write('<?php
+class My_Theme_Update {
+    public static function admin_updates() {}
+    public function truly_unused(): void {}
+    public function register() {
+        add_action( "admin_init", __CLASS__ . "::admin_updates", 1 );
+    }
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('admin_updates', $unusedMethods);
+        self::assertContains('truly_unused', $unusedMethods);
+    }
+
     // ── class-scoped call matching ──────────────────────────────────────────
 
     public function testClassScopedMatchingDoesNotLeakBetweenUnrelatedClasses(): void
@@ -489,6 +564,278 @@ class My_Nav_Walker extends Walker_Nav_Menu {
         self::assertNotContains('end_lvl', $unusedMethods);
         self::assertNotContains('start_el', $unusedMethods);
         self::assertNotContains('end_el', $unusedMethods);
+        self::assertContains('truly_unused', $unusedMethods);
+    }
+
+    public function testExcludesWpCustomizeControlContractMethods(): void
+    {
+        // Real-world finding from Twenty Twenty-One's own Customizer controls: render_content()/
+        // enqueue()/to_json() are called by the Customizer's own rendering pipeline, never by a
+        // visible name reference in theme code. Covers both extending WP_Customize_Control
+        // directly and through a WP core subclass one level below it (WP_Customize_Color_Control,
+        // never a project ClassDef or reflectable vendor class), same two-level-chain situation
+        // already solved for Walker_Nav_Menu.
+        $file = $this->write('<?php
+class My_Notice_Control extends WP_Customize_Control {
+    public function render_content() {}
+    public function truly_unused_notice() {}
+}
+class My_Color_Control extends WP_Customize_Color_Control {
+    public function enqueue() {}
+    public function to_json() {
+        return [];
+    }
+    public function truly_unused_color() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('render_content', $unusedMethods);
+        self::assertNotContains('enqueue', $unusedMethods);
+        self::assertNotContains('to_json', $unusedMethods);
+        self::assertContains('truly_unused_notice', $unusedMethods);
+        self::assertContains('truly_unused_color', $unusedMethods);
+    }
+
+    public function testExcludesWpCustomizeSectionAndPanelContractMethods(): void
+    {
+        // Real-world findings: GeneratePress's own upsell section overrides render_template(),
+        // Hello Elementor's overrides render() — both are WP_Customize_Section's own rendering
+        // pipeline override points (a different WP core base class than WP_Customize_Control,
+        // with an overlapping but not identical method set), called by the Customizer, never by
+        // a visible name reference in theme code.
+        $file = $this->write('<?php
+class My_Upsell_Section extends WP_Customize_Section {
+    public function render_template() {}
+    public function truly_unused_section(): void {}
+}
+class My_Upsell_Panel extends WP_Customize_Panel {
+    public function render() {}
+    public function content_template() {}
+    public function truly_unused_panel(): void {}
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('render_template', $unusedMethods);
+        self::assertNotContains('render', $unusedMethods);
+        self::assertNotContains('content_template', $unusedMethods);
+        self::assertContains('truly_unused_section', $unusedMethods);
+        self::assertContains('truly_unused_panel', $unusedMethods);
+    }
+
+    public function testExcludesWpUpgraderSkinContractMethodsThroughCoreSubclass(): void
+    {
+        // Real-world finding confirmed independently in both Blocksy and OceanWP: their own
+        // plugin-upgrade skin classes extend Plugin_Installer_Skin (a WP core class one level
+        // below WP_Upgrader_Skin, never a project ClassDef or reflectable vendor class — same
+        // two-level-chain situation already solved for Walker_Nav_Menu) and override
+        // feedback()/bulk_header()/bulk_footer()/decrement_update_count(), all called internally
+        // by WP_Upgrader during an admin install/update action.
+        $file = $this->write('<?php
+class My_Upgrader_Skin extends Plugin_Installer_Skin {
+    public function feedback( $string, ...$args ) {}
+    public function decrement_update_count( $type ) {}
+    public function bulk_header() {}
+    public function bulk_footer() {}
+    public function truly_unused_skin(): void {}
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('feedback', $unusedMethods);
+        self::assertNotContains('decrement_update_count', $unusedMethods);
+        self::assertNotContains('bulk_header', $unusedMethods);
+        self::assertNotContains('bulk_footer', $unusedMethods);
+        self::assertContains('truly_unused_skin', $unusedMethods);
+    }
+
+    public function testExcludesWalkerContractMethodsWhenBaseClassNameHasWrongCase(): void
+    {
+        // Real-world regression found in bootscore's own navwalker: `extends Walker_Nav_menu`
+        // (lowercase "menu" — a typo in the theme's own code). PHP class-name resolution is
+        // case-insensitive, so this legitimately extends WP core's Walker_Nav_Menu and runs fine
+        // at runtime — but BASE_CLASS_CONTRACT_METHODS is keyed by the exact-case string
+        // 'Walker_Nav_Menu', so an exact-case lookup against the parsed (mistyped) extends name
+        // would silently miss the exemption and produce a false "unused method".
+        $file = $this->write('<?php
+class My_Nav_Walker extends Walker_Nav_menu {
+    public function start_lvl(&$output, $depth = 0, $args = null) {}
+    public function start_el(&$output, $item, $depth = 0, $args = null, $id = 0) {}
+    public function truly_unused() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('start_lvl', $unusedMethods);
+        self::assertNotContains('start_el', $unusedMethods);
+        self::assertContains('truly_unused', $unusedMethods);
+    }
+
+    public function testExcludesWalkerDisplayElementOverride(): void
+    {
+        // display_element() (plus walk/paged_walk/get_number_of_root_elements/unset_children) is
+        // public on WP core's Walker and legally overridable, not just the four documented
+        // start_lvl/end_lvl/start_el/end_el hooks. Real starter themes override display_element
+        // to patch a WP core current-menu-item bug (e.g. Understrap's bootstrap navwalker), so it
+        // must be exempt from the unused-method check the same way the four are.
+        $file = $this->write('<?php
+class My_Nav_Walker extends Walker_Nav_Menu {
+    public function display_element($element, &$children_elements, $max_depth, $depth, $args, &$output) {}
+    public function truly_unused() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('display_element', $unusedMethods);
+        self::assertContains('truly_unused', $unusedMethods);
+    }
+
+    public function testExcludesWalkerContractMethodsThroughWpAdminCoreSubclasses(): void
+    {
+        // Walker_Nav_Menu_Edit, Walker_Nav_Menu_Checklist and Walker_Category_Checklist are
+        // WP core classes too (wp-admin/includes/class-walker-*.php, used by the nav-menus.php
+        // screen and the category checklist metabox) — same never-reflectable, never-a-ClassDef
+        // situation as the wp-includes Walker subclasses, so they need their own curated entries.
+        $file = $this->write('<?php
+class My_Edit_Walker extends Walker_Nav_Menu_Edit {
+    public function start_el(&$output, $item, $depth = 0, $args = null, $id = 0) {}
+    public function truly_unused_edit() {}
+}
+class My_Checklist_Walker extends Walker_Nav_Menu_Checklist {
+    public function start_el(&$output, $item, $depth = 0, $args = null, $id = 0) {}
+    public function truly_unused_checklist() {}
+}
+class My_Category_Checklist_Walker extends Walker_Category_Checklist {
+    public function start_el(&$output, $item, $depth = 0, $args = null, $id = 0) {}
+    public function truly_unused_category_checklist() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('start_el', $unusedMethods);
+        self::assertContains('truly_unused_edit', $unusedMethods);
+        self::assertContains('truly_unused_checklist', $unusedMethods);
+        self::assertContains('truly_unused_category_checklist', $unusedMethods);
+    }
+
+    public function testExcludesJsonSerializableMethodOnBackedEnum(): void
+    {
+        // Regression: enum method bodies used to get ownerClass=null (a documented gap —
+        // "enum-method scoping isn't attempted yet"), which made isContractMethod() short-circuit
+        // before ever checking whether the enum satisfies JsonSerializable — so jsonSerialize()
+        // was always flagged unused on any enum implementing it, despite the interface exemption
+        // that already works for plain classes.
+        $file = $this->write("<?php
+enum Status: string implements JsonSerializable {
+    case Active = 'active';
+    case Inactive = 'inactive';
+
+    public function jsonSerialize(): mixed {
+        return \$this->value;
+    }
+
+    public function truly_unused(): void {}
+}
+");
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('jsonSerialize', $unusedMethods);
+        self::assertContains('truly_unused', $unusedMethods);
+    }
+
+    public function testDoesNotFlagInterfaceMethodCalledThroughInterfaceTypedParam(): void
+    {
+        // Regression: interface method declarations (no body) also got ownerClass=null, so they
+        // were universally flagged "unused" — nothing could ever scope-match them, even a call
+        // through a variable typed exactly as the interface itself.
+        $file = $this->write('<?php
+interface Shippable {
+    public function calculate_shipping(): float;
+}
+
+function checkout(Shippable $method) {
+    echo $method->calculate_shipping();
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('calculate_shipping', $unusedMethods);
+    }
+
+    public function testCreditsConcreteImplementerCalledThroughInterfaceTypedParam(): void
+    {
+        // A call resolved to a concrete receiver class only ever names the *static* type at the
+        // call site — `function checkout(Shippable $method) { $method->calc(); }` records a call
+        // against 'Shippable', never 'FlatRate', even though FlatRate is what actually runs.
+        // Without isUsedByPolymorphicCall(), FlatRate::calculate_shipping() would falsely look
+        // unused despite being reachable through the only call site that exists for it — the
+        // interface's own declaration got fixed already (previous test), but the concrete
+        // implementation is a separate FunctionDef that needs its own resolution.
+        $file = $this->write('<?php
+interface Shippable {
+    public function calculate_shipping(): float;
+}
+
+class FlatRate implements Shippable {
+    public function calculate_shipping(): float {
+        return 5.0;
+    }
+    public function truly_unused(): void {}
+}
+
+function checkout(Shippable $method) {
+    echo $method->calculate_shipping();
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('calculate_shipping', $unusedMethods);
+        self::assertContains('truly_unused', $unusedMethods);
+    }
+
+    public function testCreditsConcreteImplementerThroughAbstractClassTypedParam(): void
+    {
+        // Same polymorphic-dispatch gap, for an abstract base class instead of an interface.
+        $file = $this->write('<?php
+abstract class Base_Shipping {
+    abstract public function calculate_shipping(): float;
+}
+
+class FlatRate extends Base_Shipping {
+    public function calculate_shipping(): float {
+        return 5.0;
+    }
+}
+
+function checkout(Base_Shipping $method) {
+    echo $method->calculate_shipping();
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('calculate_shipping', $unusedMethods);
+    }
+
+    public function testCreditsImplementerWhenInterfaceIsSatisfiedByAnIntermediateAncestor(): void
+    {
+        // The interface is `implements`-ed on an intermediate abstract class, not the concrete
+        // leaf class itself — isUsedByPolymorphicCall() must walk FlatRate's full extends chain
+        // (same structure as isContractMethod()) to find it on Base_Shipping, one level up.
+        $file = $this->write('<?php
+interface Shippable {
+    public function calc(): float;
+}
+abstract class Base_Shipping implements Shippable {}
+class FlatRate extends Base_Shipping {
+    public function calc(): float { return 5.0; }
+    public function truly_unused(): void {}
+}
+function checkout(Shippable $s) { echo $s->calc(); }
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('calc', $unusedMethods);
         self::assertContains('truly_unused', $unusedMethods);
     }
 

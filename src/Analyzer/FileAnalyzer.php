@@ -32,8 +32,12 @@ final class FileAnalyzer
     private array $autoloadDirs = [];
     /** @var list<string> Absolute files exempted by a classmap file entry or the "files" list. */
     private array $autoloadFiles = [];
-    /** @var list<string> Project-relative dirs exempted by a glob()-loop bulk-include pattern. */
-    private array $globExemptDirs = [];
+    /**
+     * @var list<string> Project-relative dirs exempted because a file inside them is only ever
+     *   reached through a bulk-include mechanism no per-file include()/require() reference can
+     *   catch: a glob()-loop bulk-include, or a hand-rolled spl_autoload_register() autoloader.
+     */
+    private array $dynamicLoadExemptDirs = [];
 
     public function __construct(private readonly PhpTokenParser $parser) {}
 
@@ -49,7 +53,7 @@ final class FileAnalyzer
 
         $rootDir = rtrim($rootDir, '/');
         $this->loadComposerAutoloadPaths($rootDir);
-        $this->loadGlobExemptDirs($parseResults, $rootDir);
+        $this->loadDynamicLoadExemptDirs($parseResults, $rootDir);
         $findings = [];
 
         foreach ($files as $file) {
@@ -125,27 +129,47 @@ final class FileAnalyzer
         }
 
         $relative = ltrim(str_replace($rootDir, '', $file), '/');
+
+        // Block patterns: WP core (6.0+) auto-registers every PHP file directly under a theme's
+        // own "patterns/" directory that carries a valid pattern-file header (minimum "Title:"),
+        // purely by directory-scan convention — same "loaded by header comment scan, never by a
+        // visible require()" shape as Page Templates above, just a different header field and a
+        // directory-scoped check (unlike "Template Name:", a bare "Title:" docblock line isn't
+        // distinctive enough to trust outside patterns/ — plenty of unrelated files have doc
+        // comments with a "Title:" field for their own reasons). Confirmed against wordpress.org's
+        // top themes: every current PHP file under patterns/ in Twenty Twenty-Three/Four/Five and
+        // Extendable was otherwise reported as 100% of that theme's "unused files" — the entire
+        // finding category was this one gap.
+        if (str_starts_with($relative, 'patterns/') && $this->hasPatternFileHeader($file)) {
+            return false;
+        }
+
         foreach (self::TEMPLATE_DIRS as $dir) {
             if (str_starts_with($relative, $dir . '/')) {
                 return false;
             }
         }
 
-        // A directory only ever bulk-loaded through `foreach (glob(...) as $f) { require $f; }`
-        // has no per-file include()/require() call for the referenced-index to find — the
-        // loop variable is fully dynamic. Exempted wholesale, same shape as the Composer
-        // autoload exemption above.
-        if ($this->isUnderGlobExemptDir($relative)) {
+        // A directory only ever bulk-loaded through `foreach (glob(...) as $f) { require $f; }`,
+        // or reached through a hand-rolled spl_autoload_register() autoloader, has no per-file
+        // include()/require() call for the referenced-index to find. Exempted wholesale, same
+        // shape as the Composer autoload exemption above.
+        if ($this->isUnderDynamicLoadExemptDir($relative)) {
             return false;
         }
 
         return true;
     }
 
-    private function isUnderGlobExemptDir(string $relative): bool
+    private function isUnderDynamicLoadExemptDir(string $relative): bool
     {
-        foreach ($this->globExemptDirs as $dir) {
-            if ($relative === $dir || str_starts_with($relative, $dir . '/')) {
+        foreach ($this->dynamicLoadExemptDirs as $dir) {
+            // An empty $dir means the triggering file (glob-loop caller, or spl_autoload_register
+            // call site) lives at the project root — every relative path is "under" the project
+            // root, but relativeDir() returns '' rather than '.' for that case (see its own
+            // doc), so the usual "$dir . '/'" prefix check would never match anything and
+            // silently fail to exempt a single file for a root-level autoloader.
+            if ($dir === '' || $relative === $dir || str_starts_with($relative, $dir . '/')) {
                 return true;
             }
         }
@@ -240,24 +264,56 @@ final class FileAnalyzer
      * @param list<\WpSpecter\Parser\ParseResult> $parseResults
      * $rootDir must already be rtrim'd — matches the convention isCandidate() relies on.
      */
-    private function loadGlobExemptDirs(array $parseResults, string $rootDir): void
+    private function loadDynamicLoadExemptDirs(array $parseResults, string $rootDir): void
     {
-        $this->globExemptDirs = [];
+        $this->dynamicLoadExemptDirs = [];
 
         foreach ($parseResults as $result) {
+            $callerRelDir = $this->relativeDir($result->file, $rootDir);
+
             // A glob() call alone isn't enough signal — plenty of WP code globs a directory for
             // reasons that have nothing to do with loading PHP (image galleries, asset lists).
             // Only trust it as a bulk-include when an actual include/require keyword also shows
             // up somewhere in the same file — still coarse (it doesn't prove the glob() result
             // is what gets required), but rules out the unrelated-glob case cheaply.
-            if (!$result->hasIncludeStatement || empty($result->globIncludeDirs)) {
-                continue;
+            if ($result->hasIncludeStatement && !empty($result->globIncludeDirs)) {
+                foreach ($result->globIncludeDirs as $globDir) {
+                    $exemptDir = trim($this->resolveGlobExemptDir($globDir, $callerRelDir), '/');
+                    if ($exemptDir !== '') {
+                        $this->dynamicLoadExemptDirs[] = $exemptDir;
+                    }
+                }
             }
-            $callerRelDir = $this->relativeDir($result->file, $rootDir);
-            foreach ($result->globIncludeDirs as $globDir) {
-                $exemptDir = trim($this->resolveGlobExemptDir($globDir, $callerRelDir), '/');
-                if ($exemptDir !== '') {
-                    $this->globExemptDirs[] = $exemptDir;
+
+            // scandir(SOME_CONFIGS_DIR) resolved via a define()-tracked constant — already a
+            // project-root-relative path (see ParseResult's own doc comment on this field for
+            // why), so trusted as-is rather than run through resolveGlobExemptDir's calling-file-
+            // relative prefixing. Same hasIncludeStatement gate as the glob case above.
+            if ($result->hasIncludeStatement && !empty($result->rootRelativeIncludeDirs)) {
+                foreach ($result->rootRelativeIncludeDirs as $rootDirLiteral) {
+                    $exemptDir = trim($rootDirLiteral, '/');
+                    if ($exemptDir !== '') {
+                        $this->dynamicLoadExemptDirs[] = $exemptDir;
+                    }
+                }
+            }
+
+            // A hand-rolled `spl_autoload_register(...)` autoloader (the non-Composer way any
+            // class gets loaded in a namespaced OOP theme/plugin without its own composer.json —
+            // real-world examples: Kadence, Hello Biz, Hello Elementor) has no per-file
+            // include()/require() call the referenced-index can find either: the target path is
+            // computed from the requested class name at runtime, inside the callback. Can't
+            // resolve the callback's own target directory generically (one theme concatenates a
+            // literal path fragment; another builds it from a constant plus a regex transform on
+            // the class name) — but every real-world example registers the callback from the
+            // same file that defines it, so exempting that file's own directory tree is the
+            // closest honest scope this analyzer can offer without executing the callback: it
+            // trusts the bootstrap file's own location as "wherever this custom-loaded code
+            // lives", the same way Composer's psr-4 mapping is trusted instead of proven.
+            foreach ($result->functionCalls as $call) {
+                if ($call->name === 'spl_autoload_register') {
+                    $this->dynamicLoadExemptDirs[] = $callerRelDir;
+                    break;
                 }
             }
         }
@@ -295,6 +351,18 @@ final class FileAnalyzer
     }
 
     /**
+     * "Title:" is the one header field WP core actually requires to register a block pattern
+     * (developer.wordpress.org/themes/patterns/registering-patterns/) — Slug/Categories/etc. are
+     * recommended but optional, so checking for those too would risk missing a real (if
+     * minimally-tagged) pattern file and flagging it as dead code.
+     */
+    private function hasPatternFileHeader(string $file): bool
+    {
+        $content = file_get_contents($file, length: 4096);
+        return $content !== false && (bool) preg_match('/^\s*\*\s*Title\s*:/mi', $content);
+    }
+
+    /**
      * @param list<\WpSpecter\Parser\ParseResult> $parseResults
      * @return array<string,bool>
      */
@@ -320,6 +388,35 @@ final class FileAnalyzer
                 $referenced[$normalized] = true;
                 $referenced[basename($normalized)] = true;
                 $referenced[pathinfo($normalized, PATHINFO_FILENAME)] = true;
+            }
+        }
+
+        // get_template_part( helper_fn() ) — helper_fn() is a project-defined function whose own
+        // `return` statements (see PhpTokenParser's T_RETURN handling) resolve to one or more
+        // literal paths. Merged across every scanned file first, since the helper and its caller
+        // are routinely in different files — real-world example (OceanWP theme):
+        // ocean_single_post_header_template() lives in inc/template-helpers.php, called from
+        // inc/helpers.php.
+        $functionLiteralReturns = [];
+        foreach ($parseResults as $result) {
+            foreach ($result->functionLiteralReturns as $fnName => $literals) {
+                if (!isset($functionLiteralReturns[$fnName])) {
+                    $functionLiteralReturns[$fnName] = [];
+                }
+                array_push($functionLiteralReturns[$fnName], ...$literals);
+            }
+        }
+        foreach ($parseResults as $result) {
+            foreach ($result->pendingTemplateHelperCalls as $pending) {
+                foreach ($functionLiteralReturns[$pending->helperFunction] ?? [] as $literal) {
+                    $normalized = $this->normalizePath($this->prefixTemplateHelperPath($literal, $pending->templateFunction));
+                    if ($normalized === '') {
+                        continue;
+                    }
+                    $referenced[$normalized] = true;
+                    $referenced[basename($normalized)] = true;
+                    $referenced[pathinfo($normalized, PATHINFO_FILENAME)] = true;
+                }
             }
         }
 
@@ -374,6 +471,23 @@ final class FileAnalyzer
     {
         $path = trim($path, '/');
         return $path;
+    }
+
+    /**
+     * Mirrors PhpTokenParser::parseTemplateRef()'s own get_header('x')/get_footer('x')/
+     * get_sidebar('x') => header-x/footer-x/sidebar-x prefixing, for a literal resolved via
+     * $functionLiteralReturns instead of a direct string argument — the same stem-prefix
+     * convention applies regardless of which of the two ways the literal was discovered.
+     */
+    private function prefixTemplateHelperPath(string $literal, string $templateFunction): string
+    {
+        $prefix = match ($templateFunction) {
+            'get_header' => 'header',
+            'get_footer' => 'footer',
+            'get_sidebar' => 'sidebar',
+            default => null,
+        };
+        return $prefix !== null && $literal !== '' ? $prefix . '-' . $literal : $literal;
     }
 
     /** @param array<string,bool> $referenced */

@@ -28,23 +28,128 @@ final class ClassAnalyzer
         'Serializable' => ['serialize', 'unserialize'],
     ];
 
+    // Every public method on WP core's Walker class (wp-includes/class-wp-walker.php):
+    // start_lvl/end_lvl/start_el/end_el are the ones subclasses are documented to override, but
+    // display_element, walk, paged_walk, get_number_of_root_elements and unset_children are also
+    // public and legally overridable — and real-world themes do override display_element (e.g.
+    // to patch WP core's current-menu-item class bug). All nine are only ever invoked by WP core
+    // itself (wp_nav_menu(), wp_list_categories(), wp_list_comments(), ... calling ->walk() on
+    // the walker instance), never by a visible name reference in project code.
+    private const WALKER_CONTRACT_METHODS = [
+        'start_lvl', 'end_lvl', 'start_el', 'end_el',
+        'display_element', 'walk', 'paged_walk', 'get_number_of_root_elements', 'unset_children',
+    ];
+
+    // WP_Customize_Control's override points (wp-includes/class-wp-customize-control.php):
+    // render_content()/render()/content_template() build the control's markup and JS
+    // (Backbone/underscore) template, to_json() shapes the data handed to that JS template,
+    // enqueue() loads control-specific scripts/styles, active_callback() gates visibility. All
+    // called by the Customizer's own rendering pipeline (WP_Customize_Manager server-side,
+    // customize-controls.js client-side for content_template), never by a visible name
+    // reference in theme/plugin code.
+    private const WP_CUSTOMIZE_CONTROL_CONTRACT_METHODS = [
+        'render_content', 'render', 'content_template', 'to_json', 'enqueue', 'active_callback',
+    ];
+
+    // WP_Customize_Section/WP_Customize_Panel's override points (wp-includes/class-wp-customize-
+    // section.php, class-wp-customize-panel.php) — the Customizer's other two "sidebar tree"
+    // node types alongside Control above, each with their own (overlapping but not identical)
+    // set of override points called by the same Customizer rendering pipeline, never by a
+    // visible name reference in theme/plugin code. Confirmed in the wild: GeneratePress's own
+    // upsell section overrides render_template(), Hello Elementor's overrides render().
+    private const WP_CUSTOMIZE_SECTION_CONTRACT_METHODS = ['render', 'render_template', 'json', 'active_callback'];
+    // Panel has two more override points than Section (render_content(), content_template()) —
+    // harmless to also list them on Section's own constant above if ever declared there by
+    // mistake, but kept as separate named constants for clarity same as Control's own.
+    private const WP_CUSTOMIZE_PANEL_CONTRACT_METHODS = [
+        'render', 'render_content', 'render_template', 'content_template', 'json', 'active_callback',
+    ];
+
+    // WP_Upgrader_Skin's override points (wp-admin/includes/class-wp-upgrader-skin.php) — the
+    // admin-UI hooks for a plugin/theme install-or-update screen (header/footer/feedback/error
+    // messages, before/after actions, bulk-mode header/footer). All called internally by
+    // WP_Upgrader and its subclasses (Plugin_Upgrader, Theme_Upgrader, ...) during an admin
+    // install/update action, never by a visible name reference in project code. flush_output and
+    // reset are Bulk_Upgrader_Skin's own additional override points, included here too since a
+    // project class overriding either through any bulk-mode subclass should be exempt the same
+    // way. Confirmed in the wild: both Blocksy's and OceanWP's own upgrader-skin classes
+    // override feedback()/bulk_header()/bulk_footer()/decrement_update_count().
+    private const WP_UPGRADER_SKIN_CONTRACT_METHODS = [
+        'add_strings', 'set_result', 'set_upgrader', 'request_filesystem_credentials',
+        'header', 'footer', 'error', 'feedback', 'before', 'after',
+        'decrement_update_count', 'bulk_header', 'bulk_footer', 'hide_process_failed',
+        'flush_output', 'reset',
+    ];
+
     private const BASE_CLASS_CONTRACT_METHODS = [
         'WP_Widget' => ['widget', 'form', 'update'],
         'WP_REST_Controller' => ['register_routes'],
-        'Walker' => ['start_lvl', 'end_lvl', 'start_el', 'end_el'],
+        'Walker' => self::WALKER_CONTRACT_METHODS,
         // WP core's own Walker subclasses. A project class rarely extends Walker directly — it
         // extends one of these (e.g. `class My_Nav_Walker extends Walker_Nav_Menu`), which sits
         // between it and Walker in the chain. Since these core classes are never present as a
         // ClassDef (they're WP core, not project code) and never reflectable either (WP core
         // isn't a Composer-autoloaded vendor package), the chain walk in isContractMethod()
-        // would otherwise dead-end at the reflector and return false. Same four method names as
+        // would otherwise dead-end at the reflector and return false. Same method list as
         // 'Walker' above, since that's the full contract every one of these overrides from.
-        'Walker_Nav_Menu' => ['start_lvl', 'end_lvl', 'start_el', 'end_el'],
-        'Walker_Category' => ['start_lvl', 'end_lvl', 'start_el', 'end_el'],
-        'Walker_CategoryDropdown' => ['start_lvl', 'end_lvl', 'start_el', 'end_el'],
-        'Walker_Page' => ['start_lvl', 'end_lvl', 'start_el', 'end_el'],
-        'Walker_PageDropdown' => ['start_lvl', 'end_lvl', 'start_el', 'end_el'],
-        'Walker_Comment' => ['start_lvl', 'end_lvl', 'start_el', 'end_el'],
+        'Walker_Nav_Menu' => self::WALKER_CONTRACT_METHODS,
+        'Walker_Category' => self::WALKER_CONTRACT_METHODS,
+        'Walker_CategoryDropdown' => self::WALKER_CONTRACT_METHODS,
+        'Walker_Page' => self::WALKER_CONTRACT_METHODS,
+        'Walker_PageDropdown' => self::WALKER_CONTRACT_METHODS,
+        'Walker_Comment' => self::WALKER_CONTRACT_METHODS,
+        // wp-admin-only core subclasses (nav-menus.php screen, category checklist metabox).
+        // Same reasoning as the wp-includes subclasses above — never present as project ClassDef.
+        'Walker_Nav_Menu_Edit' => self::WALKER_CONTRACT_METHODS,
+        'Walker_Nav_Menu_Checklist' => self::WALKER_CONTRACT_METHODS,
+        'Walker_Category_Checklist' => self::WALKER_CONTRACT_METHODS,
+        // WP_Customize_Control's override points: render_content()/render()/content_template()
+        // build the control's markup and JS template, to_json() shapes the data handed to that
+        // JS template, enqueue() loads control-specific assets, active_callback() gates
+        // visibility — every one of these is called by the Customizer's own rendering pipeline
+        // (WP_Customize_Manager, and customize-controls.js on the JS side for content_template),
+        // never by a visible name reference in theme code. Confirmed in the wild: Twenty
+        // Twenty-One's own notice/color controls override render_content()/enqueue()/to_json().
+        'WP_Customize_Control' => self::WP_CUSTOMIZE_CONTROL_CONTRACT_METHODS,
+        // WP core's own Control subclasses — same never-a-ClassDef, never-reflectable reasoning
+        // as the Walker_* subclasses above; a project's own control usually extends one of these
+        // rather than WP_Customize_Control directly.
+        'WP_Customize_Background_Image_Control' => self::WP_CUSTOMIZE_CONTROL_CONTRACT_METHODS,
+        'WP_Customize_Background_Position_Control' => self::WP_CUSTOMIZE_CONTROL_CONTRACT_METHODS,
+        'WP_Customize_Code_Editor_Control' => self::WP_CUSTOMIZE_CONTROL_CONTRACT_METHODS,
+        'WP_Customize_Color_Control' => self::WP_CUSTOMIZE_CONTROL_CONTRACT_METHODS,
+        'WP_Customize_Cropped_Image_Control' => self::WP_CUSTOMIZE_CONTROL_CONTRACT_METHODS,
+        'WP_Customize_Header_Image_Control' => self::WP_CUSTOMIZE_CONTROL_CONTRACT_METHODS,
+        'WP_Customize_Image_Control' => self::WP_CUSTOMIZE_CONTROL_CONTRACT_METHODS,
+        'WP_Customize_Media_Control' => self::WP_CUSTOMIZE_CONTROL_CONTRACT_METHODS,
+        'WP_Customize_Nav_Menu_Auto_Add_Control' => self::WP_CUSTOMIZE_CONTROL_CONTRACT_METHODS,
+        'WP_Customize_Nav_Menu_Control' => self::WP_CUSTOMIZE_CONTROL_CONTRACT_METHODS,
+        'WP_Customize_Nav_Menu_Item_Control' => self::WP_CUSTOMIZE_CONTROL_CONTRACT_METHODS,
+        'WP_Customize_Nav_Menu_Location_Control' => self::WP_CUSTOMIZE_CONTROL_CONTRACT_METHODS,
+        'WP_Customize_Nav_Menu_Locations_Control' => self::WP_CUSTOMIZE_CONTROL_CONTRACT_METHODS,
+        'WP_Customize_Nav_Menu_Name_Control' => self::WP_CUSTOMIZE_CONTROL_CONTRACT_METHODS,
+        'WP_Customize_Site_Icon_Control' => self::WP_CUSTOMIZE_CONTROL_CONTRACT_METHODS,
+        'WP_Customize_Theme_Control' => self::WP_CUSTOMIZE_CONTROL_CONTRACT_METHODS,
+        'WP_Customize_Upload_Control' => self::WP_CUSTOMIZE_CONTROL_CONTRACT_METHODS,
+        'WP_Sidebar_Block_Editor_Control' => self::WP_CUSTOMIZE_CONTROL_CONTRACT_METHODS,
+        'WP_Widget_Area_Customize_Control' => self::WP_CUSTOMIZE_CONTROL_CONTRACT_METHODS,
+        'WP_Widget_Form_Customize_Control' => self::WP_CUSTOMIZE_CONTROL_CONTRACT_METHODS,
+        'WP_Customize_Section' => self::WP_CUSTOMIZE_SECTION_CONTRACT_METHODS,
+        'WP_Customize_Panel' => self::WP_CUSTOMIZE_PANEL_CONTRACT_METHODS,
+        // WP_Upgrader_Skin and its WP-core subclasses (wp-admin/includes/class-*-skin.php) —
+        // never present as a project ClassDef or reflectable vendor class, same reasoning as the
+        // Walker_* and WP_Customize_*_Control subclasses above.
+        'WP_Upgrader_Skin' => self::WP_UPGRADER_SKIN_CONTRACT_METHODS,
+        'Bulk_Upgrader_Skin' => self::WP_UPGRADER_SKIN_CONTRACT_METHODS,
+        'Bulk_Plugin_Upgrader_Skin' => self::WP_UPGRADER_SKIN_CONTRACT_METHODS,
+        'Bulk_Theme_Upgrader_Skin' => self::WP_UPGRADER_SKIN_CONTRACT_METHODS,
+        'Plugin_Installer_Skin' => self::WP_UPGRADER_SKIN_CONTRACT_METHODS,
+        'Plugin_Upgrader_Skin' => self::WP_UPGRADER_SKIN_CONTRACT_METHODS,
+        'Theme_Installer_Skin' => self::WP_UPGRADER_SKIN_CONTRACT_METHODS,
+        'Theme_Upgrader_Skin' => self::WP_UPGRADER_SKIN_CONTRACT_METHODS,
+        'Automatic_Upgrader_Skin' => self::WP_UPGRADER_SKIN_CONTRACT_METHODS,
+        'Language_Pack_Upgrader_Skin' => self::WP_UPGRADER_SKIN_CONTRACT_METHODS,
+        'WP_Ajax_Upgrader_Skin' => self::WP_UPGRADER_SKIN_CONTRACT_METHODS,
     ];
 
     // Base classes whose subclasses get called entirely through framework naming-convention /
@@ -123,9 +228,33 @@ final class ClassAnalyzer
             }
         }
 
+        // WP core has several "hand a class name over as a plain string, WP instantiates it
+        // internally" registration points — WP_Customize_Manager::register_panel_type()/
+        // register_section_type()/register_control_type(), and filters like
+        // 'block_parser_class'/'customize_dynamic_partial_class' whose callback returns a class
+        // name string that WP then does `new $that_string(...)` on. None of these are `new`/
+        // `instanceof`/`extends`/`implements`/`::` — the only shapes $classReferences tracks —
+        // so the class looked permanently unused. Rather than curating every such WP API by name
+        // (a losing battle — new ones keep appearing), any string literal already flowing into
+        // the generic name-only $functionCalls pool (built for functions/methods; string
+        // literals land there regardless of which call they're an argument to, or none at all —
+        // see PhpTokenParser's blanket T_CONSTANT_ENCAPSED_STRING handling) is trusted as a
+        // class reference too when it happens to match a real class name. Same imprecision
+        // trade-off findUnusedMethods already accepts for its own $called fallback pool: two
+        // unrelated things sharing a name will each look used if either is referenced this way.
+        // Confirmed in the wild: Astra's own Astra_WP_Customize_Panel/_Section (register_*_type
+        // shape) and Blocksy's own Blocksy_WP_Block_Parser/_Customize_Partial (filter-return
+        // shape) were both false "unused class" findings before this fallback.
+        $calledNames = [];
+        foreach ($parseResults as $result) {
+            foreach ($result->functionCalls as $call) {
+                $calledNames[$call->name] = true;
+            }
+        }
+
         $findings = [];
         foreach ($classDefsByName as $name => $def) {
-            if (!isset($referenced[$name])) {
+            if (!isset($referenced[$name]) && !isset($calledNames[$name])) {
                 if ($this->isFullyExemptClass($name, $classDefsByName, $useImports)) {
                     continue;
                 }
@@ -199,6 +328,7 @@ final class ClassAnalyzer
                     || $this->isFullyExemptClass($def->ownerClass, $classDefsByName, $useImports)
                     || $this->isContractMethod($def->name, $def->ownerClass, $classDefsByName, $reflector, $useImports)
                     || $this->isUsedByTraitConsumer($def->ownerClass, $def->name, $classDefsByName, $traitUsers, $scopedCalled)
+                    || $this->isUsedByPolymorphicCall($def->ownerClass, $def->name, $classDefsByName, $scopedCalled)
                 ) {
                     continue;
                 }
@@ -254,7 +384,7 @@ final class ClassAnalyzer
 
             foreach ($def->implements as $interface) {
                 if (
-                    in_array($methodName, self::INTERFACE_CONTRACT_METHODS[$interface] ?? [], true)
+                    in_array($methodName, self::interfaceContractMethods($interface), true)
                     || $reflector->classHasMethod($useImports[$interface] ?? $interface, $methodName)
                 ) {
                     return true;
@@ -266,7 +396,7 @@ final class ClassAnalyzer
                 return false;
             }
 
-            if (in_array($methodName, self::BASE_CLASS_CONTRACT_METHODS[$base] ?? [], true)) {
+            if (in_array($methodName, self::baseClassContractMethods($base), true)) {
                 return true;
             }
 
@@ -310,7 +440,7 @@ final class ClassAnalyzer
                 return false;
             }
 
-            $expectedFqcn = self::FULLY_EXEMPT_BASE_CLASSES[$base] ?? null;
+            $expectedFqcn = self::exemptFqcnFor($base);
             if ($expectedFqcn !== null) {
                 $importedFqcn = $useImports[$base] ?? null;
                 if ($importedFqcn === null || $importedFqcn === $expectedFqcn) {
@@ -322,6 +452,37 @@ final class ClassAnalyzer
         }
 
         return false;
+    }
+
+    /**
+     * Case-insensitive lookups into the curated class-name-keyed lists above. PHP class-name
+     * resolution is itself case-insensitive, so `extends Walker_Nav_menu` (a real typo found in
+     * the wild — bootscore's own navwalker) still runs against WP core's actual `Walker_Nav_Menu`
+     * at runtime; matching these lists with exact-case string keys would silently miss it and
+     * produce a false "unused method" instead of applying the exemption.
+     *
+     * @return list<string>
+     */
+    private static function interfaceContractMethods(string $interface): array
+    {
+        static $ci = null;
+        $ci ??= array_change_key_case(self::INTERFACE_CONTRACT_METHODS, CASE_LOWER);
+        return $ci[strtolower($interface)] ?? [];
+    }
+
+    /** @return list<string> */
+    private static function baseClassContractMethods(string $base): array
+    {
+        static $ci = null;
+        $ci ??= array_change_key_case(self::BASE_CLASS_CONTRACT_METHODS, CASE_LOWER);
+        return $ci[strtolower($base)] ?? [];
+    }
+
+    private static function exemptFqcnFor(string $base): ?string
+    {
+        static $ci = null;
+        $ci ??= array_change_key_case(self::FULLY_EXEMPT_BASE_CLASSES, CASE_LOWER);
+        return $ci[strtolower($base)] ?? null;
     }
 
     /**
@@ -362,6 +523,62 @@ final class ClassAnalyzer
                 array_push($next, ...($traitUsers[$user] ?? []));
             }
             $queue = $next;
+        }
+
+        return false;
+    }
+
+    /**
+     * A call PhpTokenParser resolves to a concrete receiver class only ever names the *static*
+     * type at the call site — `function checkout(Shippable $method) { $method->calc(); }` records
+     * ScopedMethodCall('Shippable', 'calc'), never 'FlatRate', even though FlatRate is what
+     * actually runs at that call site if `$method` holds one. $scopedCalled[$ownerClass] alone
+     * therefore never sees this call for a concrete implementer's own method — only the
+     * interface/abstract-class declaration itself (whose own ownerClass now *is* 'Shippable',
+     * see the parser's T_INTERFACE handling) does. This walks $ownerClass's own extends chain —
+     * same structure as isContractMethod(), checking implements at every level too — looking for
+     * a scoped call recorded against any interface or ancestor class along the way; finding one
+     * means some code, somewhere, calls $methodName through a type $ownerClass satisfies, which
+     * is the only signal static analysis can get for genuine runtime polymorphism.
+     *
+     * This can't tell dead code apart from a live implementation the same way scopedCalled[exact
+     * class] does — if Shippable has two implementers and only one is ever actually reached at
+     * runtime, both still look used. Same trade-off the untyped-receiver fallback pool already
+     * makes project-wide; this is strictly narrower (only classes that actually implement/extend
+     * the exact type the call was resolved to, not every same-named method anywhere).
+     *
+     * @param array<string,ClassDef> $classDefsByName
+     * @param array<string,array<string,bool>> $scopedCalled
+     */
+    private function isUsedByPolymorphicCall(?string $ownerClass, string $methodName, array $classDefsByName, array $scopedCalled): bool
+    {
+        if ($ownerClass === null) {
+            return false;
+        }
+
+        $className = $ownerClass;
+        for ($depth = 0; $depth < self::MAX_INHERITANCE_DEPTH; $depth++) {
+            $def = $classDefsByName[$className] ?? null;
+            if ($def === null) {
+                return false;
+            }
+
+            foreach ($def->implements as $interface) {
+                if (isset($scopedCalled[$interface][$methodName])) {
+                    return true;
+                }
+            }
+
+            $base = $def->extends[0] ?? null;
+            if ($base === null) {
+                return false;
+            }
+
+            if (isset($scopedCalled[$base][$methodName])) {
+                return true;
+            }
+
+            $className = $base;
         }
 
         return false;

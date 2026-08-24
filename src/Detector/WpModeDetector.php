@@ -12,13 +12,19 @@ final class WpModeDetector
         'index', 'front-page', 'home', 'singular', 'single', 'page',
         'archive', 'author', 'category', 'tag', 'taxonomy', 'date',
         'search', 'searchform', 'attachment', 'image', '404', 'privacy-policy',
-        'functions', 'header', 'footer', 'sidebar', 'comments',
+        'functions', 'header', 'footer', 'sidebar', 'comments', 'embed',
+        // Not on the public template-hierarchy doc page (a separate, newer WP core mechanism —
+        // the fatal-error/maintenance-mode protection added in 5.2, wp-includes/class-wp-fatal-
+        // error-handler.php and the core-update routine) but auto-located by WP core via
+        // locate_template() the exact same way, never referenced from theme code. Confirmed in
+        // the wild: Kadence ships both, unreferenced anywhere in its own code.
+        '500', 'offline',
     ];
 
     // Prefixes whose variants (e.g. single-cpt, page-slug) are always WP hierarchy
     private const WP_HIERARCHY_PREFIXES = [
         'single-', 'archive-', 'page-', 'taxonomy-', 'category-', 'tag-', 'author-',
-        'header-', 'footer-', 'sidebar-',
+        'header-', 'footer-', 'sidebar-', 'embed-',
     ];
 
     public function detect(string $dir): ?WpMode
