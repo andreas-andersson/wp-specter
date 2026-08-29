@@ -82,7 +82,25 @@ final class FileScanner
                 return true;
             }
         }
-        return false;
+        return $this->isVendorPrefixedDirName(basename($path));
+    }
+
+    /**
+     * A literal "vendor" directory name isn't the only real shape third-party dependencies show
+     * up under: php-scoper/Mozart/Strauss-style dependency-prefixing relocates a package's code
+     * into the host project's own tree under an author-chosen directory name, always with a
+     * "vendor" segment somewhere in it by convention — confirmed in the real-world 7-plugin test
+     * corpus under three different spellings: `vendor_prefixed` (Elementor, wp-smushit),
+     * `vendor-prefixed` (WooCommerce), and `jetpack_vendor` (Jetpack's own separately-published
+     * packages). Before this check, none of these were excluded, and the *entire* output of a
+     * function/hook scan against Elementor or wp-smushit was 100% noise from bundled Twig/
+     * Symfony-polyfill/Guzzle code — not a single genuine finding in either. Matches "vendor" as
+     * a whole `_`/`-`-delimited segment (not a bare substring) so a real project directory like
+     * "vendors" (plural, unrelated) or "my-vendors-page" isn't swept up by accident.
+     */
+    private function isVendorPrefixedDirName(string $basename): bool
+    {
+        return in_array('vendor', preg_split('/[_-]/', strtolower($basename)) ?: [], true);
     }
 
     /** @param list<string> $globs */

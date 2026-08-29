@@ -122,6 +122,23 @@ final class PhpTokenParser
         // interpolation but is NOT a code-level brace. Track depth so we skip those.
         $interpolationDepth = 0;
 
+        // `if ( ! function_exists( 'some_name' ) ) { function some_name() {} }` — the real WP
+        // polyfill convention. $functionExistsGuardDepthStack/$functionExistsGuardNameStack run
+        // in lockstep (same push-on-'{'/pop-on-'}' pattern as $classDepthStack/$classNameStack),
+        // recording the guarded name for whichever `{` immediately follows a recognized
+        // `function_exists()` guard condition — consulted when a T_FUNCTION declaration's own
+        // name matches the current top of the stack, see FunctionDef::$guarded.
+        $functionExistsGuardDepthStack = [];
+        $functionExistsGuardNameStack = [];
+        $pendingFunctionExistsGuardName = null;
+
+        // The file's current `namespace X;` declaration (bare form only — see resolveFqcn's own
+        // doc comment for why the braced `namespace X { ... }` form is a deliberate non-goal).
+        // Empty string means "no namespace declared" (or not yet seen), which is also the global
+        // namespace — either way, resolveFqcn() reduces to the bare name in that case, so
+        // un-namespaced code (the majority of real WP themes/plugins) sees zero behavior change.
+        $currentNamespace = '';
+
         // Local variable type tracking: $var = new ClassName(...) is remembered for the rest of
         // that function/method's body, so $var->method() can be scoped the same way $this->
         // already is. $varTypesStack runs in lockstep with function-body brace depth (a fresh,
@@ -211,6 +228,11 @@ final class PhpTokenParser
                         $pendingParamTypes = [];
                         $pendingFunctionName = null;
                     }
+                    if ($pendingFunctionExistsGuardName !== null) {
+                        $functionExistsGuardDepthStack[] = $braceDepth;
+                        $functionExistsGuardNameStack[] = $pendingFunctionExistsGuardName;
+                        $pendingFunctionExistsGuardName = null;
+                    }
                 } elseif ($token === '}') {
                     if ($interpolationDepth > 0) {
                         $interpolationDepth--;
@@ -228,6 +250,10 @@ final class PhpTokenParser
                             array_pop($varLiteralAssignmentsStack);
                             array_pop($varLiteralValueStack);
                             array_pop($varAssignedFromFunctionStack);
+                        }
+                        if (!empty($functionExistsGuardDepthStack) && end($functionExistsGuardDepthStack) === $braceDepth) {
+                            array_pop($functionExistsGuardDepthStack);
+                            array_pop($functionExistsGuardNameStack);
                         }
                         $braceDepth--;
                     }
@@ -266,11 +292,11 @@ final class PhpTokenParser
                 // a brace context; only declarations get a ClassDef.
                 if ($this->nextMeaningfulIsIdentifier($tokens, $i)) {
                     $expectingClassOpen = true;
-                    $def = $this->parseClassDef($tokens, $i, $file);
+                    $def = $this->parseClassDef($tokens, $i, $file, 'class', $currentNamespace, $useImports);
                     if ($def !== null) {
                         $classDefs[] = $def;
-                        $pendingClassName = $def->name;
-                        $pendingClassParent = $def->extends[0] ?? null;
+                        $pendingClassName = $def->fqcn;
+                        $pendingClassParent = $def->extends[0]->fqcn ?? null;
                     }
                 } else {
                     $expectingClassOpen = $this->isPrecededByNew($tokens, $i);
@@ -311,11 +337,36 @@ final class PhpTokenParser
                     T_TRAIT => 'trait',
                     default => 'enum',
                 };
-                $def = $this->parseClassDef($tokens, $i, $file, $kind);
+                $def = $this->parseClassDef($tokens, $i, $file, $kind, $currentNamespace, $useImports);
                 if ($def !== null) {
                     $classDefs[] = $def;
-                    $pendingClassName = $def->name;
+                    $pendingClassName = $def->fqcn;
                 }
+                continue;
+            }
+
+            if ($type === T_IF) {
+                // if ( ! function_exists( 'some_name' ) ) { ... } — sets $pendingFunctionExists
+                // GuardName, consumed by the very next '{' this loop reaches (see the T_IF/'{'
+                // push logic above). Deliberately narrow: only this exact shape (an optional
+                // leading '!', a bare function_exists() call with a single string-literal
+                // argument, nothing else combined via && / ||) is trusted — "don't guess" is the
+                // same stance the rest of this parser takes everywhere else.
+                $pendingFunctionExistsGuardName = $this->functionExistsGuardName($tokens, $i);
+                continue;
+            }
+
+            if ($type === T_NAMESPACE) {
+                // `namespace Foo\Bar;` — sets $currentNamespace for the rest of the file (or
+                // until the next namespace statement; real-world code has at most one). The
+                // braced form (`namespace Foo { ... }`) is a deliberate non-goal — zero
+                // occurrences across a real 7-plugin, 8,651-file corpus justified not tracking
+                // brace-scoped namespace resets; a file using it will have subsequent code
+                // resolve as if still in the previous/global namespace.
+                $nameIndex = $this->peekNextMeaningfulIndex($tokens, $i);
+                $currentNamespace = ($nameIndex !== null && is_array($tokens[$nameIndex]) && in_array($tokens[$nameIndex][0], self::CLASS_NAME_TOKENS, true))
+                    ? ltrim($tokens[$nameIndex][1], '\\')
+                    : '';
                 continue;
             }
 
@@ -339,10 +390,10 @@ final class PhpTokenParser
                 // (guarded out: that's nested inside a method body, one or more braces deeper
                 // than the class body's own depth).
                 $user = empty($classNameStack) ? null : end($classNameStack);
-                foreach ($this->captureClassNameList($tokens, $i) as $ref) {
-                    $classReferences[] = $ref;
+                foreach ($this->captureClassNameList($tokens, $i, $currentNamespace, $useImports) as $ref) {
+                    $classReferences[] = $ref->short;
                     if ($user !== null) {
-                        $traitUsages[] = new TraitUsage($user, $ref);
+                        $traitUsages[] = new TraitUsage($user, $ref->fqcn);
                     }
                 }
                 continue;
@@ -367,6 +418,17 @@ final class PhpTokenParser
                 $ref = $this->captureClassNameAfter($tokens, $i);
                 if ($ref !== null) {
                     $classReferences[] = $ref;
+                    if ($type === T_NEW) {
+                        // `( new Export() )->register_route(...)` — the inline, wrapped-`new`
+                        // counterpart to `$var = new ClassName(); $var->method();` above; see
+                        // findInlineNewChainedCallTarget's own doc comment.
+                        $chainTarget = $this->findInlineNewChainedCallTarget($tokens, $i, $classNameStack, $classParentStack, $currentNamespace, $useImports);
+                        if ($chainTarget !== null) {
+                            [$receiverFqcn, $methodName, $methodNameIndex] = $chainTarget;
+                            $scopedMethodCalls[] = new ScopedMethodCall($receiverFqcn, $methodName);
+                            $i = $methodNameIndex;
+                        }
+                    }
                 }
                 continue;
             }
@@ -409,8 +471,8 @@ final class PhpTokenParser
             }
 
             if ($type === T_EXTENDS || $type === T_IMPLEMENTS) {
-                foreach ($this->captureClassNameList($tokens, $i) as $ref) {
-                    $classReferences[] = $ref;
+                foreach ($this->captureClassNameList($tokens, $i, $currentNamespace, $useImports) as $ref) {
+                    $classReferences[] = $ref->short;
                 }
                 continue;
             }
@@ -420,6 +482,9 @@ final class PhpTokenParser
                 $ownerClass = empty($classNameStack) ? null : end($classNameStack);
                 $ownerParent = empty($classParentStack) ? null : end($classParentStack);
                 $def = $this->parseFunctionDef($tokens, $i, $file, $insideClass, $ownerClass);
+                if ($def !== null && !empty($functionExistsGuardNameStack) && end($functionExistsGuardNameStack) === $def->name) {
+                    $def = new FunctionDef($def->name, $def->line, $def->file, $def->isMethod, $def->ownerClass, $def->returnType, guarded: true);
+                }
                 // Type-hinted parameters: `function foo(My_Class $x)` both references My_Class
                 // and, same as `$x = new My_Class()`, tells us $x's type for the rest of the
                 // body — applies equally to anonymous functions/closures, which is why this
@@ -432,18 +497,18 @@ final class PhpTokenParser
                     // caller is routinely in a different file (see PendingReturnTypedCall).
                     $closeParenIndex = $this->findMatchingCloseParen($tokens, $parenIndex);
                     $returnType = $closeParenIndex !== null
-                        ? $this->parseReturnTypeHint($tokens, $closeParenIndex, $ownerClass, $ownerParent)
+                        ? $this->parseReturnTypeHint($tokens, $closeParenIndex, $ownerClass, $ownerParent, $currentNamespace, $useImports)
                         : null;
                     if ($returnType !== null) {
-                        $classReferences[] = $returnType;
-                        $def = new FunctionDef($def->name, $def->line, $def->file, $def->isMethod, $def->ownerClass, $returnType);
+                        $classReferences[] = $returnType->short;
+                        $def = new FunctionDef($def->name, $def->line, $def->file, $def->isMethod, $def->ownerClass, $returnType->fqcn, guarded: $def->guarded);
                     }
                 }
                 if ($def !== null) {
                     $functionDefs[] = $def;
                 }
                 if ($parenIndex !== null) {
-                    [$hintClassRefs, $pendingParamTypes, $promotedPropertyTypes] = $this->parseParamTypeHints($tokens, $parenIndex, $ownerClass, $ownerParent);
+                    [$hintClassRefs, $pendingParamTypes, $promotedPropertyTypes] = $this->parseParamTypeHints($tokens, $parenIndex, $ownerClass, $ownerParent, $currentNamespace, $useImports);
                     foreach ($hintClassRefs as $ref) {
                         $classReferences[] = $ref;
                     }
@@ -501,7 +566,8 @@ final class PhpTokenParser
                             $afterPropIndex = $this->peekNextMeaningfulIndex($tokens, $propNameIndex);
 
                             if ($afterPropIndex !== null && $tokens[$afterPropIndex] === '=') {
-                                $newClass = $this->assignedNewClassName($tokens, $afterPropIndex, $classNameStack, $classParentStack);
+                                $newClass = $this->assignedNewClassName($tokens, $afterPropIndex, $classNameStack, $classParentStack, $currentNamespace, $useImports)
+                                    ?? $this->assignedVariableClassName($tokens, $afterPropIndex, $varTypesStack[$scopeTop]);
                                 if ($newClass !== null) {
                                     $propertyAssignedClasses[$receiverClass][$propName] = $newClass;
                                 } else {
@@ -535,7 +601,7 @@ final class PhpTokenParser
                     // just tracks whichever assignment comes last in source order, not "could be
                     // either" — an approximation, same spirit as the rest of this parser, and
                     // still strictly more precise than the unscoped fallback it replaces.
-                    $newClass = $this->assignedNewClassName($tokens, $equalsIndex, $classNameStack, $classParentStack);
+                    $newClass = $this->assignedNewClassName($tokens, $equalsIndex, $classNameStack, $classParentStack, $currentNamespace, $useImports);
                     if ($newClass !== null) {
                         $varTypesStack[$scopeTop][$value] = $newClass;
                         unset($varPendingCallStack[$scopeTop][$value]);
@@ -547,7 +613,7 @@ final class PhpTokenParser
                         // RHS already handled it); resolved later against make()'s own declared
                         // return type, once every file's parse is merged — see
                         // PendingReturnTypedCall.
-                        $pendingCall = $this->scopedOrBareCallRhs($tokens, $equalsIndex, $classNameStack, $classParentStack);
+                        $pendingCall = $this->scopedOrBareCallRhs($tokens, $equalsIndex, $classNameStack, $classParentStack, $currentNamespace, $useImports);
                         if ($pendingCall !== null) {
                             $varPendingCallStack[$scopeTop][$value] = $pendingCall;
                         } else {
@@ -667,11 +733,11 @@ final class PhpTokenParser
                         if ($name === 'WP_CLI' && $methodName === 'add_command') {
                             $commandClass = $this->secondArgStringLiteral($tokens, $methodNameIndex);
                             if ($commandClass !== null) {
-                                $reflectionDispatchedClassNames[] = $this->shortClassName($commandClass);
+                                $reflectionDispatchedClassNames[] = $this->resolveFqcn($commandClass, $currentNamespace, $useImports);
                             }
                         }
 
-                        $receiverClass = $this->resolveClassNameToken($name, $classNameStack, $classParentStack);
+                        $receiverClass = $this->resolveClassNameToken($name, $classNameStack, $classParentStack, $currentNamespace, $useImports);
                         if ($receiverClass !== null) {
                             $scopedMethodCalls[] = new ScopedMethodCall($receiverClass, $methodName);
                             $i = $methodNameIndex;
@@ -695,6 +761,8 @@ final class PhpTokenParser
                     $classConstants,
                     empty($classNameStack) ? null : end($classNameStack),
                     empty($classParentStack) ? null : end($classParentStack),
+                    $currentNamespace,
+                    $useImports,
                     $hookRegistrations,
                     $hookInvocations,
                     $templateRefs,
@@ -719,9 +787,9 @@ final class PhpTokenParser
                 $nextNonWhitespace = $this->peekNextMeaningful($tokens, $i);
 
                 if ($nextNonWhitespace === '::') {
-                    $receiverClass = $this->resolveClassNameToken($value, $classNameStack, $classParentStack);
+                    $receiverClass = $this->resolveClassNameToken($value, $classNameStack, $classParentStack, $currentNamespace, $useImports);
                     if ($receiverClass !== null) {
-                        $classReferences[] = $receiverClass;
+                        $classReferences[] = $this->shortClassName($value);
 
                         $target = $this->findScopedCallTarget($tokens, $i);
                         if ($target !== null) {
@@ -758,6 +826,8 @@ final class PhpTokenParser
                         $classConstants,
                         empty($classNameStack) ? null : end($classNameStack),
                         empty($classParentStack) ? null : end($classParentStack),
+                        $currentNamespace,
+                        $useImports,
                         $hookRegistrations,
                         $hookInvocations,
                         $templateRefs,
@@ -818,7 +888,7 @@ final class PhpTokenParser
                     // as the $this->/self::/parent::/Foo:: call scoping above. Anything else
                     // (a plain variable receiver, or not an array callback at all) falls back to
                     // the existing name-only pool.
-                    $receiverClass = $this->arrayCallbackReceiverClass($tokens, $i, $classNameStack, $classParentStack);
+                    $receiverClass = $this->arrayCallbackReceiverClass($tokens, $i, $classNameStack, $classParentStack, $currentNamespace, $useImports);
 
                     // Not an array callback but still a resolvable receiver: a bare
                     // 'Some_Class::method' string, the WP customizer/REST-controller shape for
@@ -829,12 +899,13 @@ final class PhpTokenParser
                     // self/parent/static since those are only meaningful inside an actual class
                     // body's scope, not resolvable from a bare string literal.
                     if ($receiverClass === null && $sepUsed === '::' && $sepPos > 0) {
-                        $classPart = $this->shortClassName(substr($stringVal, 0, $sepPos));
+                        $classPartRaw = substr($stringVal, 0, $sepPos);
+                        $classPart = $this->shortClassName($classPartRaw);
                         if (!in_array($classPart, ['self', 'parent', 'static'], true)
                             && $this->looksLikeCallback($classPart)
                         ) {
                             $classReferences[] = $classPart;
-                            $receiverClass = $classPart;
+                            $receiverClass = $this->resolveFqcn($classPartRaw, $currentNamespace, $useImports);
                         }
                     }
 
@@ -1032,8 +1103,9 @@ final class PhpTokenParser
      * whenever it isn't null).
      *
      * @param list<Token> $tokens
+     * @param array<string,string> $useImports
      */
-    private function parseReturnTypeHint(array $tokens, int $closeParenIndex, ?string $ownerClass, ?string $ownerParent): ?string
+    private function parseReturnTypeHint(array $tokens, int $closeParenIndex, ?string $ownerClass, ?string $ownerParent, string $currentNamespace, array $useImports): ?ClassRef
     {
         $j = $this->peekNextMeaningfulIndex($tokens, $closeParenIndex);
         if ($j === null || $tokens[$j] !== ':') {
@@ -1065,11 +1137,11 @@ final class PhpTokenParser
                 $segmentCount++;
                 $name = $t[0] === T_STATIC ? 'static' : $t[1];
                 $resolved = match (strtolower($name)) {
-                    'self', 'static' => $ownerClass,
-                    'parent' => $ownerParent,
+                    'self', 'static' => $ownerClass === null ? null : new ClassRef($this->shortClassName($ownerClass), $ownerClass),
+                    'parent' => $ownerParent === null ? null : new ClassRef($this->shortClassName($ownerParent), $ownerParent),
                     default => in_array(strtolower($name), self::PRIMITIVE_TYPE_NAMES, true)
                         ? null
-                        : $this->shortClassName($name),
+                        : new ClassRef($this->shortClassName($name), $this->resolveFqcn($name, $currentNamespace, $useImports)),
                 };
             }
 
@@ -1091,8 +1163,9 @@ final class PhpTokenParser
      * @param list<Token> $tokens
      * @param list<?string> $classNameStack
      * @param list<?string> $classParentStack
+     * @param array<string,string> $useImports
      */
-    private function scopedOrBareCallRhs(array $tokens, int $equalsIndex, array $classNameStack, array $classParentStack): ?array
+    private function scopedOrBareCallRhs(array $tokens, int $equalsIndex, array $classNameStack, array $classParentStack, string $currentNamespace, array $useImports): ?array
     {
         $j = $this->peekNextMeaningfulIndex($tokens, $equalsIndex);
         if ($j === null || !is_array($tokens[$j])) {
@@ -1123,7 +1196,7 @@ final class PhpTokenParser
                 }
                 [$methodName, $nameIndex] = $target;
                 $name = $token[0] === T_STATIC ? 'static' : $token[1];
-                $receiverClass = $this->resolveClassNameToken($name, $classNameStack, $classParentStack);
+                $receiverClass = $this->resolveClassNameToken($name, $classNameStack, $classParentStack, $currentNamespace, $useImports);
                 if ($receiverClass === null) {
                     return null;
                 }
@@ -1167,10 +1240,11 @@ final class PhpTokenParser
      * at runtime — same "don't guess" stance as the rest of this parser's variable tracking.
      *
      * @return array{list<string>, array<string,string>, array<string,string>}  [classReferences,
-     *   paramVar => className, promoted property name => className]
+     *   paramVar => FQCN, promoted property name => FQCN]
      * @param list<Token> $tokens
+     * @param array<string,string> $useImports
      */
-    private function parseParamTypeHints(array $tokens, int $parenIndex, ?string $ownerClass, ?string $ownerParent): array
+    private function parseParamTypeHints(array $tokens, int $parenIndex, ?string $ownerClass, ?string $ownerParent, string $currentNamespace, array $useImports): array
     {
         $classRefs = [];
         $varTypes = [];
@@ -1207,7 +1281,7 @@ final class PhpTokenParser
             }
 
             if (is_string($t) && $t === ',' && $depth === 0) {
-                $this->collectParamTypeHint($paramTokens, $ownerClass, $ownerParent, $classRefs, $varTypes, $propertyTypes);
+                $this->collectParamTypeHint($paramTokens, $ownerClass, $ownerParent, $currentNamespace, $useImports, $classRefs, $varTypes, $propertyTypes);
                 $paramTokens = [];
                 $j++;
                 continue;
@@ -1219,7 +1293,7 @@ final class PhpTokenParser
             $j++;
         }
 
-        $this->collectParamTypeHint($paramTokens, $ownerClass, $ownerParent, $classRefs, $varTypes, $propertyTypes);
+        $this->collectParamTypeHint($paramTokens, $ownerClass, $ownerParent, $currentNamespace, $useImports, $classRefs, $varTypes, $propertyTypes);
 
         return [$classRefs, $varTypes, $propertyTypes];
     }
@@ -1230,18 +1304,19 @@ final class PhpTokenParser
      * parseParamTypeHints never collects them) and records its resolved type(s).
      *
      * @param list<Token> $paramTokens
+     * @param array<string,string> $useImports
      * @param list<string> $classRefs
      * @param array<string,string> $varTypes
-     * @param array<string,string> $propertyTypes Promoted-property name => className, populated
+     * @param array<string,string> $propertyTypes Promoted-property name => FQCN, populated
      *   only when $paramTokens carries a visibility modifier (`public`/`protected`/`private`) —
      *   the PHP-required marker for constructor property promotion (`readonly` alone, without
      *   one of these, doesn't promote). Promotion auto-assigns `$this->name = $name`, the same
      *   effect as an explicit `$this->name = new ClassName()` in the constructor body — see
      *   ParseResult::$propertyAssignedClasses.
      */
-    private function collectParamTypeHint(array $paramTokens, ?string $ownerClass, ?string $ownerParent, array &$classRefs, array &$varTypes, array &$propertyTypes): void
+    private function collectParamTypeHint(array $paramTokens, ?string $ownerClass, ?string $ownerParent, string $currentNamespace, array $useImports, array &$classRefs, array &$varTypes, array &$propertyTypes): void
     {
-        $typeNames = [];
+        $typeRefs = [];
         $varName = null;
         $isPromoted = false;
 
@@ -1263,28 +1338,28 @@ final class PhpTokenParser
             if (in_array($t[0], self::CLASS_NAME_TOKENS, true) || $t[0] === T_STATIC) {
                 $name = $t[0] === T_STATIC ? 'static' : $t[1];
                 $resolved = match (strtolower($name)) {
-                    'self', 'static' => $ownerClass,
-                    'parent' => $ownerParent,
+                    'self', 'static' => $ownerClass === null ? null : new ClassRef($this->shortClassName($ownerClass), $ownerClass),
+                    'parent' => $ownerParent === null ? null : new ClassRef($this->shortClassName($ownerParent), $ownerParent),
                     default => in_array(strtolower($name), self::PRIMITIVE_TYPE_NAMES, true)
                         ? null
-                        : $this->shortClassName($name),
+                        : new ClassRef($this->shortClassName($name), $this->resolveFqcn($name, $currentNamespace, $useImports)),
                 };
                 if ($resolved !== null) {
-                    $typeNames[] = $resolved;
+                    $typeRefs[] = $resolved;
                 }
             }
         }
 
-        foreach ($typeNames as $name) {
-            $classRefs[] = $name;
+        foreach ($typeRefs as $ref) {
+            $classRefs[] = $ref->short;
         }
 
-        if ($isPromoted && $varName !== null && count($typeNames) === 1) {
-            $propertyTypes[substr($varName, 1)] = $typeNames[0];
+        if ($isPromoted && $varName !== null && count($typeRefs) === 1) {
+            $propertyTypes[substr($varName, 1)] = $typeRefs[0]->fqcn;
         }
 
-        if ($varName !== null && count($typeNames) === 1) {
-            $varTypes[$varName] = $typeNames[0];
+        if ($varName !== null && count($typeRefs) === 1) {
+            $varTypes[$varName] = $typeRefs[0]->fqcn;
         }
     }
 
@@ -1302,6 +1377,7 @@ final class PhpTokenParser
      * @param list<Token> $tokens
      * @param array<string,string> $varLiteralValues
      * @param array<string,array<string,string>> $classConstants
+     * @param array<string,string> $useImports
      * @param list<HookRegistration> $hookRegistrations
      * @param list<HookInvocation> $hookInvocations
      * @param list<TemplateRef> $templateRefs
@@ -1323,6 +1399,8 @@ final class PhpTokenParser
         array $classConstants,
         ?string $currentClass,
         ?string $currentParent,
+        string $currentNamespace,
+        array $useImports,
         array &$hookRegistrations,
         array &$hookInvocations,
         array &$templateRefs,
@@ -1335,22 +1413,22 @@ final class PhpTokenParser
         array &$functionCalls,
     ): void {
         if (in_array($name, self::HOOK_REGISTER_FUNCS, true)) {
-            $hookRegistrations[] = $this->parseHookRegistration($tokens, $i, $line, $file, $name, $varLiteralValues, $classConstants, $currentClass, $currentParent);
+            $hookRegistrations[] = $this->parseHookRegistration($tokens, $i, $line, $file, $name, $varLiteralValues, $classConstants, $currentClass, $currentParent, $currentNamespace, $useImports);
             return;
         }
 
         if (in_array($name, self::HOOK_INVOKE_FUNCS, true)) {
-            $hookInvocations[] = $this->parseHookInvocation($tokens, $i, $line, $file, $name, $varLiteralValues, $classConstants, $currentClass, $currentParent);
+            $hookInvocations[] = $this->parseHookInvocation($tokens, $i, $line, $file, $name, $varLiteralValues, $classConstants, $currentClass, $currentParent, $currentNamespace, $useImports);
             return;
         }
 
         if (array_key_exists($name, self::CRON_SCHEDULE_FUNCS)) {
-            $hookInvocations[] = $this->parseCronScheduleHook($tokens, $i, $line, $file, $name, $varLiteralValues, $classConstants, $currentClass, $currentParent);
+            $hookInvocations[] = $this->parseCronScheduleHook($tokens, $i, $line, $file, $name, $varLiteralValues, $classConstants, $currentClass, $currentParent, $currentNamespace, $useImports);
             return;
         }
 
         if (in_array($name, self::TEMPLATE_FUNCS, true)) {
-            $templateRefs[] = $this->parseTemplateRef($tokens, $i, $line, $file, $name, $varLiteralValues, $classConstants, $currentClass, $currentParent);
+            $templateRefs[] = $this->parseTemplateRef($tokens, $i, $line, $file, $name, $varLiteralValues, $classConstants, $currentClass, $currentParent, $currentNamespace, $useImports);
 
             // get_template_part( ocean_single_post_header_template() ) — the sole argument is a
             // bare call to a project helper, not a string at all, so parseTemplateRef() above
@@ -1425,11 +1503,12 @@ final class PhpTokenParser
      * @param list<Token> $tokens
      * @param array<string,string> $varLiteralValues
      * @param array<string,array<string,string>> $classConstants
+     * @param array<string,string> $useImports
      */
-    private function parseHookRegistration(array $tokens, int $i, string|int $line, string $file, string $funcName, array $varLiteralValues = [], array $classConstants = [], ?string $currentClass = null, ?string $currentParent = null): HookRegistration
+    private function parseHookRegistration(array $tokens, int $i, string|int $line, string $file, string $funcName, array $varLiteralValues = [], array $classConstants = [], ?string $currentClass = null, ?string $currentParent = null, string $currentNamespace = '', array $useImports = []): HookRegistration
     {
         // add_action( 'tag', callback )
-        $arg = $this->extractStringArgAt($tokens, $i, 0, $varLiteralValues, $classConstants, $currentClass, $currentParent);
+        $arg = $this->extractStringArgAt($tokens, $i, 0, $varLiteralValues, $classConstants, $currentClass, $currentParent, $currentNamespace, $useImports);
         if ($arg === null) {
             return new HookRegistration('', $funcName, (int) $line, $file, true);
         }
@@ -1441,10 +1520,11 @@ final class PhpTokenParser
      * @param list<Token> $tokens
      * @param array<string,string> $varLiteralValues
      * @param array<string,array<string,string>> $classConstants
+     * @param array<string,string> $useImports
      */
-    private function parseHookInvocation(array $tokens, int $i, string|int $line, string $file, string $funcName, array $varLiteralValues = [], array $classConstants = [], ?string $currentClass = null, ?string $currentParent = null): HookInvocation
+    private function parseHookInvocation(array $tokens, int $i, string|int $line, string $file, string $funcName, array $varLiteralValues = [], array $classConstants = [], ?string $currentClass = null, ?string $currentParent = null, string $currentNamespace = '', array $useImports = []): HookInvocation
     {
-        $arg = $this->extractStringArgAt($tokens, $i, 0, $varLiteralValues, $classConstants, $currentClass, $currentParent);
+        $arg = $this->extractStringArgAt($tokens, $i, 0, $varLiteralValues, $classConstants, $currentClass, $currentParent, $currentNamespace, $useImports);
         if ($arg === null) {
             return new HookInvocation('', $funcName, (int) $line, $file, true, '', '');
         }
@@ -1456,11 +1536,12 @@ final class PhpTokenParser
      * @param list<Token> $tokens
      * @param array<string,string> $varLiteralValues
      * @param array<string,array<string,string>> $classConstants
+     * @param array<string,string> $useImports
      */
-    private function parseCronScheduleHook(array $tokens, int $i, string|int $line, string $file, string $funcName, array $varLiteralValues = [], array $classConstants = [], ?string $currentClass = null, ?string $currentParent = null): HookInvocation
+    private function parseCronScheduleHook(array $tokens, int $i, string|int $line, string $file, string $funcName, array $varLiteralValues = [], array $classConstants = [], ?string $currentClass = null, ?string $currentParent = null, string $currentNamespace = '', array $useImports = []): HookInvocation
     {
         $argIndex = self::CRON_SCHEDULE_FUNCS[$funcName];
-        $arg = $this->extractStringArgAt($tokens, $i, $argIndex, $varLiteralValues, $classConstants, $currentClass, $currentParent);
+        $arg = $this->extractStringArgAt($tokens, $i, $argIndex, $varLiteralValues, $classConstants, $currentClass, $currentParent, $currentNamespace, $useImports);
         if ($arg === null) {
             return new HookInvocation('', $funcName, (int) $line, $file, true, '', '');
         }
@@ -1472,14 +1553,15 @@ final class PhpTokenParser
      * @param list<Token> $tokens
      * @param array<string,string> $varLiteralValues
      * @param array<string,array<string,string>> $classConstants
+     * @param array<string,string> $useImports
      */
-    private function parseTemplateRef(array $tokens, int $i, string|int $line, string $file, string $funcName, array $varLiteralValues = [], array $classConstants = [], ?string $currentClass = null, ?string $currentParent = null): TemplateRef
+    private function parseTemplateRef(array $tokens, int $i, string|int $line, string $file, string $funcName, array $varLiteralValues = [], array $classConstants = [], ?string $currentClass = null, ?string $currentParent = null, string $currentNamespace = '', array $useImports = []): TemplateRef
     {
         // Unlike hook tags, a template ref keeps a usable value even when the arg is a dynamic
         // interpolated string — e.g. get_template_part("variants/$variant") still tells us
         // every "variants/*" file is reachable, even though the exact suffix isn't known.
         // The literal prefix doubles as the exact value when the arg isn't dynamic at all.
-        [, , $path] = $this->extractStringArgAt($tokens, $i, 0, $varLiteralValues, $classConstants, $currentClass, $currentParent) ?? ['', true, ''];
+        [, , $path] = $this->extractStringArgAt($tokens, $i, 0, $varLiteralValues, $classConstants, $currentClass, $currentParent, $currentNamespace, $useImports) ?? ['', true, ''];
 
         // get_header('kiosk') loads header-kiosk.php; prefix the stem so matching works
         if ($path !== '') {
@@ -1638,6 +1720,61 @@ final class PhpTokenParser
             return null;
         }
         return $j;
+    }
+
+    /**
+     * $ifIndex points at T_IF. Recognizes exactly `if ( ! function_exists ( 'name' ) )` —
+     * the leading `!` REQUIRED (the only shape real code actually uses this for: the non-negated
+     * form would define the function only once it already exists, an immediate redeclaration
+     * fatal error, so no real code writes it) — everything else exact, no `&&`/`||` combined
+     * with anything else, no `=== false`, immediately followed by `{`. Anything looser returns
+     * null rather than guessing: this feeds a real-usage EXEMPTION (FunctionDef::$guarded), so a
+     * false match here would wrongly hide genuinely dead code, not just miss a real polyfill.
+     *
+     * @param list<Token> $tokens
+     */
+    private function functionExistsGuardName(array $tokens, int $ifIndex): ?string
+    {
+        $j = $this->peekNextMeaningfulIndex($tokens, $ifIndex);
+        if ($j === null || $tokens[$j] !== '(') {
+            return null;
+        }
+
+        $j = $this->peekNextMeaningfulIndex($tokens, $j);
+        if ($j === null || $tokens[$j] !== '!') {
+            return null;
+        }
+        $j = $this->peekNextMeaningfulIndex($tokens, $j);
+        if ($j === null || !is_array($tokens[$j]) || $tokens[$j][0] !== T_STRING || $tokens[$j][1] !== 'function_exists') {
+            return null;
+        }
+
+        $openCallParen = $this->peekNextMeaningfulIndex($tokens, $j);
+        if ($openCallParen === null || $tokens[$openCallParen] !== '(') {
+            return null;
+        }
+
+        $strIndex = $this->peekNextMeaningfulIndex($tokens, $openCallParen);
+        if ($strIndex === null || !is_array($tokens[$strIndex]) || $tokens[$strIndex][0] !== T_CONSTANT_ENCAPSED_STRING) {
+            return null;
+        }
+
+        $closeCallParen = $this->peekNextMeaningfulIndex($tokens, $strIndex);
+        if ($closeCallParen === null || $tokens[$closeCallParen] !== ')') {
+            return null;
+        }
+
+        $closeIfParen = $this->peekNextMeaningfulIndex($tokens, $closeCallParen);
+        if ($closeIfParen === null || $tokens[$closeIfParen] !== ')') {
+            return null;
+        }
+
+        $braceIndex = $this->peekNextMeaningfulIndex($tokens, $closeIfParen);
+        if ($braceIndex === null || $tokens[$braceIndex] !== '{') {
+            return null;
+        }
+
+        return $this->stripQuotes($tokens[$strIndex][1]);
     }
 
     /**
@@ -1823,11 +1960,12 @@ final class PhpTokenParser
      * @param ?string $currentClass Whichever class this call is physically inside, for
      *   `self`/`static::CONST` resolution — null outside any class body.
      * @param ?string $currentParent That class's own `extends` target, for `parent::CONST`.
+     * @param array<string,string> $useImports
      */
-    private function extractStringArgAt(array $tokens, int $i, int $argIndex, array $varLiteralValues = [], array $classConstants = [], ?string $currentClass = null, ?string $currentParent = null): ?array
+    private function extractStringArgAt(array $tokens, int $i, int $argIndex, array $varLiteralValues = [], array $classConstants = [], ?string $currentClass = null, ?string $currentParent = null, string $currentNamespace = '', array $useImports = []): ?array
     {
         $argTokens = $this->argTokensAt($tokens, $i, $argIndex);
-        return $argTokens === null ? null : $this->classifyArgTokens($argTokens, $varLiteralValues, $classConstants, $currentClass, $currentParent);
+        return $argTokens === null ? null : $this->classifyArgTokens($argTokens, $varLiteralValues, $classConstants, $currentClass, $currentParent, $currentNamespace, $useImports);
     }
 
     /**
@@ -1913,8 +2051,9 @@ final class PhpTokenParser
      * @param array<string,string> $varLiteralValues
      * @param array<string,array<string,string>> $classConstants
      * @return array{string, bool, string, string} [exact tag or '', isDynamic, literal prefix, literal suffix]
+     * @param array<string,string> $useImports
      */
-    private function classifyArgTokens(array $argTokens, array $varLiteralValues = [], array $classConstants = [], ?string $currentClass = null, ?string $currentParent = null): array
+    private function classifyArgTokens(array $argTokens, array $varLiteralValues = [], array $classConstants = [], ?string $currentClass = null, ?string $currentParent = null, string $currentNamespace = '', array $useImports = []): array
     {
         if (count($argTokens) === 1 && is_array($argTokens[0]) && $argTokens[0][0] === T_CONSTANT_ENCAPSED_STRING) {
             $value = $this->stripQuotes($argTokens[0][1]);
@@ -1938,7 +2077,7 @@ final class PhpTokenParser
             $receiverClass = match (strtolower($receiverName)) {
                 'self', 'static' => $currentClass,
                 'parent' => $currentParent,
-                default => $this->shortClassName($receiverName),
+                default => $this->resolveFqcn($receiverName, $currentNamespace, $useImports),
             };
             $value = $receiverClass !== null ? ($classConstants[$receiverClass][$argTokens[2][1]] ?? null) : null;
             if ($value !== null) {
@@ -2063,8 +2202,9 @@ final class PhpTokenParser
     /**
      * @param 'class'|'interface'|'trait'|'enum' $kind
      * @param list<Token> $tokens
+     * @param array<string,string> $useImports
      */
-    private function parseClassDef(array $tokens, int $i, string $file, string $kind = 'class'): ?ClassDef
+    private function parseClassDef(array $tokens, int $i, string $file, string $kind, string $currentNamespace, array $useImports): ?ClassDef
     {
         $j = $i + 1;
         while (isset($tokens[$j]) && is_array($tokens[$j]) && $tokens[$j][0] === T_WHITESPACE) {
@@ -2076,9 +2216,11 @@ final class PhpTokenParser
             return null;
         }
 
-        [$extends, $implements] = $this->findClassHierarchy($tokens, $j);
+        [$extends, $implements] = $this->findClassHierarchy($tokens, $j, $currentNamespace, $useImports);
 
-        return new ClassDef($next[1], $next[2], $file, $extends, $implements, $kind);
+        $fqcn = $currentNamespace === '' ? $next[1] : $currentNamespace . '\\' . $next[1];
+
+        return new ClassDef($next[1], $fqcn, $next[2], $file, $extends, $implements, $kind);
     }
 
     /**
@@ -2089,10 +2231,11 @@ final class PhpTokenParser
      * T_EXTENDS/T_IMPLEMENTS handling (which feeds the flat classReferences list) still sees
      * these same tokens afterwards, same as parseFunctionDef's lookahead does for T_STRING.
      *
-     * @return array{list<string>, list<string>}
+     * @return array{list<ClassRef>, list<ClassRef>}
      * @param list<Token> $tokens
+     * @param array<string,string> $useImports
      */
-    private function findClassHierarchy(array $tokens, int $nameIndex): array
+    private function findClassHierarchy(array $tokens, int $nameIndex, string $currentNamespace, array $useImports): array
     {
         $extends = [];
         $implements = [];
@@ -2115,9 +2258,9 @@ final class PhpTokenParser
             }
 
             if ($t[0] === T_EXTENDS) {
-                $extends = $this->captureClassNameList($tokens, $j);
+                $extends = $this->captureClassNameList($tokens, $j, $currentNamespace, $useImports);
             } elseif ($t[0] === T_IMPLEMENTS) {
-                $implements = $this->captureClassNameList($tokens, $j);
+                $implements = $this->captureClassNameList($tokens, $j, $currentNamespace, $useImports);
             }
 
             $j++;
@@ -2162,10 +2305,11 @@ final class PhpTokenParser
      * e.g. `class A extends B implements C, D`. Stops at the class body's opening brace, the
      * end of an interface-only declaration, or a following `implements` clause.
      *
-     * @return list<string>
+     * @return list<ClassRef>
      * @param list<Token> $tokens
+     * @param array<string,string> $useImports
      */
-    private function captureClassNameList(array $tokens, int $i): array
+    private function captureClassNameList(array $tokens, int $i, string $currentNamespace, array $useImports): array
     {
         $names = [];
         $j = $i + 1;
@@ -2191,7 +2335,7 @@ final class PhpTokenParser
             }
 
             if (in_array($t[0], self::CLASS_NAME_TOKENS, true)) {
-                $names[] = $this->shortClassName($t[1]);
+                $names[] = new ClassRef($this->shortClassName($t[1]), $this->resolveFqcn($t[1], $currentNamespace, $useImports));
             }
 
             $j++;
@@ -2273,6 +2417,33 @@ final class PhpTokenParser
     {
         $pos = strrpos($name, '\\');
         return $pos === false ? $name : substr($name, $pos + 1);
+    }
+
+    /**
+     * Resolves a class-name token's raw text to its real fully-qualified name, per PHP's own
+     * unqualified/qualified/fully-qualified name-resolution rules: a leading `\` is already
+     * fully qualified (strip it and use as-is); otherwise, if the name's first segment matches a
+     * `use`-imported alias, substitute that import's FQCN for that first segment; otherwise the
+     * name resolves relative to the current namespace (unchanged if there is none — the common
+     * case for un-namespaced WP code, where this reduces to exactly $name).
+     *
+     * @param array<string,string> $useImports
+     */
+    private function resolveFqcn(string $name, string $currentNamespace, array $useImports): string
+    {
+        if (str_starts_with($name, '\\')) {
+            return ltrim($name, '\\');
+        }
+
+        $sepPos = strpos($name, '\\');
+        $firstSegment = $sepPos === false ? $name : substr($name, 0, $sepPos);
+
+        if (isset($useImports[$firstSegment])) {
+            $imported = $useImports[$firstSegment];
+            return $sepPos === false ? $imported : $imported . substr($name, $sepPos);
+        }
+
+        return $currentNamespace === '' ? $name : $currentNamespace . '\\' . $name;
     }
 
     /**
@@ -2599,19 +2770,50 @@ final class PhpTokenParser
     }
 
     /**
+     * Given the index of an assignment's `=` token, checks whether the right-hand side is
+     * exactly a bare variable — `$this->prop = $controller;` — whose class is already known via
+     * the current scope's $varTypes (most commonly a type-hinted constructor parameter tracked
+     * by collectParamTypeHint, the constructor-injection pattern: `public function
+     * __construct(Controller $controller) { $this->controller = $controller; }`, where the
+     * property isn't `new`'d directly or auto-promoted). Requires the RHS to be nothing more than
+     * `$var;` — anything else (a method call, a further property access, a binary expression)
+     * bails rather than guessing, same stance as assignedNewClassName's own sibling cases.
+     *
+     * @param list<Token> $tokens
+     * @param array<string,string> $varTypes
+     */
+    private function assignedVariableClassName(array $tokens, int $equalsIndex, array $varTypes): ?string
+    {
+        $j = $this->peekNextMeaningfulIndex($tokens, $equalsIndex);
+        if ($j === null || !is_array($tokens[$j]) || $tokens[$j][0] !== T_VARIABLE) {
+            return null;
+        }
+        $varName = $tokens[$j][1];
+
+        $after = $this->peekNextMeaningfulIndex($tokens, $j);
+        if ($after === null || $tokens[$after] !== ';') {
+            return null;
+        }
+
+        return $varTypes[$varName] ?? null;
+    }
+
+    /**
      * Resolves a receiver identifier's raw text ("self", "parent", or a literal class name) to
-     * the class it actually refers to. "self" and "parent" depend on where this code physically
-     * is; anything else is already a concrete name (namespace-qualified names get shortened).
+     * the FQCN it actually refers to. "self" and "parent" depend on where this code physically
+     * is — $classNameStack/$classParentStack already hold FQCNs (see the class-open push sites)
+     * — anything else is resolved via resolveFqcn() against the current namespace/use-imports.
      *
      * @param list<?string> $classNameStack
      * @param list<?string> $classParentStack
+     * @param array<string,string> $useImports
      */
-    private function resolveClassNameToken(string $name, array $classNameStack, array $classParentStack): ?string
+    private function resolveClassNameToken(string $name, array $classNameStack, array $classParentStack, string $currentNamespace, array $useImports): ?string
     {
         return match ($name) {
             'self' => empty($classNameStack) ? null : end($classNameStack),
             'parent' => empty($classParentStack) ? null : end($classParentStack),
-            default => $this->shortClassName($name),
+            default => $this->resolveFqcn($name, $currentNamespace, $useImports),
         };
     }
 
@@ -2624,8 +2826,9 @@ final class PhpTokenParser
      * @param list<?string> $classNameStack
      * @param list<?string> $classParentStack
      * @param list<Token> $tokens
+     * @param array<string,string> $useImports
      */
-    private function assignedNewClassName(array $tokens, int $equalsIndex, array $classNameStack, array $classParentStack): ?string
+    private function assignedNewClassName(array $tokens, int $equalsIndex, array $classNameStack, array $classParentStack, string $currentNamespace, array $useImports): ?string
     {
         $newIndex = $this->peekNextMeaningfulIndex($tokens, $equalsIndex);
         if ($newIndex === null || !is_array($tokens[$newIndex]) || $tokens[$newIndex][0] !== T_NEW) {
@@ -2646,7 +2849,69 @@ final class PhpTokenParser
             return null;
         }
 
-        return $this->resolveClassNameToken($nameToken[1], $classNameStack, $classParentStack);
+        return $this->resolveClassNameToken($nameToken[1], $classNameStack, $classParentStack, $currentNamespace, $useImports);
+    }
+
+    /**
+     * `( new ClassName(...) )->method(...)` — the inline, parenthesized-`new` counterpart to
+     * `$var = new ClassName(); $var->method();` (assignedNewClassName above). Requires `new` to
+     * be immediately preceded by `(` — the wrapping group PHP has required for this exact
+     * chained-call shape since 5.4 — which also matches the one confirmed real-world example
+     * this was built from (Elementor's `( new Export() )->register_route(...)`); a bare
+     * `new Foo()->bar()` without the wrapping parens is a separate, rarer shape deliberately not
+     * handled here.
+     *
+     * @return array{string, string, int}|null [resolved receiver FQCN, method name, its token index]
+     * @param list<Token> $tokens
+     * @param list<?string> $classNameStack
+     * @param list<?string> $classParentStack
+     * @param array<string,string> $useImports
+     */
+    private function findInlineNewChainedCallTarget(array $tokens, int $newIndex, array $classNameStack, array $classParentStack, string $currentNamespace, array $useImports): ?array
+    {
+        $openParenIndex = $this->peekPrevMeaningfulIndex($tokens, $newIndex);
+        if ($openParenIndex === null || $tokens[$openParenIndex] !== '(') {
+            return null;
+        }
+
+        $nameIndex = $this->peekNextMeaningfulIndex($tokens, $newIndex);
+        if ($nameIndex === null) {
+            return null;
+        }
+        $nameToken = $tokens[$nameIndex];
+
+        if (is_array($nameToken) && $nameToken[0] === T_STATIC) {
+            $receiverFqcn = empty($classNameStack) ? null : end($classNameStack);
+        } elseif (is_array($nameToken) && in_array($nameToken[0], self::CLASS_NAME_TOKENS, true)) {
+            $receiverFqcn = $this->resolveClassNameToken($nameToken[1], $classNameStack, $classParentStack, $currentNamespace, $useImports);
+        } else {
+            return null; // `new class {}` (anonymous) / `new $dynamicClass()` — not resolvable
+        }
+        if ($receiverFqcn === null) {
+            return null;
+        }
+
+        $afterNameIndex = $this->peekNextMeaningfulIndex($tokens, $nameIndex);
+        $closeCtorParenIndex = $nameIndex;
+        if ($afterNameIndex !== null && $tokens[$afterNameIndex] === '(') {
+            $closeCtorParenIndex = $this->findMatchingCloseParen($tokens, $afterNameIndex);
+            if ($closeCtorParenIndex === null) {
+                return null;
+            }
+        }
+
+        $wrappingCloseIndex = $this->peekNextMeaningfulIndex($tokens, $closeCtorParenIndex);
+        if ($wrappingCloseIndex === null || $tokens[$wrappingCloseIndex] !== ')') {
+            return null;
+        }
+
+        $target = $this->findScopedCallTarget($tokens, $wrappingCloseIndex);
+        if ($target === null) {
+            return null;
+        }
+        [$methodName, $methodNameIndex] = $target;
+
+        return [$receiverFqcn, $methodName, $methodNameIndex];
     }
 
     /** @param list<Token> $tokens */
@@ -2689,8 +2954,9 @@ final class PhpTokenParser
      * @param list<?string> $classNameStack
      * @param list<?string> $classParentStack
      * @param list<Token> $tokens
+     * @param array<string,string> $useImports
      */
-    private function arrayCallbackReceiverClass(array $tokens, int $i, array $classNameStack, array $classParentStack): ?string
+    private function arrayCallbackReceiverClass(array $tokens, int $i, array $classNameStack, array $classParentStack, string $currentNamespace, array $useImports): ?string
     {
         $commaIndex = $this->peekPrevMeaningfulIndex($tokens, $i);
         if ($commaIndex === null || $tokens[$commaIndex] !== ',') {
@@ -2729,7 +2995,7 @@ final class PhpTokenParser
             if ($openIndex === null || !$this->isArrayOpenAt($tokens, $openIndex)) {
                 return null;
             }
-            return $this->resolveClassNameToken($tokens[$nameIndex][1], $classNameStack, $classParentStack);
+            return $this->resolveClassNameToken($tokens[$nameIndex][1], $classNameStack, $classParentStack, $currentNamespace, $useImports);
         }
 
         // ['Foo', 'method']
@@ -2739,7 +3005,7 @@ final class PhpTokenParser
                 return null;
             }
             $literal = $this->stripQuotes($receiverEndToken[1]);
-            return $literal !== '' ? $literal : null;
+            return $literal !== '' ? $this->resolveFqcn($literal, $currentNamespace, $useImports) : null;
         }
 
         return null;

@@ -139,8 +139,22 @@ final class TemplateAnalyzer
         foreach ($templateFiles as $templateFile) {
             $basename = $this->templateBasename($templateFile);
 
-            // Exempt WP core hierarchy templates (exact names + pattern variants) in classic/hybrid mode
-            if ($mode !== WpMode::Block && $this->modeDetector->isHierarchyTemplate($basename)) {
+            // Exempt WP core hierarchy templates (exact names + pattern variants) — but only for
+            // an actual theme scan (classic/hybrid, or mode not yet determined). WP's own
+            // locate_template()/template-hierarchy auto-location is a THEME mechanism; a plugin's
+            // own bundled "templates/" directory (WooCommerce's WC_Template_Loader and the many
+            // similar CPT-plugin conventions it inspired) is never auto-located this way, even
+            // when a bundled file's name happens to start with a hierarchy prefix like
+            // "taxonomy-"/"single-"/"archive-". Previously gated on "not Block mode", which
+            // incorrectly also exempted Plugin mode — confirmed against real WooCommerce
+            // templates (taxonomy-product-cat.php, taxonomy-product-tag.php) that have zero
+            // literal reference anywhere in the codebase (only reached via a runtime string
+            // concatenation in WC_Template_Loader that no static analysis can resolve) and were
+            // silently escaping detection purely because of this exemption, not because they're
+            // actually reachable. Mirrors collectTemplateFiles()'s own "is this actually a theme
+            // scan" condition just below for root-level file collection.
+            $isThemeScan = $mode === WpMode::Classic || $mode === WpMode::Hybrid || $mode === null;
+            if ($isThemeScan && $this->modeDetector->isHierarchyTemplate($basename)) {
                 continue;
             }
 

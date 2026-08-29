@@ -57,6 +57,33 @@ final class FileScannerTest extends TestCase
         self::assertCount(1, $result->files);
     }
 
+    public function testExcludesVendorPrefixedDirectories(): void
+    {
+        // php-scoper/Mozart/Strauss-style dependency prefixing (real-world: Elementor,
+        // wp-smushit, WooCommerce, Jetpack all use one of these spellings).
+        $this->touch('functions.php');
+        $this->touch('vendor_prefixed/twig/src/Environment.php');
+        $this->touch('vendor-prefixed/packages/Symfony/Polyfill/bootstrap.php');
+        $this->touch('jetpack_vendor/automattic/jetpack-sync/src/Module.php');
+
+        $result = $this->scanner->scan($this->tmp);
+
+        self::assertCount(1, $result->files);
+        self::assertStringContainsString('functions.php', $result->files[0]);
+    }
+
+    public function testDoesNotExcludeDirsWithVendorAsMerePlainSubstring(): void
+    {
+        // "vendors" (plural) and "myvendorpage" don't contain "vendor" as a whole
+        // underscore/hyphen-delimited segment -- must not be swept up by accident.
+        $this->touch('vendors/catalog.php');
+        $this->touch('myvendorpage/index.php');
+
+        $result = $this->scanner->scan($this->tmp);
+
+        self::assertCount(2, $result->files);
+    }
+
     public function testIgnoreGlobsApplied(): void
     {
         $this->touch('functions.php');

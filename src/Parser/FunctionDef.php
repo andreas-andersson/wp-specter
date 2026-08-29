@@ -22,5 +22,12 @@ final class FunctionDef
         // PhpTokenParser's parseReturnTypeHint and ClassAnalyzer's PendingReturnTypedCall
         // resolution.
         public readonly ?string $returnType = null,
+        // True when this exact declaration sits directly inside its own matching
+        // `if ( ! function_exists( '<same name>' ) ) { ... }` guard — the real WP polyfill
+        // convention (a function only meant to exist if WP core/another plugin hasn't already
+        // declared it, so it's never callable from *this* project's own code). See
+        // FunctionAnalyzer::isExcluded()'s own docblock for why this replaced a blanket
+        // name-prefix exclusion.
+        public readonly bool $guarded = false,
     ) {}
 }

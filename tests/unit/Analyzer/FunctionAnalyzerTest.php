@@ -63,16 +63,27 @@ add_action("admin_notices", function () {
         self::assertEmpty($this->analyzer->analyze([$file]));
     }
 
-    public function testFunctionExistsGuardDoesNotCountAsCall(): void
+    public function testFunctionExistsGuardExcludesTheGuardedFunctionEntirely(): void
     {
-        // Regression: `if ( ! function_exists( 'my_helper' ) ) { function my_helper() {} }` is
-        // an extremely common WP redeclaration guard, self-referencing the very thing it's about
-        // to define — not a real usage signal. Its own string argument was flowing into the same
-        // generic name pool a real call would, permanently masking a genuinely-unused function.
+        // `if ( ! function_exists( 'my_helper' ) ) { function my_helper() {} }` is the real WP
+        // polyfill convention — only meant to exist if WP core/another plugin hasn't already
+        // declared it, so it's never callable from this project's own code, and shouldn't be
+        // reported at all (see FunctionDef::$guarded / FunctionAnalyzer::isExcluded).
         $file = $this->write("<?php
 if ( ! function_exists( 'my_helper' ) ) {
     function my_helper() {}
 }
+");
+        self::assertEmpty($this->analyzer->analyze([$file]));
+    }
+
+    public function testUnguardedSameNamedFunctionIsStillReportedUnused(): void
+    {
+        // Only a function declared DIRECTLY inside its own matching guard is exempted — a
+        // same-named function declared plainly elsewhere (no guard at all) must still be
+        // evaluated normally.
+        $file = $this->write("<?php
+function my_helper() {}
 ");
         $findings = $this->analyzer->analyze([$file]);
         self::assertCount(1, $findings);
@@ -122,13 +133,38 @@ function bootstrap() {
         self::assertContains('truly_unused_helper', $unused);
     }
 
-    public function testExcludesWpPrefixedFunctions(): void
+    public function testWpPrefixedFunctionsAreNotBlanketExcluded(): void
     {
+        // A wp_/get_/the_/is_-prefixed name is no longer an automatic exemption on its own —
+        // only a real function_exists()-guarded polyfill is (see the guard tests above).
+        // Real-world regression this replaced: wp-smushit's own wp_smush_php_deprecated_notice()
+        // was genuinely dead (every call site commented out) but invisible purely because of its
+        // "wp_" prefix.
         $file = $this->write('<?php
 function wp_my_function() {}
 function get_my_data() {}
 function the_title() {}
 function is_active() {}
+');
+        $names = array_column($this->analyzer->analyze([$file]), 'name');
+        self::assertContains('wp_my_function', $names);
+        self::assertContains('get_my_data', $names);
+        self::assertContains('the_title', $names);
+        self::assertContains('is_active', $names);
+    }
+
+    public function testWpCoreNamePolyfillGuardedByFunctionExistsIsExempt(): void
+    {
+        // Real-world case (wp-smushit): a polyfill for a real WP-core function of the same name,
+        // guarded so it only defines itself if WP core hasn't already — WP core calls it once it
+        // exists, invisible to any single-plugin scan by design. Confirms the guard mechanism
+        // (not the name prefix) is what correctly protects this legitimate case.
+        $file = $this->write('<?php
+if ( ! function_exists( "wp_sizes_attribute_includes_valid_auto" ) ) {
+    function wp_sizes_attribute_includes_valid_auto( $sizes_attr ) {
+        return false;
+    }
+}
 ');
         self::assertEmpty($this->analyzer->analyze([$file]));
     }

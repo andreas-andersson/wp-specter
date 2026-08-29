@@ -1298,6 +1298,144 @@ class Not_Acorn extends Composer {
         );
     }
 
+    public function testNamespacedComposerCollisionInSameNamespaceAsBaseIsNotExempted(): void
+    {
+        // The gap merely being namespace-aware closes as a side effect: no `use` import at all,
+        // so before namespace-awareness existed there was no way to tell this file's own local
+        // "Composer" class apart from a real Roots\Acorn\View\Composer subclass -- both looked
+        // like the exact same bare short-name match. Now My\App\Composer !== the file's own
+        // resolved extends target only when there really is a mismatch; here the extending class
+        // is namespaced too, so its own Composer reference resolves to My\App\Composer, not the
+        // Acorn FQCN, and must NOT be exempted.
+        $file = $this->write('<?php
+namespace My\App;
+class Composer {
+    public function siteName() {}
+}
+class Not_Acorn extends Composer {
+    public function ownMethod() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertContains('ownMethod', $unusedMethods);
+    }
+
+    public function testNamespacedSubclassStillGetsWpCoreContractMethodExemption(): void
+    {
+        // Guards against the FQCN-aware redesign accidentally requiring an FQCN match against
+        // WP-core names (which are always global-namespace, keyed by bare short name in
+        // BASE_CLASS_CONTRACT_METHODS) -- widget()/form()/update() are WP_Widget's own contract,
+        // called by WP core itself, never by name in project code.
+        $file = $this->write('<?php
+namespace My_Plugin;
+class My_Widget extends \WP_Widget {
+    public function widget($args, $instance) {}
+    public function form($instance) {}
+    public function update($new_instance, $old_instance) {}
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        self::assertEmpty(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod));
+    }
+
+    public function testTwoProjectClassesWithSameShortNameInDifferentNamespacesAreTrackedSeparately(): void
+    {
+        // Modeled directly on the real Elementor bug this whole effort was built from: two
+        // unrelated classes both named Base_Route, in different namespaces, each declaring their
+        // own register_route() method. Before FQCN-aware keying, $classDefsByName['Base_Route']
+        // silently held only whichever ClassDef was parsed last, and $scopedCalled['Base_Route']
+        // was one shared bucket -- a genuine call to one would falsely credit the other's method
+        // as used too.
+        $routesFile = $this->write('<?php
+namespace Elementor\App\Modules\ImportExportCustomization\Data\Routes;
+abstract class Base_Route {
+    abstract protected function get_args(): array;
+}
+class Export extends Base_Route {
+    public function register_route($ns, $base) {}
+    protected function get_args(): array { return []; }
+}
+');
+        $v2BaseFile = $this->write('<?php
+namespace Elementor\Data\V2\Base;
+abstract class Base_Route {
+    protected function register_route($route = "", $methods = "GET", $args = []) {}
+}
+');
+        $callerFile = $this->write('<?php
+namespace Elementor\App\Modules\ImportExportCustomization\Data;
+use Elementor\App\Modules\ImportExportCustomization\Data\Routes\Export;
+class Controller {
+    private static function register_routes() {
+        ( new Export() )->register_route("ns", "base");
+    }
+}
+');
+        $findings = $this->analyzer->analyze(
+            [$routesFile, $v2BaseFile, $callerFile],
+            suppressUnusedClassMethods: false,
+        );
+        // The genuinely-called one, on the correct Base_Route, must not be reported.
+        self::assertNotContains(
+            'register_route',
+            array_column(
+                array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod && $f->file === $routesFile),
+                'name',
+            ),
+        );
+        // The unrelated, never-called Base_Route::register_route on Data\V2\Base must still be
+        // reported -- this is the assertion that would have passed "by accident" pre-fix (both
+        // would have looked used via the short-name collision) and is the real proof this works.
+        self::assertContains(
+            'register_route',
+            array_column(
+                array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod && $f->file === $v2BaseFile),
+                'name',
+            ),
+        );
+    }
+
+    public function testInlineNewChainedCallExemptsMethodFromUnusedReport(): void
+    {
+        $file = $this->write('<?php
+namespace My\App;
+class Export {
+    public function register_route() {}
+}
+( new Export() )->register_route();
+');
+        $findings = $this->analyzer->analyze([$file]);
+        self::assertEmpty(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod));
+    }
+
+    public function testPropertyMethodCallViaTypedConstructorParameterExemptsTheMethod(): void
+    {
+        // Real-world case (Elementor's Data\V2\Base\Base_Route/Controller): a type-hinted
+        // constructor parameter manually assigned to a property, then called from a completely
+        // different method -- $this->controller->get_permission_callback(). Previously invisible
+        // to $propertyAssignedClasses (only new ClassName() and constructor-promoted properties
+        // were tracked), so every override of get_permission_callback() anywhere in the
+        // Controller hierarchy looked unused regardless of real usage.
+        $file = $this->write('<?php
+class Controller {
+    public function get_permission_callback() {}
+}
+class Base_Route {
+    protected $controller;
+    protected function __construct(Controller $controller) {
+        $this->controller = $controller;
+    }
+    public function dispatch() {
+        $this->controller->get_permission_callback();
+    }
+}
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('get_permission_callback', $unusedMethods);
+    }
+
     // ── vendor reflection fallback (contract methods on classes outside the scan) ──────────
 
     public function testExcludesMethodOverridingVendorClassViaReflection(): void

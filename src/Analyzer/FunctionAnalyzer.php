@@ -11,7 +11,6 @@ use WpSpecter\Parser\PhpTokenParser;
 
 final class FunctionAnalyzer
 {
-    private const WP_PREFIXES = ['wp_', 'get_', 'the_', 'is_', 'has_', 'do_', 'apply_'];
     private const MAGIC_PREFIXES = ['__'];
 
     public function __construct(private readonly PhpTokenParser $parser) {}
@@ -24,11 +23,12 @@ final class FunctionAnalyzer
     {
         $parseResults = array_map(fn(string $f) => $this->parser->parse($f), $files);
 
-        // Pass 1: collect all definitions (skip class methods and WP-prefixed names)
+        // Pass 1: collect all definitions (skip class methods, magic methods, and real
+        // function_exists()-guarded polyfills — see isExcluded()'s own docblock)
         $definitions = [];
         foreach ($parseResults as $result) {
             foreach ($result->functionDefs as $def) {
-                if ($def->isMethod || $this->isExcluded($def->name)) {
+                if ($def->isMethod || $def->guarded || $this->isExcluded($def->name)) {
                     continue;
                 }
                 $definitions[$def->name] = $def;
@@ -75,9 +75,23 @@ final class FunctionAnalyzer
         return $findings;
     }
 
+    /**
+     * A magic method-like name (`__construct` etc.) at the top level is vanishingly rare and
+     * meaningless outside a class body — excluded defensively, same as ClassAnalyzer's own
+     * isMagicMethod(). Real WP-polyfill exclusion (a function only meant to exist if WP core/
+     * another plugin hasn't already declared it, so it's never callable from this project's own
+     * code) is handled via FunctionDef::$guarded instead of this method — previously a blanket
+     * name-prefix list (wp_/get_/the_/is_/has_/do_/apply_) undocumented since the project's first
+     * commit. Replaced after a fresh gap-hunting pass found it both too broad (wp-smushit's own
+     * genuinely dead `wp_smush_php_deprecated_notice()` — every call site commented out — was
+     * invisible purely because of its `wp_` prefix) and only accidentally protective in the one
+     * direction it mattered (a real WP-core-name polyfill, `wp_sizes_attribute_includes_valid_auto()`,
+     * wrapped in its own `function_exists()` guard) — the guard shape is the real signal, not the
+     * name.
+     */
     private function isExcluded(string $name): bool
     {
-        foreach ([...self::MAGIC_PREFIXES, ...self::WP_PREFIXES] as $prefix) {
+        foreach (self::MAGIC_PREFIXES as $prefix) {
             if (str_starts_with($name, $prefix)) {
                 return true;
             }

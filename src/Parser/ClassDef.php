@@ -7,13 +7,14 @@ namespace WpSpecter\Parser;
 final class ClassDef
 {
     /**
-     * @param list<string> $extends     Short base-class name(s) from `extends` — normally at
-     *                                  most one for a class, but interfaces can extend several.
-     * @param list<string> $implements  Short interface name(s) from `implements`.
+     * @param list<ClassRef> $extends     Base-class ref(s) from `extends` — normally at most one
+     *                                    for a class, but interfaces can extend several.
+     * @param list<ClassRef> $implements  Interface ref(s) from `implements`.
      * @param 'class'|'interface'|'trait'|'enum' $kind
      */
     public function __construct(
         public readonly string $name,
+        public readonly string $fqcn,
         public readonly int $line,
         public readonly string $file,
         public readonly array $extends = [],

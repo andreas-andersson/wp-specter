@@ -1,3 +1,32 @@
+# File Scanning — Open Issues
+
+Known gaps in `FileScanner` (which files ever reach any analyzer, before any check-specific logic
+runs at all).
+
+- [x] **A literal `vendor` directory name isn't the only real shape third-party dependencies show
+  up under — php-scoper/Mozart/Strauss-style dependency-prefixing relocates a package's code into
+  the host project's own tree under an author-chosen directory name, always with a "vendor"
+  segment somewhere in it by convention, but never excluded by the old fixed 3-item
+  `DEFAULT_EXCLUDES` list.** Found by a fresh gap-hunting pass over the 7-plugin test corpus:
+  confirmed **three different real spellings**, none excluded — `vendor_prefixed` (Elementor,
+  wp-smushit), `vendor-prefixed` (WooCommerce), `jetpack_vendor` (Jetpack's own separately-
+  published Automattic packages). Impact was severe for two of the seven: **100% of Elementor's
+  95 `--type=functions` findings** and **100% of wp-smushit's 7** were bundled Twig/Symfony-
+  polyfill/Guzzle code — neither plugin had a single genuine finding in that check, entirely
+  masked by noise. This wasn't specific to the functions/hooks checks — it's upstream of every
+  analyzer, since `FileScanner` decides what files exist at all before any check-specific logic
+  runs.
+
+  Fixed: `FileScanner::isVendorPrefixedDirName()` additionally excludes any directory whose
+  basename contains "vendor" as a whole `_`/`-`-delimited segment (not a bare substring — a real
+  project directory named "vendors" (plural) or "my-vendors-page" isn't swept up by accident, only
+  an exact segment match). Applied unconditionally alongside the existing literal-name exclusion
+  list, the same "always-on default" treatment `vendor`/`node_modules`/`.git` already get.
+  Verified: Elementor and wp-smushit's `--type=functions` now both come back `✓ All clear` (their
+  entire prior output was this noise), zero remaining `vendor_prefixed`/`vendor-prefixed`/
+  `jetpack_vendor` hits anywhere in the corpus, and a full `--type=all` sanity pass across all 7
+  plugins shows no crashes and no regressions.
+
 # Parsing / Class & Method Detection — Open Issues
 
 Known gaps in `PhpTokenParser` and the class/method-unused analysis built on top of it
@@ -100,6 +129,95 @@ scope limit that trades recall or precision for staying a single-pass, no-depend
   Inherent to a token-based parser without type inference or dataflow analysis — not realistically
   fixable without a much bigger rewrite. Documented here so it's not re-investigated as a "bug."
 
+- [x] **Every class-keyed structure was flat and keyed only by short class name, project-wide —
+  two unrelated classes sharing a short name across different namespaces collided.** `PhpTokenParser`
+  had zero `T_NAMESPACE` handling at all, and `ClassDef`/every scoped-call/property-type map in
+  `ClassAnalyzer` (`$classDefsByName`, `$scopedCalled`, `$propertyAssignedClasses`,
+  `$descendantsOf`, ~15 structures total) discarded namespace entirely. `$classDefsByName[$def->name]
+  = $def` silently **overwrote** one class's `ClassDef` with another's the instant two classes
+  anywhere in the project shared a short name — not just a collision risk for the colliding pair,
+  but corruption of the extends/implements chain-walk (`isContractMethod`,
+  `isUsedByPolymorphicCall`, `isFullyExemptClass`) for every other class that happened to also
+  need that (now wrong) `ClassDef`. Real-world case (Elementor): two unrelated classes both named
+  `Base_Route`, in different namespaces (`Elementor\App\Modules\ImportExportCustomization\Data\
+  Routes` vs `Elementor\Data\V2\Base`), each declaring their own `register_route()` method (a
+  third unrelated class, `Elementor\Data\Base\Endpoint`, declares one too) — `$scopedCalled
+  ['Base_Route']['register_route']` was one shared bucket regardless of which one a real call
+  site resolved to.
+
+  Fixed with a genuinely namespace-aware resolution pass, not a workaround:
+  1. **`PhpTokenParser`** now tracks `namespace X;` (the bare, non-braced form only — see scope
+     limitation below) and resolves every extends/implements/trait-use/`new`/`instanceof`/static-
+     call-receiver/type-hint/return-type class-name reference to its real FQCN, per PHP's own
+     resolution rules (leading `\` ⇒ already fully qualified; first segment matches a `use` import
+     ⇒ substitute that import's FQCN; otherwise ⇒ prefixed with the current namespace, reducing to
+     exactly the bare name for the ~38% of real-world files with no `namespace` at all — zero
+     behavior change there). New `src/Parser/ClassRef.php` value object carries *both* the short
+     name (for matching WP-core/vendor curated tables — `BASE_CLASS_CONTRACT_METHODS` and
+     friends, always keyed by bare short name since WP core is always global-namespace — and
+     `VendorClassReflector`, unaffected) and the resolved FQCN (for matching another project
+     `ClassDef` precisely) side by side, so nothing downstream had to choose one over the other.
+     `ClassDef` gained an `$fqcn` field; `extends`/`implements` changed from `list<string>` to
+     `list<ClassRef>`.
+  2. **`ClassAnalyzer`** re-keyed `$classDefsByName` (and everything downstream of it —
+     `$scopedCalled`, `$descendantsOf`, the `isContractMethod`/`isUsedByPolymorphicCall`/
+     `isFullyExemptClass` chain-walks) by FQCN instead of short name. A useful side effect:
+     `ClassAnalyzer`'s own *global* merge of every file's `use` imports into one flat map (a
+     second, independent source of the same collision risk — two files importing different FQCNs
+     under the same alias would silently pick whichever was merged last) became unnecessary and
+     was deleted outright, since each `ClassRef` already carries its own correctly-resolved,
+     per-file FQCN. `isFullyExemptClass`'s "no signal either way ⇒ trust the bare short-name
+     match" leniency (for `FULLY_EXEMPT_BASE_CLASSES`, e.g. Acorn's `Composer`) is preserved
+     exactly, just re-expressed as `$ref->fqcn === $ref->short` — and this closes a related,
+     previously-undetectable gap as a side effect: a namespaced file's own unrelated `Composer`
+     class extended with no `use` import at all previously had *no way* to be told apart from a
+     real `Roots\Acorn\View\Composer` subclass (both were an identical bare short-name match);
+     merely being namespaced now makes `fqcn !== short`, correctly ruling it out.
+  3. **Bundled, separate fix** (needed for the Elementor example to resolve end-to-end — the
+     namespace work alone doesn't touch it): the real call site is
+     `( new Export() )->register_route(...)`, an inline `new` immediately chained with `->method()`,
+     which `PhpTokenParser` didn't scope to any receiver at all before (only `$this->`,
+     `self::`/`parent::`/`static::`, a literal `Class::method()`, and the two-statement
+     `$var = new X(); $var->method();` were recognized). Extended the *existing*
+     `assignedNewClassName()`/`findScopedCallTarget()` machinery to also recognize this shape
+     (gated on `new` being immediately preceded by `(`, the wrapping parens PHP requires for it)
+     rather than inventing a separate mechanism.
+
+  `classReferences` (the flat pool feeding `findUnusedClasses`' own "is this class referenced at
+  all" check, and `FileAnalyzer`'s unrelated PSR-4-mapped-file usage-proof) was deliberately left
+  untouched, still short-name-only — the actual reported bug was a contract-method/polymorphic-
+  dispatch failure, not an unused-class-detection one, and touching it would have pulled
+  `FileAnalyzer.php` into a change that didn't need it.
+
+  Verified against the full real-plugin corpus (before/after `git stash` comparison, `--type=classes`):
+  akismet, contact-form-7, and wordfence unchanged (no namespace short-name collisions present).
+  wp-smushit and jetpack showed small method-count increases (7 and 46 respectively) — real,
+  previously-hidden dead code now correctly surfaced, no longer masked by an unrelated same-named
+  method elsewhere. Elementor and WooCommerce showed large *net decreases* (729→636 and
+  1360→1246 methods respectively) — the dominant effect in both: the silent-`ClassDef`-overwrite
+  bug had been corrupting the extends/implements chain-walk for a much wider set of classes than
+  just the colliding pair (very common in both codebases, which reuse generic short names like
+  `Module`/`Controller`/`Base` across dozens of unrelated namespaced files), so fixing it let
+  `isContractMethod`/`isUsedByPolymorphicCall` correctly credit far more genuinely-used methods
+  that were previously walking the *wrong* (overwritten) class's inheritance chain. Elementor's
+  own `Base_Route`/`register_route` collision confirmed resolved directly: the genuinely-called
+  one (`ImportExportCustomization\...\Export`, via the newly-recognized inline-chain call) is no
+  longer flagged; the unrelated `Data\V2\Base\Base_Route` one is (correctly) still evaluated on
+  its own merits. No crashes on any of the 7 plugins.
+
+  **Explicit scope limitations, not silent gaps:**
+  - **Braced `namespace X { ... }` / bare `namespace { ... }` forms are unsupported.** Zero
+    occurrences across the entire 7-plugin, 8,651-file real-world fixture corpus justified not
+    tracking brace-scoped namespace resets — a file using this form has subsequent code resolve
+    as if still in the previous/global namespace.
+  - **`FunctionAnalyzer`'s identical-looking flat short-name collision for namespaced top-level
+    functions was deliberately NOT touched.** PHP resolves an unqualified function *call* by
+    trying the current namespace first and falling back to the *global* namespace at runtime if
+    not found there — a real ambiguity class-name resolution doesn't have (an unqualified class
+    reference always resolves to exactly one place, never a runtime fallback). Applying the same
+    FQCN scheme to functions without modeling that fallback would risk introducing false "unused
+    function" positives rather than fixing anything. Left as a real, separate follow-up.
+
 ## Method detection
 
 - [x] **Contract-method exemption (`ClassAnalyzer::isContractMethod`) only checks the declaring
@@ -175,6 +293,33 @@ scope limit that trades recall or precision for staying a single-pass, no-depend
     The bare-string comparison silently never matched anything (return null every time), caught
     by a manual debug trace after property tracking produced zero results end-to-end on an
     otherwise-correct test fixture.
+
+- [x] **Property-type tracking above only recognized `$this->prop = new ClassName()` — a
+  property assigned from a type-hinted parameter that isn't `new`'d directly or
+  constructor-promoted was still invisible.** Found by a fresh gap-hunting pass while chasing an
+  unexplained finding: real-world case (Elementor's `Data\V2\Base\Base_Route`/`Controller`) —
+  `protected function __construct( Controller $controller, $route ) { $this->controller =
+  $controller; }`, a manual constructor-injection assignment (not `new Controller()`, no
+  visibility modifier on the parameter so not promotion either). Every override of
+  `get_permission_callback()` anywhere in the `Controller` hierarchy looked unused, since
+  `$this->controller->get_permission_callback()` (called from a *different* method, `Base_Route`'s
+  own `register_route()`/`register_item_route()`) could never resolve — `assignedNewClassName()`
+  only recognizes a `new ClassName(...)` right-hand side, so the assignment was silently dropped
+  from `$propertyAssignedClasses` entirely. Not a regression from the namespace-aware
+  rearchitecture above (confirmed it would have produced the same false positive before that work
+  too) — just newly surfaced while verifying that refactor's real-corpus impact.
+
+  Fixed: new `PhpTokenParser::assignedVariableClassName()` — given a `$this->prop = <RHS>;`
+  assignment, if the RHS isn't a `new` expression, checks whether it's *exactly* a bare variable
+  (`$var;`, nothing more — a method call, chained access, or any other expression bails rather
+  than guessing) whose class is already known via the current scope's `$varTypesStack` (already
+  seeded for a type-hinted parameter by `collectParamTypeHint`, see the entry below). Falls back
+  to this only when `assignedNewClassName()` itself returns null, so the existing `new
+  ClassName()`/constructor-promotion paths are unaffected. Verified against the real corpus:
+  `get_permission_callback` findings gone entirely from Elementor's `--type=classes` output, and
+  the same pattern being common in Elementor's own dependency-injection-style architecture
+  dropped the method-finding count further (526, down from 636 after the namespace-aware fix
+  alone). Full 7-plugin sanity pass shows no crashes.
 
 - [x] **Type-hinted parameters don't seed variable tracking or count as class references.**
   Fixed: `parseParamTypeHints`/`collectParamTypeHint` in `PhpTokenParser` walk the parameter
@@ -271,15 +416,16 @@ scope limit that trades recall or precision for staying a single-pass, no-depend
     core source to scan for them in the first place; this tool only ever targeted the base-class
     half of the original complaint.
 
-- [ ] **Namespaced static calls aren't scoped.** `Some\Namespace\Foo::method()` — the receiver-token
-  branches that resolve `self::`/`parent::`/`Foo::` (in the `T_STRING` branch of the main loop)
-  only match `T_STRING`, never `T_NAME_QUALIFIED`/`T_NAME_FULLY_QUALIFIED`. Falls back to the
-  unscoped pool. Same limitation already existed for `classReferences` before any of the
-  class-scoping work (namespaced `extends`/`implements`/`new` targets were never a problem there
-  since `captureClassNameAfter`/`captureClassNameList` already use `CLASS_NAME_TOKENS`, which
-  does include the qualified-name tokens — it's specifically the call-scoping lookahead
-  (`findScopedCallTarget`'s receiver-side checks) that's T_STRING-only). Low priority: WP
-  plugin/theme code is overwhelmingly written in the global namespace.
+- [x] **Namespaced static calls aren't scoped — stale entry, this was already fixed (commit
+  `37b63d4`) and the checkbox just never got updated.** `Some\Namespace\Foo::method()` is handled
+  by its own dedicated `T_NAME_QUALIFIED`/`T_NAME_FULLY_QUALIFIED` branch in the main loop (see
+  the "`\SwiftQueue\License_Bridge::initialize()`" doc comment in `PhpTokenParser::parse`),
+  calling the same `findScopedCallTarget`/`resolveClassNameToken` machinery the `T_STRING` branch
+  uses — confirmed still covered by `PhpTokenParserTest::
+  testFullyQualifiedAndNamespaceQualifiedStaticCallsResolveAsClassReferences`. The namespace-aware
+  FQCN resolution work above additionally improved what that branch resolves *to* — the scoped
+  call's receiver is now the real FQCN (`SwiftQueue\License_Bridge`) instead of just the bare
+  short name — but the scoping itself predates that work and was never actually missing.
 
 - [x] **Contract-method exemption (and the class-unused check) only ever knew about base
   classes/interfaces the scan itself parsed — a class extending a real Composer dependency
@@ -597,6 +743,47 @@ way the class/method/file gaps above were found; nothing here has been fixed yet
   case documented under Class detection above; not worth a special case without a second
   real-world example motivating it.
 
+- [x] **`TemplateAnalyzer`'s WP-hierarchy exemption fired for Plugin-mode scans too, not just
+  theme scans — but enabling the check for plugins was tried and reverted after real-corpus
+  verification showed it makes things worse, not better.** Found by a fresh gap-hunting pass:
+  `isHierarchyTemplate()` was gated on `$mode !== WpMode::Block`, which is also true for
+  `WpMode::Plugin` — so a plugin's own bundled `templates/`-directory file whose name happens to
+  start with a WP hierarchy prefix (`taxonomy-`, `single-`, `archive-`, ...) got the same
+  free-pass exemption a theme's real hierarchy file correctly gets, even though WP's own
+  `locate_template()` never auto-locates a *plugin's* bundled templates that way — that's purely
+  the plugin's own override-lookup convention (WooCommerce's `WC_Template_Loader`, and every
+  CPT-heavy plugin that copies the pattern). Confirmed real, currently-unflagged case:
+  WooCommerce's `templates/taxonomy-product-cat.php`/`taxonomy-product-tag.php` have zero literal
+  reference anywhere in its source (reachable only via `$default_file = 'taxonomy-' .
+  $object->taxonomy . '.php';`, a runtime concatenation no static tokenizer can resolve) — both
+  escape detection purely because of this exemption bug.
+
+  **Fixed at the `TemplateAnalyzer` level**: the hierarchy exemption now only fires for an actual
+  theme scan (`$mode === WpMode::Classic || $mode === WpMode::Hybrid || $mode === null`), mirroring
+  `collectTemplateFiles()`'s own existing "is this a theme scan" condition for root-level file
+  collection. Covered by new unit tests
+  (`testDoesNotExemptHierarchyNamedTemplatesInPluginMode`/`testStillExemptsHierarchyTemplatesInHybridMode`).
+
+  **Deliberately NOT wired up to actually run for Plugin mode**, though — `Application.php`
+  independently skips the whole templates check for `WpMode::Plugin` targets (unrelated to the
+  bug above; a second, separate gate), and this was tried and reverted after enabling it: WooCommerce
+  loads most of its own `templates/` directory through its own wrapper functions
+  (`wc_get_template()`/`wc_get_template_part()`), not the WP-core `get_template_part()`/
+  `get_header()`/`get_footer()`/`get_sidebar()` calls `PhpTokenParser`'s `TEMPLATE_FUNCS` list
+  tracks. Confirmed real false positives from enabling the check: `content-product.php` and
+  `content-single-product.php` are genuinely used — reached via literal
+  `wc_get_template_part('content', 'product')`/`('content', 'single-product')` calls — but the
+  parser has no way to know `wc_get_template_part` maps its two string arguments to a
+  `slug-name.php` filename the way it already knows `get_template_part`'s single argument does.
+  Net result in the one real plugin this whole investigation was built around: 2 confirmed new
+  false positives per 2 genuine catches — a wash at best, likely worse across other plugins with
+  their own similarly-named wrapper (EDD's `edd_get_template_part()` and others follow the exact
+  same pattern). Real fix would need either a curated list of known plugin template-loader
+  wrapper names (unbounded, whack-a-mole — a new one for every plugin ecosystem) or a generic
+  "two-string-argument call producing a `slug-name.php`-shaped file reference" heuristic broad
+  enough to catch this shape without also matching unrelated two-string-argument calls. Left
+  disabled for Plugin mode until that's actually solved, not merely flipped on.
+
 ## Function detection
 
 - [x] **Namespaced/fully-qualified function calls were invisible to `FunctionAnalyzer`.** The
@@ -612,6 +799,43 @@ way the class/method/file gaps above were found; nothing here has been fixed yet
   *declared* with a bare name in PHP (the enclosing `namespace` block carries the namespace, never
   the declaration's own name token), so `FunctionDef` was already just as namespace-blind on the
   definition side.
+
+- [x] **`FunctionAnalyzer`'s blanket `wp_`/`get_`/`the_`/`is_`/`has_`/`do_`/`apply_` name-prefix
+  exclusion was undocumented since the project's very first commit and provably too broad in one
+  direction while only accidentally correct in the other.** Found by a fresh gap-hunting pass:
+  any function whose name merely *starts with* one of these prefixes was excluded from "unused"
+  reporting entirely, unconditionally — no comment anywhere explaining why, unusual for this
+  codebase, which documents every other trade-off in detail. Confirmed real false negative
+  (wp-smushit): a same-named function with every call site commented out would be invisible
+  purely because of its `wp_` prefix — though on closer inspection this exact function turned out
+  to *also* be a real `function_exists()`-guarded polyfill (see below), so it wasn't actually a
+  clean example of the prefix hiding otherwise-checkable dead code; the underlying "any
+  `wp_`/`get_`/etc-prefixed function gets a free pass regardless of whether it's guarded" problem
+  is still real for any unguarded same-prefixed function, just not demonstrated by that specific
+  corpus example. Confirmed the legitimate case the exclusion was accidentally protecting
+  (wp-smushit again): `wp_sizes_attribute_includes_valid_auto()`, a polyfill for a real WP-core
+  function of the same name, guarded by
+  `if ( ! function_exists( 'wp_sizes_attribute_includes_valid_auto' ) )` — called by WP core
+  itself once it exists, invisible to any single-plugin scan by design, and genuinely needing
+  *some* exemption.
+
+  Fixed: the real signal isn't the name prefix, it's whether the function is declared directly
+  inside its own matching `function_exists()` guard — the actual WP polyfill convention. New
+  `PhpTokenParser::functionExistsGuardName()` recognizes exactly
+  `if ( ! function_exists( 'name' ) ) { ... }` (leading `!` required — the only shape real code
+  uses this for, since the non-negated form would define the function only once it already
+  exists, an immediate redeclaration fatal error) immediately followed by `{`; a
+  `$functionExistsGuardDepthStack`/`$functionExistsGuardNameStack` pair (same push-on-`{`/
+  pop-on-`}` pattern as `$classDepthStack`) records the guarded name for that block, and a
+  `T_FUNCTION` declaration whose own name matches the current top of the stack gets
+  `FunctionDef::$guarded = true`. `FunctionAnalyzer::isExcluded()` now only excludes magic-style
+  names (`__`-prefixed); the prefix list is gone, and guarded functions are dropped from
+  `$definitions` entirely — a legitimate polyfill is never reported, the same as before, but a
+  same-prefixed function that *isn't* guarded is now actually evaluated instead of getting a free
+  pass by name alone. Verified: `wp_sizes_attribute_includes_valid_auto()` stays exempt (guarded);
+  a synthetic unguarded `wp_my_function()`/`get_my_data()`/etc. is now correctly reported (new
+  test coverage, since the real corpus didn't have a live unguarded example). Full 7-plugin
+  corpus sanity pass shows no crashes.
   - Deliberately narrower than the `T_STRING` branch: WP's own hook/template/glob/`define`/
     existence-check special-cased function names (`add_action`, `get_template_part`, `glob`,
     `class_exists`, ...) aren't given the same special-case dispatch here. Found while

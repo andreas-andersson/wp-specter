@@ -127,6 +127,33 @@ function render() {
         self::assertCount(1, $findings);
     }
 
+    public function testDoesNotExemptHierarchyNamedTemplatesInPluginMode(): void
+    {
+        // Real-world case (WooCommerce): templates/taxonomy-product-cat.php is a plugin's own
+        // bundled override template, never auto-located by WP core's theme hierarchy the way a
+        // theme's own taxonomy.php would be — WP's locate_template() only ever looks in the
+        // active theme. A plugin-bundled file whose name happens to start with a hierarchy
+        // prefix must not get a free pass just for looking like one.
+        $themeDir = $this->tmp;
+        $taxonomy = $this->touch('templates/taxonomy-product-cat.php');
+
+        $findings = $this->analyzer->analyze([$taxonomy], WpMode::Plugin, $themeDir);
+
+        self::assertCount(1, $findings);
+    }
+
+    public function testStillExemptsHierarchyTemplatesInHybridMode(): void
+    {
+        // Hybrid (a block theme that still ships some classic PHP templates) is a real theme
+        // scan -- must keep the hierarchy exemption, unlike Plugin mode above.
+        $themeDir = $this->tmp;
+        $single = $this->touch('single.php');
+
+        $findings = $this->analyzer->analyze([$single], WpMode::Hybrid, $themeDir);
+
+        self::assertEmpty($findings);
+    }
+
     public function testFunctionsPhpNeverFlagged(): void
     {
         $themeDir = $this->tmp;

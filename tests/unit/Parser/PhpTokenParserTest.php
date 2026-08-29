@@ -460,8 +460,9 @@ class My_Widget extends WP_Widget implements Countable {
 ');
         self::assertCount(1, $result->classDefs);
         self::assertSame('My_Widget', $result->classDefs[0]->name);
-        self::assertSame(['WP_Widget'], $result->classDefs[0]->extends);
-        self::assertSame(['Countable'], $result->classDefs[0]->implements);
+        self::assertSame('My_Widget', $result->classDefs[0]->fqcn);
+        self::assertSame(['WP_Widget'], array_map(fn($ref) => $ref->short, $result->classDefs[0]->extends));
+        self::assertSame(['Countable'], array_map(fn($ref) => $ref->short, $result->classDefs[0]->implements));
 
         $methods = array_column($result->functionDefs, 'ownerClass', 'name');
         self::assertSame('My_Widget', $methods['widget']);
@@ -528,7 +529,7 @@ interface Base_B {}
 interface Combined extends Base_A, Base_B {}
 ');
         $defsByName = array_column($result->classDefs, null, 'name');
-        self::assertSame(['Base_A', 'Base_B'], $defsByName['Combined']->extends);
+        self::assertSame(['Base_A', 'Base_B'], array_map(fn($ref) => $ref->short, $defsByName['Combined']->extends));
     }
 
     public function testEnumWithBackingTypeAndImplementsIsParsedCorrectly(): void
@@ -541,7 +542,7 @@ enum Status: string implements Has_Label {
 ');
         $defsByName = array_column($result->classDefs, null, 'name');
         self::assertSame('enum', $defsByName['Status']->kind);
-        self::assertSame(['Has_Label'], $defsByName['Status']->implements);
+        self::assertSame(['Has_Label'], array_map(fn($ref) => $ref->short, $defsByName['Status']->implements));
     }
 
     public function testTraitUseInsideClassBodyIsClassReference(): void
@@ -690,8 +691,12 @@ function bootstrap() {
             fn($c) => $c->receiverClass . '::' . $c->method,
             $result->scopedMethodCalls,
         );
-        self::assertContains('License_Bridge::initialize', $calls);
-        self::assertContains('Wp_Cli_Commands::register', $calls);
+        // receiverClass is now the fully-resolved FQCN, not the bare short name: the fully-
+        // qualified call resolves to SwiftQueue\License_Bridge (leading backslash stripped); the
+        // merely-qualified one resolves relative to the current namespace, SwiftQueue\Ns\
+        // Wp_Cli_Commands (no matching `use` import for its first segment "Ns").
+        self::assertContains('SwiftQueue\License_Bridge::initialize', $calls);
+        self::assertContains('SwiftQueue\Ns\Wp_Cli_Commands::register', $calls);
     }
 
     public function testFullyQualifiedAndNamespaceQualifiedBareFunctionCallsAreCredited(): void
@@ -847,6 +852,60 @@ class My_Controller {
         self::assertSame('My_Controller', $result->propertyMethodCalls[0]->ownerClass);
         self::assertSame('service', $result->propertyMethodCalls[0]->property);
         self::assertSame('render', $result->propertyMethodCalls[0]->method);
+    }
+
+    public function testPropertyAssignedFromATypedParameterIsTracked(): void
+    {
+        // Real-world case (Elementor's Data\V2\Base\Base_Route): a type-hinted constructor
+        // parameter manually assigned to a property -- not `new ClassName()`, not
+        // constructor-promoted -- previously invisible to $propertyAssignedClasses entirely, so
+        // $this->controller->get_permission_callback() (called from a completely different
+        // method) always fell back to the unscoped pool no matter what.
+        $result = $this->parse('<?php
+class Base_Route {
+    protected $controller;
+    protected function __construct(Controller $controller) {
+        $this->controller = $controller;
+    }
+    public function dispatch() {
+        $this->controller->get_permission_callback();
+    }
+}
+');
+        self::assertSame(
+            ['Base_Route' => ['controller' => 'Controller']],
+            $result->propertyAssignedClasses,
+        );
+        self::assertCount(1, $result->propertyMethodCalls);
+        self::assertSame('get_permission_callback', $result->propertyMethodCalls[0]->method);
+    }
+
+    public function testPropertyAssignedFromAnUntypedParameterIsNotTracked(): void
+    {
+        // No type hint at all -- nothing for $varTypesStack to have recorded, so there's no
+        // class to propagate; must not be mistaken for anything.
+        $result = $this->parse('<?php
+class Base_Route {
+    protected function __construct($controller) {
+        $this->controller = $controller;
+    }
+}
+');
+        self::assertSame([], $result->propertyAssignedClasses);
+    }
+
+    public function testPropertyAssignedFromAMethodCallOnAVariableIsNotTracked(): void
+    {
+        // $this->prop = $var->method(); -- more than a bare "$var;" RHS, must bail rather than
+        // guess (same "don't guess" stance as everywhere else in this parser).
+        $result = $this->parse('<?php
+class Base_Route {
+    protected function __construct(Controller $controller) {
+        $this->controller = $controller->clone();
+    }
+}
+');
+        self::assertSame([], $result->propertyAssignedClasses);
     }
 
     public function testConstructorPromotedPropertyIsTrackedAsAnImplicitAssignment(): void
@@ -1359,6 +1418,201 @@ function boot() {
 }
 ');
         self::assertEmpty($result->pendingReturnTypedCalls);
+    }
+
+    // ── Namespace-aware FQCN resolution ─────────────────────────────────────
+
+    public function testNamespacedClassResolvesFqcn(): void
+    {
+        $result = $this->parse('<?php
+namespace My\App;
+class Foo {}
+');
+        self::assertSame('Foo', $result->classDefs[0]->name);
+        self::assertSame('My\App\Foo', $result->classDefs[0]->fqcn);
+    }
+
+    public function testNamespacedClassWithUseImportResolvesExtendsFqcn(): void
+    {
+        $result = $this->parse('<?php
+namespace My\App;
+use Vendor\Base;
+class Foo extends Base {}
+');
+        $extends = $result->classDefs[0]->extends[0];
+        self::assertSame('Base', $extends->short);
+        self::assertSame('Vendor\Base', $extends->fqcn);
+    }
+
+    public function testNamespacedClassWithoutUseImportResolvesExtendsToCurrentNamespace(): void
+    {
+        // No `use` at all -- an unqualified reference resolves relative to the current
+        // namespace, per PHP's own class-name-resolution rules (never a silent fallback to the
+        // global namespace the way an unqualified function call gets at runtime).
+        $result = $this->parse('<?php
+namespace My\App;
+class Foo extends Bar {}
+');
+        $extends = $result->classDefs[0]->extends[0];
+        self::assertSame('Bar', $extends->short);
+        self::assertSame('My\App\Bar', $extends->fqcn);
+    }
+
+    public function testLeadingBackslashFullyQualifiedExtendsResolvesVerbatim(): void
+    {
+        $result = $this->parse('<?php
+namespace My\App;
+class Foo extends \Vendor\Base {}
+');
+        $extends = $result->classDefs[0]->extends[0];
+        self::assertSame('Base', $extends->short);
+        self::assertSame('Vendor\Base', $extends->fqcn);
+    }
+
+    public function testUnnamespacedClassFqcnEqualsShortName(): void
+    {
+        // The common case (most real WP themes/plugins don't use namespaces at all) -- zero
+        // behavior change from before namespace-awareness existed.
+        $result = $this->parse('<?php
+class Foo extends Bar {}
+');
+        self::assertSame('Foo', $result->classDefs[0]->fqcn);
+        $extends = $result->classDefs[0]->extends[0];
+        self::assertSame('Bar', $extends->fqcn);
+    }
+
+    public function testQualifiedExtendsNameWithUseImportOnFirstSegment(): void
+    {
+        // `use Vendor\Sub;` imports "Sub" as an alias for "Vendor\Sub" -- a later qualified
+        // reference "Sub\Deep" substitutes that import for its own first segment only.
+        $result = $this->parse('<?php
+use Vendor\Sub;
+class Foo extends Sub\Deep {}
+');
+        $extends = $result->classDefs[0]->extends[0];
+        self::assertSame('Vendor\Sub\Deep', $extends->fqcn);
+    }
+
+    public function testInlineNewChainedCallIsRecordedAsScopedMethodCall(): void
+    {
+        // ( new Export() )->register_route(...) -- the real-world Elementor shape this feature
+        // was built from.
+        $result = $this->parse('<?php
+namespace My\App;
+class Export {
+    public function register_route() {}
+}
+( new Export() )->register_route();
+');
+        $calls = array_map(fn($c) => $c->receiverClass . '::' . $c->method, $result->scopedMethodCalls);
+        self::assertContains('My\App\Export::register_route', $calls);
+    }
+
+    public function testInlineNewChainedCallWithConstructorArgs(): void
+    {
+        $result = $this->parse('<?php
+namespace My\App;
+class Export {
+    public function __construct($a, $b) {}
+    public function register_route() {}
+}
+( new Export("a", "b") )->register_route();
+');
+        $calls = array_map(fn($c) => $c->receiverClass . '::' . $c->method, $result->scopedMethodCalls);
+        self::assertContains('My\App\Export::register_route', $calls);
+    }
+
+    public function testInlineNewSelfChainedCallResolvesToOwnerClass(): void
+    {
+        $result = $this->parse('<?php
+namespace My\App;
+class Factory {
+    public function make() {
+        return ( new self() )->build();
+    }
+    public function build() {}
+}
+');
+        $calls = array_map(fn($c) => $c->receiverClass . '::' . $c->method, $result->scopedMethodCalls);
+        self::assertContains('My\App\Factory::build', $calls);
+    }
+
+    public function testBareNewAssignedToVariableIsUnaffectedByInlineChainFeature(): void
+    {
+        // $x = new Export(); $x->register_route(); -- the pre-existing two-statement pattern,
+        // confirming the new inline-chain code path doesn't double-emit or otherwise interfere.
+        $result = $this->parse('<?php
+namespace My\App;
+class Export {
+    public function register_route() {}
+}
+$x = new Export();
+$x->register_route();
+');
+        $calls = array_map(fn($c) => $c->receiverClass . '::' . $c->method, $result->scopedMethodCalls);
+        self::assertCount(1, array_filter($calls, fn($c) => $c === 'My\App\Export::register_route'));
+    }
+
+    // ── function_exists() guard detection ───────────────────────────────────
+
+    public function testFunctionDeclaredInsideItsOwnFunctionExistsGuardIsMarkedGuarded(): void
+    {
+        $result = $this->parse('<?php
+if ( ! function_exists( "my_helper" ) ) {
+    function my_helper() {}
+}
+');
+        $defs = array_column($result->functionDefs, null, 'name');
+        self::assertTrue($defs['my_helper']->guarded);
+    }
+
+    public function testUnguardedFunctionIsNotMarkedGuarded(): void
+    {
+        $result = $this->parse('<?php
+function my_helper() {}
+');
+        $defs = array_column($result->functionDefs, null, 'name');
+        self::assertFalse($defs['my_helper']->guarded);
+    }
+
+    public function testFunctionExistsGuardOnlyMarksTheMatchingNamedFunction(): void
+    {
+        // Two functions declared inside the same guard block -- only the one whose name
+        // actually matches the guarded string is marked.
+        $result = $this->parse('<?php
+if ( ! function_exists( "my_helper" ) ) {
+    function my_helper() {}
+    function unrelated_helper() {}
+}
+');
+        $defs = array_column($result->functionDefs, null, 'name');
+        self::assertTrue($defs['my_helper']->guarded);
+        self::assertFalse($defs['unrelated_helper']->guarded);
+    }
+
+    public function testFunctionExistsGuardWithoutNegationIsNotRecognized(): void
+    {
+        // `if ( function_exists('x') ) { function x() {} }` (no leading !) is a different,
+        // logically backwards shape real code doesn't actually use this way -- deliberately not
+        // matched, "don't guess" stance.
+        $result = $this->parse('<?php
+if ( function_exists( "my_helper" ) ) {
+    function my_helper() {}
+}
+');
+        $defs = array_column($result->functionDefs, null, 'name');
+        self::assertFalse($defs['my_helper']->guarded);
+    }
+
+    public function testFunctionExistsGuardCombinedWithOtherConditionIsNotRecognized(): void
+    {
+        $result = $this->parse('<?php
+if ( ! function_exists( "my_helper" ) && true ) {
+    function my_helper() {}
+}
+');
+        $defs = array_column($result->functionDefs, null, 'name');
+        self::assertFalse($defs['my_helper']->guarded);
     }
 
     private function parse(string $code): \WpSpecter\Parser\ParseResult

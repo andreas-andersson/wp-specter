@@ -191,41 +191,28 @@ final class ClassAnalyzer
     {
         $parseResults = array_map(fn(string $f) => $this->parser->parse($f), $files);
 
+        // Keyed by FQCN, not short name — two unrelated classes sharing a short name across
+        // different namespaces (real-world case: Elementor's two distinct `Base_Route` classes)
+        // now occupy two distinct keys instead of one silently overwriting the other's ClassDef.
         $classDefsByName = [];
         foreach ($parseResults as $result) {
             foreach ($result->classDefs as $def) {
-                $classDefsByName[$def->name] = $def;
+                $classDefsByName[$def->fqcn] = $def;
             }
         }
 
         $reflector = new VendorClassReflector($vendorAutoloadPaths);
 
-        // Short name/alias => FQCN from every file's `use` imports, merged globally — same
-        // "flat, whole-project namespace" trade-off $classDefsByName already makes. Lets
-        // isContractMethod resolve an extends/implements short name (PhpTokenParser only ever
-        // records short names) back to a real, autoloadable vendor class name.
-        $useImports = [];
-        foreach ($parseResults as $result) {
-            foreach ($result->useImports as $alias => $fqcn) {
-                $useImports[$alias] = $fqcn;
-            }
-        }
-
-        $unusedClassFindings = $this->findUnusedClasses($parseResults, $classDefsByName, $useImports);
-
-        // A method whose owner class is itself already reported as unused is redundant noise —
-        // the class finding already says "nothing here is reachable," so every method under it
-        // says nothing new. Filtered by name, not by cross-referencing Finding objects, since
-        // findUnusedMethods needs a fast set lookup per method, not per-finding matching.
-        $unusedClassNames = [];
-        if ($suppressUnusedClassMethods) {
-            foreach ($unusedClassFindings as $finding) {
-                $unusedClassNames[$finding->name] = true;
-            }
-        }
+        // Filled in by findUnusedClasses() below with every FQCN it reports unused — a method
+        // whose owner class is itself already reported as unused is redundant noise, the class
+        // finding already says "nothing here is reachable," so every method under it says
+        // nothing new.
+        $unusedFqcns = [];
+        $unusedClassFindings = $this->findUnusedClasses($parseResults, $classDefsByName, $unusedFqcns);
+        $unusedClassNames = $suppressUnusedClassMethods ? $unusedFqcns : [];
 
         $findings = $unusedClassFindings;
-        array_push($findings, ...$this->findUnusedMethods($parseResults, $classDefsByName, $reflector, $useImports, $unusedClassNames));
+        array_push($findings, ...$this->findUnusedMethods($parseResults, $classDefsByName, $reflector, $unusedClassNames));
 
         usort($findings, fn(Finding $a, Finding $b) => $a->file <=> $b->file ?: $a->line <=> $b->line);
 
@@ -234,11 +221,12 @@ final class ClassAnalyzer
 
     /**
      * @param list<ParseResult> $parseResults
-     * @param array<string,ClassDef> $classDefsByName
-     * @param array<string,string> $useImports
+     * @param array<string,ClassDef> $classDefsByName Keyed by FQCN.
+     * @param array<string,true> $unusedFqcns Output: every FQCN reported unused, added to as
+     *   found — lets analyze() suppress redundant UnusedMethod findings without a second pass.
      * @return list<Finding>
      */
-    private function findUnusedClasses(array $parseResults, array $classDefsByName, array $useImports = []): array
+    private function findUnusedClasses(array $parseResults, array $classDefsByName, array &$unusedFqcns = []): array
     {
         $referenced = [];
         foreach ($parseResults as $result) {
@@ -272,14 +260,15 @@ final class ClassAnalyzer
         }
 
         $findings = [];
-        foreach ($classDefsByName as $name => $def) {
-            if (!isset($referenced[$name]) && !isset($calledNames[$name])) {
-                if ($this->isFullyExemptClass($name, $classDefsByName, $useImports)) {
+        foreach ($classDefsByName as $fqcn => $def) {
+            if (!isset($referenced[$def->name]) && !isset($calledNames[$def->name])) {
+                if ($this->isFullyExemptClass($fqcn, $classDefsByName)) {
                     continue;
                 }
+                $unusedFqcns[$fqcn] = true;
                 $findings[] = new Finding(
                     type: FindingType::UnusedClass,
-                    name: $name,
+                    name: $def->name,
                     file: $def->file,
                     line: $def->line,
                     certainty: FindingCertainty::Error,
@@ -293,13 +282,12 @@ final class ClassAnalyzer
 
     /**
      * @param list<ParseResult> $parseResults
-     * @param array<string,ClassDef> $classDefsByName
-     * @param array<string,string> $useImports
-     * @param array<string,bool> $unusedClassNames Owner class names already reported as
+     * @param array<string,ClassDef> $classDefsByName Keyed by FQCN.
+     * @param array<string,bool> $unusedClassNames Owner class FQCNs already reported as
      *   UnusedClass — their methods are skipped as redundant (see analyze()).
      * @return list<Finding>
      */
-    private function findUnusedMethods(array $parseResults, array $classDefsByName, VendorClassReflector $reflector, array $useImports, array $unusedClassNames = []): array
+    private function findUnusedMethods(array $parseResults, array $classDefsByName, VendorClassReflector $reflector, array $unusedClassNames = []): array
     {
         // Calls PhpTokenParser could resolve to a concrete receiver class — $this->method(),
         // self::/parent::/static::method(), and Foo::method() with a literal class name — are
@@ -451,15 +439,15 @@ final class ClassAnalyzer
         // interface/ancestor a call was resolved to): here, base class -> any concrete descendant
         // a call was actually resolved to.
         $descendantsOf = [];
-        foreach ($classDefsByName as $name => $def) {
-            $className = $name;
+        foreach ($classDefsByName as $fqcn => $def) {
+            $className = $fqcn;
             for ($depth = 0; $depth < self::MAX_INHERITANCE_DEPTH; $depth++) {
-                $base = ($classDefsByName[$className] ?? null)?->extends[0] ?? null;
-                if ($base === null) {
+                $baseRef = ($classDefsByName[$className] ?? null)?->extends[0] ?? null;
+                if ($baseRef === null) {
                     break;
                 }
-                $descendantsOf[$base][] = $name;
-                $className = $base;
+                $descendantsOf[$baseRef->fqcn][] = $fqcn;
+                $className = $baseRef->fqcn;
             }
         }
 
@@ -474,8 +462,8 @@ final class ClassAnalyzer
                     || isset($scopedCalled[$def->ownerClass ?? ''][$def->name])
                     || isset($reflectionDispatchedClassNames[$def->ownerClass ?? ''])
                     || $this->matchesAnyPrefix($def->name, $scopedCalledPrefixes[$def->ownerClass ?? ''] ?? [])
-                    || $this->isFullyExemptClass($def->ownerClass, $classDefsByName, $useImports)
-                    || $this->isContractMethod($def->name, $def->ownerClass, $classDefsByName, $reflector, $useImports)
+                    || $this->isFullyExemptClass($def->ownerClass, $classDefsByName)
+                    || $this->isContractMethod($def->name, $def->ownerClass, $classDefsByName, $reflector)
                     || $this->isUsedByTraitConsumer($def->ownerClass, $def->name, $classDefsByName, $traitUsers, $scopedCalled)
                     || $this->isUsedByPolymorphicCall($def->ownerClass, $def->name, $classDefsByName, $scopedCalled)
                     || $this->isUsedByDescendantReceiver($def->ownerClass, $def->name, $descendantsOf, $scopedCalled)
@@ -512,14 +500,13 @@ final class ClassAnalyzer
      * entry, but only fires when a vendor autoloader was actually found (see
      * VendorClassReflector::isAvailable).
      *
-     * $useImports resolves a short name to a real vendor FQCN before handing it to $reflector —
-     * PhpTokenParser only ever records the short name off an extends/implements clause, but
-     * class_exists()/ReflectionClass need the real name to find a `use`-imported vendor class.
+     * $className always holds a real, already-resolved FQCN at every point in this walk (the
+     * initial $ownerClass, or a chain link's own ClassRef::$fqcn) — handed to $reflector directly
+     * once the walk steps off scanned project code, no separate use-import lookup needed.
      *
-     * @param array<string,ClassDef> $classDefsByName
-     * @param array<string,string> $useImports
+     * @param array<string,ClassDef> $classDefsByName Keyed by FQCN.
      */
-    private function isContractMethod(string $methodName, ?string $ownerClass, array $classDefsByName, VendorClassReflector $reflector, array $useImports): bool
+    private function isContractMethod(string $methodName, ?string $ownerClass, array $classDefsByName, VendorClassReflector $reflector): bool
     {
         if ($ownerClass === null) {
             return false;
@@ -529,31 +516,31 @@ final class ClassAnalyzer
         for ($depth = 0; $depth < self::MAX_INHERITANCE_DEPTH; $depth++) {
             $def = $classDefsByName[$className] ?? null;
             if ($def === null) {
-                return $reflector->classHasMethod($useImports[$className] ?? $className, $methodName);
+                return $reflector->classHasMethod($className, $methodName);
             }
 
-            foreach ($def->implements as $interface) {
+            foreach ($def->implements as $ifaceRef) {
                 if (
-                    in_array($methodName, self::interfaceContractMethods($interface), true)
-                    || $reflector->classHasMethod($useImports[$interface] ?? $interface, $methodName)
+                    in_array($methodName, self::interfaceContractMethods($ifaceRef->short), true)
+                    || $reflector->classHasMethod($ifaceRef->fqcn, $methodName)
                 ) {
                     return true;
                 }
             }
 
-            $base = $def->extends[0] ?? null;
-            if ($base === null) {
+            $baseRef = $def->extends[0] ?? null;
+            if ($baseRef === null) {
                 return false;
             }
 
             if (
-                in_array($methodName, self::baseClassContractMethods($base), true)
-                || in_array($methodName, self::generatedContractMethods($base), true)
+                in_array($methodName, self::baseClassContractMethods($baseRef->short), true)
+                || in_array($methodName, self::generatedContractMethods($baseRef->short), true)
             ) {
                 return true;
             }
 
-            $className = $base;
+            $className = $baseRef->fqcn;
         }
 
         return false;
@@ -567,16 +554,19 @@ final class ClassAnalyzer
      *
      * Exempting an entire class is a much bigger effect than the per-method curated lists above,
      * so a bare short-name match isn't good enough on its own: a project with its own unrelated
-     * "Composer" base class would otherwise get every subclass silently exempted. Whenever the
-     * extending file actually `use`-imported the base name, $useImports must resolve it to the
-     * real FQCN in FULLY_EXEMPT_BASE_CLASSES before this counts as a match — only falling back to
-     * the bare short-name comparison (the original, collision-prone behavior) when no import
-     * resolved it either way, since then there's no FQCN to check against at all.
+     * "Composer" base class would otherwise get every subclass silently exempted. A chain link's
+     * own ClassRef::$fqcn must resolve to the real FULLY_EXEMPT_BASE_CLASSES FQCN before this
+     * counts as a match — `$ref->fqcn === $ref->short` (true only when the extending file has no
+     * namespace, no matching `use` import, and no leading backslash on the reference) is the one
+     * case with no real signal either way, and still falls back to the lenient short-name-only
+     * match the same as before. This is strictly more precise than the pre-namespace-aware
+     * version: a namespaced file's own unrelated `Composer` class (no `use` at all) previously
+     * had no way to be told apart from a real `Roots\Acorn\View\Composer` subclass — merely being
+     * namespaced now makes `$ref->fqcn !== $ref->short`, correctly ruling it out.
      *
-     * @param array<string,ClassDef> $classDefsByName
-     * @param array<string,string> $useImports
+     * @param array<string,ClassDef> $classDefsByName Keyed by FQCN.
      */
-    private function isFullyExemptClass(?string $className, array $classDefsByName, array $useImports = []): bool
+    private function isFullyExemptClass(?string $className, array $classDefsByName): bool
     {
         if ($className === null) {
             return false;
@@ -588,20 +578,17 @@ final class ClassAnalyzer
                 return false;
             }
 
-            $base = $def->extends[0] ?? null;
-            if ($base === null) {
+            $baseRef = $def->extends[0] ?? null;
+            if ($baseRef === null) {
                 return false;
             }
 
-            $expectedFqcn = self::exemptFqcnFor($base);
-            if ($expectedFqcn !== null) {
-                $importedFqcn = $useImports[$base] ?? null;
-                if ($importedFqcn === null || $importedFqcn === $expectedFqcn) {
-                    return true;
-                }
+            $expectedFqcn = self::exemptFqcnFor($baseRef->short);
+            if ($expectedFqcn !== null && ($baseRef->fqcn === $expectedFqcn || $baseRef->fqcn === $baseRef->short)) {
+                return true;
             }
 
-            $className = $base;
+            $className = $baseRef->fqcn;
         }
 
         return false;
@@ -716,7 +703,7 @@ final class ClassAnalyzer
      * makes project-wide; this is strictly narrower (only classes that actually implement/extend
      * the exact type the call was resolved to, not every same-named method anywhere).
      *
-     * @param array<string,ClassDef> $classDefsByName
+     * @param array<string,ClassDef> $classDefsByName Keyed by FQCN.
      * @param array<string,array<string,bool>> $scopedCalled
      */
     private function isUsedByPolymorphicCall(?string $ownerClass, string $methodName, array $classDefsByName, array $scopedCalled): bool
@@ -732,22 +719,22 @@ final class ClassAnalyzer
                 return false;
             }
 
-            foreach ($def->implements as $interface) {
-                if (isset($scopedCalled[$interface][$methodName])) {
+            foreach ($def->implements as $ifaceRef) {
+                if (isset($scopedCalled[$ifaceRef->fqcn][$methodName])) {
                     return true;
                 }
             }
 
-            $base = $def->extends[0] ?? null;
-            if ($base === null) {
+            $baseRef = $def->extends[0] ?? null;
+            if ($baseRef === null) {
                 return false;
             }
 
-            if (isset($scopedCalled[$base][$methodName])) {
+            if (isset($scopedCalled[$baseRef->fqcn][$methodName])) {
                 return true;
             }
 
-            $className = $base;
+            $className = $baseRef->fqcn;
         }
 
         return false;

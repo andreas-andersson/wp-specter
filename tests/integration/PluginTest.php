@@ -42,6 +42,12 @@ final class PluginTest extends TestCase
 
     public function testTemplatesSkippedForPlugin(): void
     {
+        // Deliberate, not a stale gap: TemplateAnalyzer's own hierarchy-exemption bug was fixed,
+        // but actually running the check for Plugin mode was tried and reverted — real plugins
+        // (confirmed: WooCommerce) commonly load their own templates/ directory through a custom
+        // wrapper function (wc_get_template()/wc_get_template_part(), not the WP-core template
+        // functions this parser tracks), so enabling the check produced more false positives than
+        // genuine catches. See TODO.md's "Template detection" section.
         ob_start();
         $this->app->run(['wp-specter', 'scan', $this->fixture, '--no-color', '--target=plugin']);
         $output = ob_get_clean();
