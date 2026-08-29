@@ -91,6 +91,53 @@ if ( ! class_exists( "My_Deprecated_Control" ) ) {
         self::assertContains('My_Deprecated_Control', $unusedClasses);
     }
 
+    public function testDoesNotReportClassPassedAsBareStringToRegisterWidget(): void
+    {
+        // register_widget('My_Widget') — the class name string, same as any other bare string
+        // literal, flows into the generic $functionCalls pool (see PhpTokenParser's blanket
+        // T_CONSTANT_ENCAPSED_STRING handling) and is trusted as a class reference by the same
+        // fallback that covers register_panel_type()/the filter-return shape above — this isn't
+        // register_widget-specific, it works for any function taking a bare class-name string.
+        $file = $this->write('<?php
+class My_Widget extends WP_Widget {
+    public function widget($args, $instance) {}
+}
+function register_my_widgets() {
+    register_widget("My_Widget");
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        self::assertEmpty(array_filter($findings, fn($f) => $f->type === FindingType::UnusedClass));
+    }
+
+    public function testDoesNotReportClassPassedAsBareStringToIsAOrIsSubclassOf(): void
+    {
+        $file = $this->write('<?php
+class My_Base {}
+function check($x) {
+    return is_a($x, "My_Base") || is_subclass_of($x, "My_Base");
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        self::assertEmpty(array_filter($findings, fn($f) => $f->type === FindingType::UnusedClass));
+    }
+
+    public function testDoesNotReportClassNamePassedAsAPlainConfigArrayValue(): void
+    {
+        // A class name string used as an ordinary associative-array value (not the special
+        // [Foo::class, 'method'] callback shape) — e.g. a customizer/control config array —
+        // still flows through the same generic string-literal handling.
+        $file = $this->write('<?php
+class My_Custom_Control {}
+$config = array(
+    "type"  => "control",
+    "class" => "My_Custom_Control",
+);
+');
+        $findings = $this->analyzer->analyze([$file]);
+        self::assertEmpty(array_filter($findings, fn($f) => $f->type === FindingType::UnusedClass));
+    }
+
     public function testDoesNotReportClassInstantiatedWithNew(): void
     {
         $file = $this->write('<?php
@@ -314,11 +361,38 @@ class My_Class {
     public function unused_method() {}
 }
 ');
-        $findings = $this->analyzer->analyze([$file]);
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
         $methods = array_values(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod));
         self::assertCount(1, $methods);
         self::assertSame('unused_method', $methods[0]->name);
         self::assertSame(FindingCertainty::Warning, $methods[0]->certainty);
+    }
+
+    public function testUnusedMethodOnAnAlreadyUnusedClassIsSuppressedByDefault(): void
+    {
+        // The class finding already says nothing on it is reachable — reporting its methods too
+        // is redundant. $suppressUnusedClassMethods defaults to true (see --no-suppress-unused-
+        // class-methods).
+        $file = $this->write('<?php
+class My_Dead_Class {
+    public function truly_unused() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        self::assertCount(1, $findings);
+        self::assertSame(FindingType::UnusedClass, $findings[0]->type);
+    }
+
+    public function testUnusedMethodOnAnAlreadyUnusedClassIsReportedWhenSuppressionIsDisabled(): void
+    {
+        $file = $this->write('<?php
+class My_Dead_Class {
+    public function truly_unused() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertContains('truly_unused', $unusedMethods);
     }
 
     public function testDoesNotReportMethodCalledViaObjectOperator(): void
@@ -375,7 +449,7 @@ class My_Theme_Update {
     }
 }
 ');
-        $findings = $this->analyzer->analyze([$file]);
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
         $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
         self::assertNotContains('admin_updates', $unusedMethods);
         self::assertContains('truly_unused', $unusedMethods);
@@ -426,7 +500,7 @@ function boot() {
     $s->render();
 }
 ');
-        $findings = $this->analyzer->analyze([$file]);
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
         $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
         self::assertContains('render', $unusedMethods);
         self::assertCount(1, $unusedMethods, 'Only Dead_Service::render should be flagged, not Used_Service::render');
@@ -501,7 +575,7 @@ class Dead_Hooks {
 }
 add_action("init", [Used_Hooks::class, "on_init"]);
 ');
-        $findings = $this->analyzer->analyze([$file]);
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
         $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
         self::assertContains('on_init', $unusedMethods);
         self::assertCount(1, $unusedMethods, 'Only Dead_Hooks::on_init should be flagged, not Used_Hooks::on_init');
@@ -534,7 +608,7 @@ class My_Widget extends WP_Widget {
     public function truly_unused() {}
 }
 ');
-        $findings = $this->analyzer->analyze([$file]);
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
         $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
         self::assertNotContains('widget', $unusedMethods);
         self::assertNotContains('form', $unusedMethods);
@@ -558,7 +632,7 @@ class My_Nav_Walker extends Walker_Nav_Menu {
     public function truly_unused() {}
 }
 ');
-        $findings = $this->analyzer->analyze([$file]);
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
         $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
         self::assertNotContains('start_lvl', $unusedMethods);
         self::assertNotContains('end_lvl', $unusedMethods);
@@ -588,7 +662,7 @@ class My_Color_Control extends WP_Customize_Color_Control {
     public function truly_unused_color() {}
 }
 ');
-        $findings = $this->analyzer->analyze([$file]);
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
         $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
         self::assertNotContains('render_content', $unusedMethods);
         self::assertNotContains('enqueue', $unusedMethods);
@@ -615,7 +689,7 @@ class My_Upsell_Panel extends WP_Customize_Panel {
     public function truly_unused_panel(): void {}
 }
 ');
-        $findings = $this->analyzer->analyze([$file]);
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
         $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
         self::assertNotContains('render_template', $unusedMethods);
         self::assertNotContains('render', $unusedMethods);
@@ -641,7 +715,7 @@ class My_Upgrader_Skin extends Plugin_Installer_Skin {
     public function truly_unused_skin(): void {}
 }
 ');
-        $findings = $this->analyzer->analyze([$file]);
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
         $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
         self::assertNotContains('feedback', $unusedMethods);
         self::assertNotContains('decrement_update_count', $unusedMethods);
@@ -665,7 +739,7 @@ class My_Nav_Walker extends Walker_Nav_menu {
     public function truly_unused() {}
 }
 ');
-        $findings = $this->analyzer->analyze([$file]);
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
         $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
         self::assertNotContains('start_lvl', $unusedMethods);
         self::assertNotContains('start_el', $unusedMethods);
@@ -685,7 +759,7 @@ class My_Nav_Walker extends Walker_Nav_Menu {
     public function truly_unused() {}
 }
 ');
-        $findings = $this->analyzer->analyze([$file]);
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
         $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
         self::assertNotContains('display_element', $unusedMethods);
         self::assertContains('truly_unused', $unusedMethods);
@@ -711,7 +785,7 @@ class My_Category_Checklist_Walker extends Walker_Category_Checklist {
     public function truly_unused_category_checklist() {}
 }
 ');
-        $findings = $this->analyzer->analyze([$file]);
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
         $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
         self::assertNotContains('start_el', $unusedMethods);
         self::assertContains('truly_unused_edit', $unusedMethods);
@@ -738,7 +812,7 @@ enum Status: string implements JsonSerializable {
     public function truly_unused(): void {}
 }
 ");
-        $findings = $this->analyzer->analyze([$file]);
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
         $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
         self::assertNotContains('jsonSerialize', $unusedMethods);
         self::assertContains('truly_unused', $unusedMethods);
@@ -788,7 +862,7 @@ function checkout(Shippable $method) {
     echo $method->calculate_shipping();
 }
 ');
-        $findings = $this->analyzer->analyze([$file]);
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
         $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
         self::assertNotContains('calculate_shipping', $unusedMethods);
         self::assertContains('truly_unused', $unusedMethods);
@@ -833,10 +907,62 @@ class FlatRate extends Base_Shipping {
 }
 function checkout(Shippable $s) { echo $s->calc(); }
 ');
-        $findings = $this->analyzer->analyze([$file]);
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
         $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
         self::assertNotContains('calc', $unusedMethods);
         self::assertContains('truly_unused', $unusedMethods);
+    }
+
+    public function testCreditsSharedBaseClassMethodCalledThroughConcreteSubclassReceiver(): void
+    {
+        // Real-world finding (Astra theme): a shared, concrete (non-abstract) method declared
+        // once on an abstract base class, called from every concrete subclass via its own
+        // receiver — `Subclass::register()`, `$this->build_output_schema()` from inside the
+        // subclass — never `Base_Ability::` directly. Every one of those calls resolves its
+        // receiver to the subclass, so scopedCalled[ownerClass] (ownerClass being the base
+        // class) never matches on its own; isUsedByDescendantReceiver() must widen the check to
+        // any known descendant.
+        $file = $this->write('<?php
+abstract class Base_Ability {
+    public static function register() {}
+    public function build_output_schema() {}
+    public function truly_unused() {}
+}
+class Concrete_Ability extends Base_Ability {
+    public function run() {
+        $this->build_output_schema();
+    }
+}
+Concrete_Ability::register();
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('register', $unusedMethods);
+        self::assertNotContains('build_output_schema', $unusedMethods);
+        self::assertContains('truly_unused', $unusedMethods);
+    }
+
+    public function testDescendantReceiverCreditDoesNotLeakToUnrelatedBaseClass(): void
+    {
+        // Not_Related's chain never reaches Base_Ability at any depth — register() on
+        // Not_Related must still be reported, even though a same-named method IS used elsewhere
+        // through a genuinely related descendant.
+        $file = $this->write('<?php
+abstract class Base_Ability {
+    public static function register() {}
+}
+class Concrete_Ability extends Base_Ability {}
+Concrete_Ability::register();
+
+class Not_Related {
+    public static function register() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_values(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod));
+        self::assertCount(1, $unusedMethods);
+        self::assertSame('register', $unusedMethods[0]->name);
+        self::assertSame(9, $unusedMethods[0]->line, 'Should flag Not_Related::register(), not Base_Ability::register()');
     }
 
     public function testExcludesInterfaceContractMethods(): void
@@ -865,7 +991,7 @@ class Not_A_Widget {
     public function widget() {}
 }
 ');
-        $findings = $this->analyzer->analyze([$file]);
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
         $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
         self::assertContains('widget', $unusedMethods);
     }
@@ -885,7 +1011,7 @@ class My_Widget extends My_Base_Widget {
     public function truly_unused() {}
 }
 ');
-        $findings = $this->analyzer->analyze([$file]);
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
         $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
         self::assertNotContains('widget', $unusedMethods);
         self::assertNotContains('form', $unusedMethods);
@@ -920,9 +1046,177 @@ class Not_A_Widget extends Not_A_Widget_Base {
     public function widget() {}
 }
 ');
-        $findings = $this->analyzer->analyze([$file]);
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
         $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
         self::assertContains('widget', $unusedMethods);
+    }
+
+    // ── return-type inference ───────────────────────────────────────────────────────────────
+
+    public function testCreditsMethodCalledThroughAVariableTypedByAFactoryMethodsReturnType(): void
+    {
+        // $x = My_Factory::make(); $x->render(); — make()'s own declared `: My_Service` return
+        // type resolves $x's type the same way `new My_Service()` already would, even though
+        // make()'s declaration and this call site could be in entirely different files.
+        $file = $this->write('<?php
+class My_Service {
+    public function render() {}
+    public function truly_unused() {}
+}
+class My_Factory {
+    public static function make(): My_Service {
+        return new My_Service();
+    }
+}
+class My_Controller {
+    public function boot() {
+        $x = My_Factory::make();
+        $x->render();
+    }
+}
+(new My_Controller())->boot();
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('render', $unusedMethods);
+        self::assertContains('truly_unused', $unusedMethods);
+    }
+
+    public function testCreditsMethodCalledThroughATopLevelFunctionsReturnType(): void
+    {
+        $file = $this->write('<?php
+class My_Service {
+    public function render() {}
+}
+function create_service(): My_Service {
+    return new My_Service();
+}
+class My_Controller {
+    public function boot() {
+        $x = create_service();
+        $x->render();
+    }
+}
+(new My_Controller())->boot();
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('render', $unusedMethods);
+    }
+
+    public function testCreditsMethodCalledThroughAThisMethodsReturnType(): void
+    {
+        $file = $this->write('<?php
+class My_Service {
+    public function render() {}
+}
+class My_Controller {
+    private function makeService(): My_Service {
+        return new My_Service();
+    }
+    public function boot() {
+        $x = $this->makeService();
+        $x->render();
+    }
+}
+(new My_Controller())->boot();
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('render', $unusedMethods);
+    }
+
+    public function testReturnTypeCreditDoesNotLeakToAnUnrelatedClassWithTheSameMethodName(): void
+    {
+        // Dead_Service's own "render" must still be reported — the return-type credit is scoped
+        // to My_Service (what make() actually declares), not a bare-name match against every
+        // class with a same-named method.
+        $file = $this->write('<?php
+class My_Service {
+    public function render() {}
+}
+class Dead_Service {
+    public function render() {}
+}
+class My_Factory {
+    public static function make(): My_Service {
+        return new My_Service();
+    }
+}
+class My_Controller {
+    public function boot() {
+        $x = My_Factory::make();
+        $x->render();
+    }
+}
+(new My_Controller())->boot();
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertContains('render', $unusedMethods);
+        self::assertCount(1, $unusedMethods, 'Only Dead_Service::render should be flagged, not My_Service::render');
+    }
+
+    public function testUnresolvableSourceCallFallsBackToTheUnscopedPoolInsteadOfLosingTheCall(): void
+    {
+        // $c = totally_unknown_function(); $c->maybe_used(); — the source call's return type
+        // never resolves (the function doesn't exist at all here), so this must degrade to the
+        // same unscoped-pool credit the call always got before PendingReturnTypedCall existed,
+        // not silently disappear — a same-named real method elsewhere must still be credited.
+        $file = $this->write('<?php
+class Some_Class {
+    public function maybe_used() {}
+}
+class My_Controller {
+    public function boot() {
+        $c = totally_unknown_function();
+        $c->maybe_used();
+    }
+}
+(new My_Controller())->boot();
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('maybe_used', $unusedMethods);
+    }
+
+    // ── generated contract-method fallback (WpCoreContractMethods) ─────────────────────────
+
+    public function testExcludesContractMethodFromGeneratedWpCoreStubNotInTheHandCuratedList(): void
+    {
+        // Custom_Image_Header (wp-includes/class-wp-customize-manager.php's Custom_Image_Header,
+        // the classic pre-Customizer-era custom-header API) isn't in ClassAnalyzer's hand-curated
+        // BASE_CLASS_CONTRACT_METHODS at all — its init() override point is only known through
+        // WpCoreContractMethods (tools/generate-wp-contract-methods-stub.php), which found it by
+        // scanning real WP core for a public method declared on the class and also called via
+        // $this->method() from elsewhere in that same class's body. Content-dependent on the
+        // generated stub's current real-world data, same as HookAnalyzerTest's own reliance on
+        // 'init'/'wp_head' actually being in WpCoreHooks — Custom_Image_Header::init() being an
+        // overridable hook is stable, long-standing WP core API, not expected to disappear.
+        $file = $this->write('<?php
+class My_Custom_Header extends Custom_Image_Header {
+    public function init() {}
+    public function truly_unused() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('init', $unusedMethods);
+        self::assertContains('truly_unused', $unusedMethods);
+    }
+
+    public function testGeneratedContractMethodFallbackDoesNotLeakToAnUnrelatedClass(): void
+    {
+        // A method literally named "init" on a class with no relation to Custom_Image_Header
+        // must still be reported — same leak-guard shape as the hand-curated lists' own tests.
+        $file = $this->write('<?php
+class Not_A_Custom_Header {
+    public function init() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertContains('init', $unusedMethods);
     }
 
     // ── whole-class exemption (Acorn/Sage-style reflection-dispatch base classes) ──────────
@@ -960,7 +1254,7 @@ class Not_A_Composer {
     public function siteName() {}
 }
 ');
-        $findings = $this->analyzer->analyze([$file]);
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
         $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
         self::assertContains('siteName', $unusedMethods);
     }
@@ -995,7 +1289,7 @@ class Not_Acorn extends Composer {
     public function siteName() {}
 }
 ');
-        $findings = $this->analyzer->analyze([$file]);
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
         $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
         self::assertContains('siteName', $unusedMethods);
         self::assertContains(
@@ -1024,7 +1318,7 @@ class My_Provider extends ServiceProvider {
     public function truly_unused() {}
 }
 ');
-        $findings = $this->analyzer->analyze([$file], [$vendorAutoload]);
+        $findings = $this->analyzer->analyze([$file], [$vendorAutoload], false);
         $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
         self::assertNotContains('register', $unusedMethods);
         self::assertContains('truly_unused', $unusedMethods);
@@ -1043,7 +1337,7 @@ class My_Provider2 extends ServiceProvider {
     public function register() {}
 }
 ');
-        $findings = $this->analyzer->analyze([$file]);
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
         $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
         self::assertContains('register', $unusedMethods);
     }
@@ -1101,6 +1395,200 @@ class My_Class {
 ');
         $findings = $this->analyzer->analyze([$file]);
         self::assertEmpty(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod));
+    }
+
+    // ── dynamic concatenated callback prefixes ──────────────────────────────────────────────
+
+    public function testCreditsMethodMatchedByADynamicConcatenatedCallbackPrefix(): void
+    {
+        // Real-world finding (Astra theme): `add_action('astra_footer_html_'.$i,
+        // array($this, 'footer_html_'.$i))` inside a `for` loop wiring N numbered component
+        // slots. footer_html_1..4 are only ever reached through the runtime-built suffix, never
+        // a literal exact name — the prefix ('footer_html_') resolved against $this must still
+        // credit them.
+        $file = $this->write('<?php
+class Astra_Builder_Footer {
+    public function wire() {
+        for ($i = 1; $i <= 2; $i++) {
+            add_action("astra_footer_html_" . $i, array($this, "footer_html_" . $i));
+        }
+    }
+    public function footer_html_1() {}
+    public function footer_html_2() {}
+    public function truly_unused() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('footer_html_1', $unusedMethods);
+        self::assertNotContains('footer_html_2', $unusedMethods);
+        self::assertContains('truly_unused', $unusedMethods);
+    }
+
+    public function testDynamicCallbackPrefixCreditDoesNotLeakToAnUnrelatedClass(): void
+    {
+        // Other_Class's own similarly-prefixed method must still be reported — the prefix credit
+        // is scoped to the receiver class it was actually resolved against ($this inside
+        // My_Builder), not a bare-name match against every class.
+        $file = $this->write('<?php
+class My_Builder {
+    public function wire() {
+        for ($i = 1; $i <= 1; $i++) {
+            add_action("hook_" . $i, array($this, "slot_" . $i));
+        }
+    }
+    public function slot_1() {}
+}
+(new My_Builder())->wire();
+
+class Other_Class {
+    public function slot_1() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_values(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod));
+        self::assertCount(1, $unusedMethods);
+        self::assertSame('slot_1', $unusedMethods[0]->name);
+        self::assertSame(13, $unusedMethods[0]->line, 'Should flag Other_Class::slot_1(), not My_Builder::slot_1()');
+    }
+
+    // ── reflection-dispatched class names (WP_CLI::add_command) ────────────────────────────
+
+    public function testCreditsEveryPublicMethodOfAClassRegisteredWithWpCliAddCommand(): void
+    {
+        // Real-world finding (Astra theme): WP_CLI::add_command('astra abilities',
+        // 'Astra_Abilities_CLI') hands WP-CLI a class name it dispatches across by reflection —
+        // whichever public method matches the typed subcommand runs. No fixed method name
+        // exists to check per class the way BASE_CLASS_CONTRACT_METHODS does, so every method on
+        // the registered class must be exempt.
+        $file = $this->write('<?php
+class Astra_Abilities_CLI {
+    public function enable($args, $assoc_args) {}
+    public function disable($args, $assoc_args) {}
+}
+WP_CLI::add_command( "astra abilities", "Astra_Abilities_CLI" );
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        self::assertEmpty(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod));
+    }
+
+    public function testWpCliAddCommandExemptionDoesNotLeakToUnrelatedClasses(): void
+    {
+        $file = $this->write('<?php
+class Astra_Abilities_CLI {
+    public function enable($args, $assoc_args) {}
+}
+WP_CLI::add_command( "astra abilities", "Astra_Abilities_CLI" );
+
+class Not_A_Cli_Command {
+    public function enable() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertContains('enable', $unusedMethods);
+    }
+
+    // ── property-type tracking ──────────────────────────────────────────────────────────────
+
+    public function testCreditsMethodCalledThroughAPropertySetInAnotherMethod(): void
+    {
+        // $this->service = new My_Service() in the constructor, $this->service->render() called
+        // from a different method entirely — the biggest remaining precision gap before this
+        // fix: property types weren't tracked at all, so this fell back to the unscoped pool.
+        $file = $this->write('<?php
+class My_Service {
+    public function render() {}
+    public function truly_unused() {}
+}
+class My_Controller {
+    private $service;
+    public function __construct() {
+        $this->service = new My_Service();
+    }
+    public function boot() {
+        $this->service->render();
+    }
+}
+(new My_Controller())->boot();
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('render', $unusedMethods);
+        self::assertContains('truly_unused', $unusedMethods);
+    }
+
+    public function testCreditsMethodCalledThroughAConstructorPromotedProperty(): void
+    {
+        // public function __construct(private My_Service $svc) {} auto-assigns $this->svc — same
+        // effect as an explicit assignment, credited the same way.
+        $file = $this->write('<?php
+class My_Service {
+    public function render() {}
+}
+class My_Controller {
+    public function __construct(private My_Service $svc) {}
+    public function boot() {
+        $this->svc->render();
+    }
+}
+(new My_Controller(new My_Service()))->boot();
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('render', $unusedMethods);
+    }
+
+    public function testPropertyTypeCreditDoesNotLeakToAnUnrelatedClassWithTheSameMethodName(): void
+    {
+        // Dead_Service's own "render" must still be reported — the property-type credit is
+        // scoped to My_Service (what $this->service was actually assigned), not a bare-name
+        // match against every class with a same-named method.
+        $file = $this->write('<?php
+class My_Service {
+    public function render() {}
+}
+class Dead_Service {
+    public function render() {}
+}
+class My_Controller {
+    public function __construct() {
+        $this->service = new My_Service();
+    }
+    public function boot() {
+        $this->service->render();
+    }
+}
+(new My_Controller())->boot();
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertContains('render', $unusedMethods);
+        self::assertCount(1, $unusedMethods, 'Only Dead_Service::render should be flagged, not My_Service::render');
+    }
+
+    public function testReassigningAPropertyToAnUnresolvableValueInvalidatesItsTrackedType(): void
+    {
+        // $this->service is reassigned to a plain function-call result partway through — its
+        // previously tracked type must not survive to credit an unrelated later call.
+        $file = $this->write('<?php
+class My_Service {
+    public function render() {}
+}
+class My_Controller {
+    public function __construct() {
+        $this->service = new My_Service();
+        $this->service = some_factory();
+    }
+    public function boot() {
+        $this->service->render();
+    }
+}
+(new My_Controller())->boot();
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertContains('render', $unusedMethods);
     }
 
     public function testDoesNotReportStandaloneFunctionsAsUnusedMethods(): void

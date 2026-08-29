@@ -16,6 +16,48 @@ final class ParseResult
      * @param list<ClassDef>        $classDefs
      * @param list<string>          $classReferences
      * @param list<ScopedMethodCall> $scopedMethodCalls
+     * @param list<ScopedMethodCallPrefix> $scopedMethodCallPrefixes Same shape as
+     *                                           $scopedMethodCalls, but for an array-callback
+     *                                           built via string concatenation with a resolvable
+     *                                           receiver — `array($this, 'footer_html_' .
+     *                                           $index)` inside a loop. Any method on the
+     *                                           receiver class starting with the prefix counts as
+     *                                           used (see PhpTokenParser's T_CONSTANT_ENCAPSED_
+     *                                           STRING handling). Deliberately requires a
+     *                                           resolved receiver — without that narrowing, a
+     *                                           prefix match on an unscoped name is far too broad
+     *                                           (ordinary string-building unrelated to any
+     *                                           callback matches the same identifier-prefix
+     *                                           shape constantly, and a short incidental prefix
+     *                                           would hide genuinely dead code project-wide).
+     * @param list<string>          $reflectionDispatchedClassNames Class names passed as a bare
+     *                                           string to an API that dispatches across *every*
+     *                                           public method of that class by reflection —
+     *                                           currently just `WP_CLI::add_command($hook,
+     *                                           'My_Class')`, which calls whatever public method
+     *                                           matches the CLI subcommand typed, not a fixed
+     *                                           method name a curated list could name up front.
+     * @param array<string,array<string,string>> $propertyAssignedClasses Class name => property
+     *                                           name => the class assigned to it, from every
+     *                                           `$this->prop = new ClassName()` sighting anywhere
+     *                                           in that class's body (last write wins, same as
+     *                                           local-variable tracking), plus every constructor-
+     *                                           promoted property's own type hint (`public
+     *                                           function __construct(private My_Service $svc)`
+     *                                           auto-assigns `$this->svc`, same as an explicit
+     *                                           assignment would). Consulted by ClassAnalyzer to
+     *                                           resolve $propertyMethodCalls once every file's
+     *                                           parse is merged — see PhpTokenParser's T_VARIABLE
+     *                                           handling ($this-> branch) and collectParamTypeHint.
+     * @param list<PropertyMethodCall> $propertyMethodCalls Every `$this->prop->method()` seen,
+     *                                           unresolved — see PropertyMethodCall's own
+     *                                           docblock for why resolution is deferred to
+     *                                           ClassAnalyzer instead of attempted inline.
+     * @param list<PendingReturnTypedCall> $pendingReturnTypedCalls `$x = SomeFactory::make();
+     *                                           $x->method();` — unresolved, since make()'s own
+     *                                           declared return type might be defined in a
+     *                                           different file's parse (or later in this one) —
+     *                                           see PendingReturnTypedCall's own docblock.
      * @param list<TraitUsage>      $traitUsages Each `use TraitName;` seen directly inside a
      *                                            class/trait body, paired with the enclosing
      *                                            class/trait's own name (see PhpTokenParser's
@@ -61,6 +103,11 @@ final class ParseResult
         public readonly array $classDefs = [],
         public readonly array $classReferences = [],
         public readonly array $scopedMethodCalls = [],
+        public readonly array $scopedMethodCallPrefixes = [],
+        public readonly array $reflectionDispatchedClassNames = [],
+        public readonly array $propertyAssignedClasses = [],
+        public readonly array $propertyMethodCalls = [],
+        public readonly array $pendingReturnTypedCalls = [],
         public readonly array $traitUsages = [],
         public readonly array $globIncludeDirs = [],
         public readonly array $rootRelativeIncludeDirs = [],

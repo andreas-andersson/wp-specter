@@ -21,6 +21,7 @@ final class Config
         public readonly bool $generateConfig = false,
         public readonly bool $generateBaseline = false,
         public readonly bool $noVendorReflection = false,
+        public readonly bool $noSuppressUnusedClassMethods = false,
     ) {}
 
     public function wantsType(string $type): bool

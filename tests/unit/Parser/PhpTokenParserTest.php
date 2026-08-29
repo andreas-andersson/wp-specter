@@ -72,11 +72,115 @@ add_filter( 'the_content', 'filter_content' );
         self::assertSame('the_content', $result->hookRegistrations[1]->tag);
     }
 
-    public function testMarksVariableHookTagAsDynamic(): void
+    public function testVariableHookTagResolvesToItsLastKnownLiteralValue(): void
     {
+        // $tag = 'init'; add_action($tag, ...); -- the variable's last-known literal value
+        // resolves the tag exactly the same way a literal directly in the call already would.
         $result = $this->parse('<?php
 $tag = "init";
 add_action( $tag, "handler" );
+');
+        self::assertCount(1, $result->hookRegistrations);
+        self::assertSame('init', $result->hookRegistrations[0]->tag);
+        self::assertFalse($result->hookRegistrations[0]->isDynamic);
+    }
+
+    public function testUnresolvableVariableHookTagStillMarksDynamic(): void
+    {
+        // $tag comes from a function call, not a literal assignment -- no known value to
+        // resolve, so this must still fall back to the old "fully dynamic" behavior.
+        $result = $this->parse('<?php
+$tag = get_dynamic_tag();
+add_action( $tag, "handler" );
+');
+        self::assertCount(1, $result->hookRegistrations);
+        self::assertTrue($result->hookRegistrations[0]->isDynamic);
+    }
+
+    public function testSelfClassConstantHookTagResolvesToItsLiteralValue(): void
+    {
+        // const HOOK_NAME = 'my_plugin_loaded'; ... add_action(self::HOOK_NAME, ...) -- the
+        // constant's literal value resolves the tag exactly the same way a literal directly in
+        // the call already would.
+        $result = $this->parse('<?php
+class My_Plugin {
+    const HOOK_NAME = "my_plugin_loaded";
+    public function register() {
+        add_action( self::HOOK_NAME, "handler" );
+    }
+}
+');
+        self::assertCount(1, $result->hookRegistrations);
+        self::assertSame('my_plugin_loaded', $result->hookRegistrations[0]->tag);
+        self::assertFalse($result->hookRegistrations[0]->isDynamic);
+    }
+
+    public function testStaticAndExplicitClassNameConstantHookTagsAlsoResolve(): void
+    {
+        $result = $this->parse('<?php
+class My_Plugin {
+    const HOOK_NAME = "my_plugin_loaded";
+    public function registerStatic() {
+        add_action( static::HOOK_NAME, "handler" );
+    }
+}
+function bootstrap() {
+    add_action( My_Plugin::HOOK_NAME, "handler" );
+}
+');
+        self::assertCount(2, $result->hookRegistrations);
+        foreach ($result->hookRegistrations as $reg) {
+            self::assertSame('my_plugin_loaded', $reg->tag);
+            self::assertFalse($reg->isDynamic);
+        }
+    }
+
+    public function testParentClassConstantHookTagResolvesAgainstTheParentClass(): void
+    {
+        $result = $this->parse('<?php
+class Base_Plugin {
+    const HOOK_NAME = "base_hook";
+}
+class My_Plugin extends Base_Plugin {
+    public function register() {
+        add_action( parent::HOOK_NAME, "handler" );
+    }
+}
+');
+        self::assertCount(1, $result->hookRegistrations);
+        self::assertSame('base_hook', $result->hookRegistrations[0]->tag);
+        self::assertFalse($result->hookRegistrations[0]->isDynamic);
+    }
+
+    public function testConstantValueBuiltFromConcatenationIsNotResolved(): void
+    {
+        // const HOOK_PREFIX = 'my_plugin_' . SOME_SUFFIX; -- not a bare literal, so must not be
+        // guessed at, same "don't guess" stance as everywhere else in this parser.
+        $result = $this->parse('<?php
+class My_Plugin {
+    const HOOK_NAME = "my_plugin_" . "loaded";
+    public function register() {
+        add_action( self::HOOK_NAME, "handler" );
+    }
+}
+');
+        self::assertCount(1, $result->hookRegistrations);
+        self::assertTrue($result->hookRegistrations[0]->isDynamic);
+    }
+
+    public function testUnrelatedClassConstantWithTheSameNameDoesNotLeak(): void
+    {
+        // Other_Class's own HOOK_NAME must not resolve My_Plugin::HOOK_NAME's tag -- the lookup
+        // is scoped by class name, not a bare constant-name match.
+        $result = $this->parse('<?php
+class Other_Class {
+    const HOOK_NAME = "other_hook";
+}
+class My_Plugin {
+    public function register() {
+        add_action( self::HOOK_NAME, "handler" );
+    }
+}
 ');
         self::assertCount(1, $result->hookRegistrations);
         self::assertTrue($result->hookRegistrations[0]->isDynamic);
@@ -129,6 +233,51 @@ do_action($fullyDynamicTag);
         self::assertCount(1, $result->hookInvocations);
         self::assertTrue($result->hookInvocations[0]->isDynamic);
         self::assertSame('', $result->hookInvocations[0]->tagPrefix);
+        self::assertSame('', $result->hookInvocations[0]->tagSuffix);
+    }
+
+    public function testInterpolatedHookInvocationKeepsLiteralSuffix(): void
+    {
+        // WP_Widget's own real shape: do_action("{$this->id_base}_widget_updated") -- dynamic
+        // first, literal last. Rarer than the prefix case (WP convention overwhelmingly puts the
+        // static part first), but real for per-widget-ID hook naming.
+        $result = $this->parse('<?php
+class My_Widget {
+    public $id_base = "my_widget";
+    public function update_callback() {
+        do_action("{$this->id_base}_widget_updated");
+    }
+}
+');
+        self::assertCount(1, $result->hookInvocations);
+        self::assertTrue($result->hookInvocations[0]->isDynamic);
+        self::assertSame('', $result->hookInvocations[0]->tag);
+        self::assertSame('', $result->hookInvocations[0]->tagPrefix);
+        self::assertSame('_widget_updated', $result->hookInvocations[0]->tagSuffix);
+    }
+
+    public function testConcatenatedHookInvocationKeepsLiteralSuffix(): void
+    {
+        $result = $this->parse('<?php
+do_action($dynamic_part . "_widget_updated");
+');
+        self::assertCount(1, $result->hookInvocations);
+        self::assertTrue($result->hookInvocations[0]->isDynamic);
+        self::assertSame('', $result->hookInvocations[0]->tagPrefix);
+        self::assertSame('_widget_updated', $result->hookInvocations[0]->tagSuffix);
+    }
+
+    public function testLiteralPrefixTakesPriorityOverASuffixWhenBothArePresent(): void
+    {
+        // "foo_{$x}_bar" technically has both a literal prefix ("foo_") and a literal suffix
+        // ("_bar") -- the prefix case is checked first and wins, the same "first match wins,
+        // don't over-engineer" stance classifyArgTokens already takes elsewhere.
+        $result = $this->parse('<?php
+do_action("foo_{$x}_bar");
+');
+        self::assertCount(1, $result->hookInvocations);
+        self::assertSame('foo_', $result->hookInvocations[0]->tagPrefix);
+        self::assertSame('', $result->hookInvocations[0]->tagSuffix);
     }
 
     public function testExtractsGetTemplatePart(): void
@@ -520,6 +669,213 @@ Child::static_call();
         self::assertEmpty($result->functionCalls);
     }
 
+    public function testFullyQualifiedAndNamespaceQualifiedStaticCallsResolveAsClassReferences(): void
+    {
+        // \SwiftQueue\License_Bridge::initialize() tokenizes the receiver as a single
+        // T_NAME_FULLY_QUALIFIED token (PHP 8.0+), not T_STRING -- must still register as a
+        // class reference and a scoped method call, the same as a bare `License_Bridge::` would.
+        $result = $this->parse('<?php
+namespace SwiftQueue;
+class License_Bridge { public static function initialize() {} }
+class Wp_Cli_Commands { public static function register() {} }
+function bootstrap() {
+    \SwiftQueue\License_Bridge::initialize();
+    Ns\Wp_Cli_Commands::register();
+}
+');
+        self::assertContains('License_Bridge', $result->classReferences);
+        self::assertContains('Wp_Cli_Commands', $result->classReferences);
+
+        $calls = array_map(
+            fn($c) => $c->receiverClass . '::' . $c->method,
+            $result->scopedMethodCalls,
+        );
+        self::assertContains('License_Bridge::initialize', $calls);
+        self::assertContains('Wp_Cli_Commands::register', $calls);
+    }
+
+    public function testFullyQualifiedAndNamespaceQualifiedBareFunctionCallsAreCredited(): void
+    {
+        // \My_Theme\my_helper() and Sub\my_other_helper() tokenize as a single
+        // T_NAME_FULLY_QUALIFIED/T_NAME_QUALIFIED token, not T_STRING -- the only call-detection
+        // branch fired on T_STRING before this fix, so a real, called function still looked
+        // unused. Resolved to its unqualified tail the same way a qualified class reference
+        // already is, since a function can only ever be *declared* with a bare name in PHP.
+        $result = $this->parse('<?php
+namespace My_Theme;
+function bootstrap() {
+    \My_Theme\my_helper();
+    Sub\my_other_helper();
+}
+');
+        $names = array_column($result->functionCalls, 'name');
+        self::assertContains('my_helper', $names);
+        self::assertContains('my_other_helper', $names);
+    }
+
+    public function testFullyQualifiedWpCoreHookCallIsRecognized(): void
+    {
+        // \add_action(...) -- a namespaced file explicitly opting out of its own namespace for a
+        // WP core global. Before this fix, the whole name-comparison dispatch (hook/template/
+        // glob/define/existence-check) only ever ran for a T_STRING call, so this was invisible
+        // to hook detection entirely, not just FunctionAnalyzer.
+        $result = $this->parse('<?php
+namespace My_Theme;
+function boot() {
+    \add_action( "my_namespaced_hook", "handler" );
+}
+');
+        self::assertCount(1, $result->hookRegistrations);
+        self::assertSame('my_namespaced_hook', $result->hookRegistrations[0]->tag);
+        self::assertFalse($result->hookRegistrations[0]->isDynamic);
+    }
+
+    public function testFullyQualifiedWpCoreHookInvocationIsRecognized(): void
+    {
+        $result = $this->parse('<?php
+namespace My_Theme;
+function boot() {
+    \do_action( "my_namespaced_hook" );
+}
+');
+        self::assertCount(1, $result->hookInvocations);
+        self::assertSame('my_namespaced_hook', $result->hookInvocations[0]->tag);
+    }
+
+    public function testNamespaceQualifiedTemplatePartCallIsRecognized(): void
+    {
+        $result = $this->parse('<?php
+namespace My_Theme;
+function render() {
+    Sub\get_template_part( "template-parts/hero" );
+}
+');
+        self::assertCount(1, $result->templateRefs);
+        self::assertSame('template-parts/hero', $result->templateRefs[0]->path);
+    }
+
+    public function testFullyQualifiedClassExistsGuardIsStillExcludedFromClassReferences(): void
+    {
+        // \class_exists('X') guarding X's own definition must not count as a usage signal, the
+        // same exclusion the plain class_exists() shape already gets.
+        $result = $this->parse('<?php
+namespace My_Theme;
+if ( ! \class_exists( "My_Guarded_Class" ) ) {
+    class My_Guarded_Class {}
+}
+');
+        self::assertEmpty($result->functionCalls);
+    }
+
+    public function testBareStringClassMethodCallbackRegistersClassReferenceAndScopedCall(): void
+    {
+        // 'render_callback' => 'Astra_Customizer_Partials::render_partial_site_title' -- a WP
+        // customizer/REST-controller callback given as a plain "Class::method" string, no array
+        // involved. The trailing segment ("render_partial_site_title") was already extracted as
+        // a callback, but the class segment before the "::" was discarded -- the class itself
+        // looked permanently unused despite being reached exactly this way.
+        $result = $this->parse("<?php
+\$config = [
+    'render_callback' => 'Astra_Customizer_Partials::render_partial_site_title',
+];
+");
+        self::assertContains('Astra_Customizer_Partials', $result->classReferences);
+
+        $calls = array_map(
+            fn($c) => $c->receiverClass . '::' . $c->method,
+            $result->scopedMethodCalls,
+        );
+        self::assertContains('Astra_Customizer_Partials::render_partial_site_title', $calls);
+    }
+
+    public function testConcatenatedArrayCallbackMethodNameRegistersAScopedPrefix(): void
+    {
+        // Real-world finding (Astra theme): `add_action('astra_footer_html_'.$i, array($this,
+        // 'footer_html_'.$i))` inside a `for` loop wiring N numbered component slots. The
+        // literal 'footer_html_' alone isn't a real method name — the suffix only exists at
+        // runtime — so it must land as a *prefix* against the resolved $this receiver, not an
+        // exact-match scoped call for the truncated string.
+        $result = $this->parse('<?php
+class My_Builder {
+    public function wire() {
+        for ($i = 1; $i <= 4; $i++) {
+            add_action("astra_footer_html_" . $i, array($this, "footer_html_" . $i));
+        }
+    }
+    public function footer_html_1() {}
+}
+');
+        self::assertEmpty($result->scopedMethodCalls);
+        $prefixes = array_map(
+            fn($p) => $p->receiverClass . '::' . $p->prefix,
+            $result->scopedMethodCallPrefixes,
+        );
+        self::assertContains('My_Builder::footer_html_', $prefixes);
+    }
+
+    public function testWpCliAddCommandRegistersTheClassForReflectionDispatch(): void
+    {
+        // WP_CLI::add_command('astra abilities', 'Astra_Abilities_CLI') hands WP-CLI a class
+        // name it dispatches across by reflection — whichever public method matches the typed
+        // subcommand runs, not a fixed method name a curated contract list could name up front.
+        $result = $this->parse('<?php
+WP_CLI::add_command( "astra abilities", "Astra_Abilities_CLI" );
+');
+        self::assertContains('Astra_Abilities_CLI', $result->reflectionDispatchedClassNames);
+    }
+
+    public function testPropertyAssignedNewClassIsTrackedAndConsultedFromAnotherMethod(): void
+    {
+        // $this->service = new My_Service() in the constructor, read via $this->service->render()
+        // from a different method entirely — the class-scoped counterpart to $varTypesStack's
+        // per-function local-variable tracking.
+        $result = $this->parse('<?php
+class My_Controller {
+    public function __construct() {
+        $this->service = new My_Service();
+    }
+    public function boot() {
+        $this->service->render();
+    }
+}
+');
+        self::assertSame(
+            ['My_Controller' => ['service' => 'My_Service']],
+            $result->propertyAssignedClasses,
+        );
+        self::assertCount(1, $result->propertyMethodCalls);
+        self::assertSame('My_Controller', $result->propertyMethodCalls[0]->ownerClass);
+        self::assertSame('service', $result->propertyMethodCalls[0]->property);
+        self::assertSame('render', $result->propertyMethodCalls[0]->method);
+    }
+
+    public function testConstructorPromotedPropertyIsTrackedAsAnImplicitAssignment(): void
+    {
+        // public function __construct(private My_Service $svc) {} auto-assigns $this->svc — same
+        // effect as an explicit $this->svc = $svc; in the constructor body.
+        $result = $this->parse('<?php
+class My_Controller {
+    public function __construct(private My_Service $svc) {}
+}
+');
+        self::assertSame(
+            ['My_Controller' => ['svc' => 'My_Service']],
+            $result->propertyAssignedClasses,
+        );
+    }
+
+    public function testUntypedOrPlainConstructorParameterIsNotTrackedAsAPropertyAssignment(): void
+    {
+        // No visibility modifier -> not promotion, just an ordinary typed parameter (already
+        // covered by $varTypesStack, not $propertyAssignedClasses).
+        $result = $this->parse('<?php
+class My_Controller {
+    public function __construct(My_Service $svc) {}
+}
+');
+        self::assertSame([], $result->propertyAssignedClasses);
+    }
+
     public function testStaticModifierIsNotMistakenForStaticCall(): void
     {
         // "static" here is the method-visibility modifier, not `static::` late static binding —
@@ -566,6 +922,11 @@ function boot() {
 
     public function testReassignedLocalVariableInvalidatesTrackedType(): void
     {
+        // $s's `new My_Service()` type is invalidated by the reassignment to some_factory() — a
+        // bare call now tracked as a *pending* return-typed call (see PendingReturnTypedCall)
+        // rather than the old behavior of falling straight into the unscoped $functionCalls pool;
+        // ClassAnalyzer resolves it later (or falls back to the unscoped pool itself if
+        // some_factory's return type never resolves — see ClassAnalyzerTest).
         $result = $this->parse('<?php
 class My_Service {
     public function render() {}
@@ -577,8 +938,10 @@ function boot() {
 }
 ');
         self::assertEmpty($result->scopedMethodCalls);
-        $names = array_column($result->functionCalls, 'name');
-        self::assertContains('render', $names);
+        self::assertCount(1, $result->pendingReturnTypedCalls);
+        self::assertNull($result->pendingReturnTypedCalls[0]->sourceReceiverClass);
+        self::assertSame('some_factory', $result->pendingReturnTypedCalls[0]->sourceMethod);
+        self::assertSame('render', $result->pendingReturnTypedCalls[0]->readMethod);
     }
 
     public function testLocalVariableTypeDoesNotLeakAcrossFunctions(): void
@@ -860,6 +1223,142 @@ function second() {
 ');
         $calls = array_map(fn($c) => $c->receiverClass . '::' . $c->method, $result->scopedMethodCalls);
         self::assertNotContains('My_Service::render', $calls);
+    }
+
+    // ── declared return-type resolution ─────────────────────────────────────────────────────
+
+    public function testDeclaredReturnTypeIsResolvedOnFunctionDef(): void
+    {
+        $result = $this->parse('<?php
+class My_Service {}
+function create_service(): My_Service {
+    return new My_Service();
+}
+class My_Factory {
+    public static function make(): My_Service {
+        return new My_Service();
+    }
+    private function makeNullable(): ?My_Service {
+        return null;
+    }
+}
+');
+        $defsByName = [];
+        foreach ($result->functionDefs as $def) {
+            $defsByName[$def->ownerClass ?? ''][$def->name] = $def;
+        }
+        self::assertSame('My_Service', $defsByName['']['create_service']->returnType);
+        self::assertSame('My_Service', $defsByName['My_Factory']['make']->returnType);
+        // A nullable return type still resolves to the underlying class — a ?My_Service return
+        // is still confidently My_Service whenever it isn't null.
+        self::assertSame('My_Service', $defsByName['My_Factory']['makeNullable']->returnType);
+        self::assertContains('My_Service', $result->classReferences);
+    }
+
+    public function testUnionOrIntersectionReturnTypeIsNotResolved(): void
+    {
+        // Ambiguous — an int|My_Service (or My_Service&Countable) return could be either at
+        // runtime, so must not be trusted as a confident single class the way a plain My_Service
+        // return already is.
+        $result = $this->parse('<?php
+class My_Service {}
+interface Countable2 {}
+function make_union(): int|My_Service {
+    return new My_Service();
+}
+function make_intersection(): My_Service&Countable2 {
+    return new My_Service();
+}
+');
+        foreach ($result->functionDefs as $def) {
+            self::assertNull($def->returnType, "{$def->name} should not resolve a union/intersection return type");
+        }
+    }
+
+    public function testSelfAndStaticReturnTypesResolveAgainstTheOwnerClass(): void
+    {
+        $result = $this->parse('<?php
+class My_Builder {
+    public function withThing(): self {
+        return $this;
+    }
+    public function withOtherThing(): static {
+        return $this;
+    }
+}
+');
+        $defsByName = [];
+        foreach ($result->functionDefs as $def) {
+            $defsByName[$def->name] = $def;
+        }
+        self::assertSame('My_Builder', $defsByName['withThing']->returnType);
+        self::assertSame('My_Builder', $defsByName['withOtherThing']->returnType);
+    }
+
+    public function testVoidAndPrimitiveReturnTypesAreNotResolved(): void
+    {
+        $result = $this->parse('<?php
+function doA(): void {}
+function doB(): int {}
+function doC(): ?string { return null; }
+function doD(): array { return []; }
+');
+        foreach ($result->functionDefs as $def) {
+            self::assertNull($def->returnType);
+        }
+    }
+
+    public function testAssignmentFromReturnTypedCallIsTrackedAsAPendingCall(): void
+    {
+        // $x = My_Factory::make(); $x->render(); — unresolved at parse time (make()'s own
+        // return-type declaration might be in a different file's parse), so recorded as a
+        // PendingReturnTypedCall rather than a ScopedMethodCall directly; see ClassAnalyzerTest
+        // for the resolved-end-to-end behavior.
+        $result = $this->parse('<?php
+class My_Factory {
+    public static function make() {}
+}
+function boot() {
+    $x = My_Factory::make();
+    $x->render();
+}
+');
+        // My_Factory::make() itself is still credited as an ordinary scoped call (the natural
+        // per-token scan reaches those tokens regardless of the pending-call tracking above them)
+        // — only the *subsequent* $x->render() read is unresolved and deferred.
+        $calls = array_map(fn($c) => $c->receiverClass . '::' . $c->method, $result->scopedMethodCalls);
+        self::assertSame(['My_Factory::make'], $calls);
+        self::assertCount(1, $result->pendingReturnTypedCalls);
+        self::assertSame('My_Factory', $result->pendingReturnTypedCalls[0]->sourceReceiverClass);
+        self::assertSame('make', $result->pendingReturnTypedCalls[0]->sourceMethod);
+        self::assertSame('render', $result->pendingReturnTypedCalls[0]->readMethod);
+    }
+
+    public function testAssignmentFromBareFunctionCallIsTrackedWithANullReceiver(): void
+    {
+        $result = $this->parse('<?php
+function boot() {
+    $x = create_service();
+    $x->render();
+}
+');
+        self::assertCount(1, $result->pendingReturnTypedCalls);
+        self::assertNull($result->pendingReturnTypedCalls[0]->sourceReceiverClass);
+        self::assertSame('create_service', $result->pendingReturnTypedCalls[0]->sourceMethod);
+        self::assertSame('render', $result->pendingReturnTypedCalls[0]->readMethod);
+    }
+
+    public function testChainedCallAsRhsIsNotTrackedAsAPendingCall(): void
+    {
+        // $x = Foo::make()->build(); — more than one call in the RHS; this parser only trusts
+        // the simplest single-call shape, same "bail rather than guess" stance as everywhere else.
+        $result = $this->parse('<?php
+function boot() {
+    $x = My_Factory::make()->build();
+    $x->render();
+}
+');
+        self::assertEmpty($result->pendingReturnTypedCalls);
     }
 
     private function parse(string $code): \WpSpecter\Parser\ParseResult

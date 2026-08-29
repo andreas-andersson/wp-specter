@@ -97,8 +97,10 @@ do_action('repeated_hook');
         self::assertSame(1, count(array_filter($data['hooks'], fn($h) => $h === 'repeated_hook')));
     }
 
-    public function testDynamicHookTagsAreSkipped(): void
+    public function testVariableHookTagResolvesInGeneratedStubs(): void
     {
+        // $hook's last-known literal value ('dynamic_hook') resolves the tag exactly the same
+        // way a literal directly in the call already would, so it's now captured too.
         file_put_contents($this->tmp . '/plugin.php', "<?php
 \$hook = 'dynamic_hook';
 do_action(\$hook);
@@ -111,7 +113,26 @@ do_action('literal_hook');
         ob_get_clean();
 
         $data = $this->readJson($output_file);
-        self::assertNotContains('dynamic_hook', $data['hooks']);
+        self::assertContains('dynamic_hook', $data['hooks']);
+        self::assertContains('literal_hook', $data['hooks']);
+    }
+
+    public function testUnresolvableDynamicHookTagsAreSkipped(): void
+    {
+        // $hook comes from a function call, not a literal assignment -- genuinely no way to know
+        // what it is, so this must still be skipped rather than guessed at.
+        file_put_contents($this->tmp . '/plugin.php', "<?php
+\$hook = get_dynamic_tag();
+do_action(\$hook);
+do_action('literal_hook');
+");
+        $output_file = $this->tmp . '/stubs.json';
+
+        ob_start();
+        $this->app->run(['wp-specter', 'generate-stubs', $this->tmp, "--output={$output_file}"]);
+        ob_get_clean();
+
+        $data = $this->readJson($output_file);
         self::assertContains('literal_hook', $data['hooks']);
     }
 

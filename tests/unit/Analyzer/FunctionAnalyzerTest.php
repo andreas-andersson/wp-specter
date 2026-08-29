@@ -103,6 +103,25 @@ add_action( 'init', __NAMESPACE__ . '\\my_handler' );
         self::assertEmpty($this->analyzer->analyze([$file]));
     }
 
+    public function testFullyQualifiedFunctionCallCountsAsUse(): void
+    {
+        // \My_Theme\my_helper() tokenizes as a single T_NAME_FULLY_QUALIFIED token, not T_STRING
+        // — the only call-detection branch fired on T_STRING before this fix, so the definition
+        // looked unused despite the call.
+        $file = $this->write('<?php
+namespace My_Theme;
+function my_helper() {}
+function truly_unused_helper() {}
+function bootstrap() {
+    \My_Theme\my_helper();
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unused = array_column($findings, 'name');
+        self::assertNotContains('my_helper', $unused);
+        self::assertContains('truly_unused_helper', $unused);
+    }
+
     public function testExcludesWpPrefixedFunctions(): void
     {
         $file = $this->write('<?php
@@ -222,6 +241,26 @@ use function pings_open;
         self::assertCount(1, $findings);
         self::assertSame($file, $findings[0]->file);
         self::assertSame(3, $findings[0]->line);
+    }
+
+    public function testDoesNotReportAFunctionCreditedThroughAnUnresolvedReturnTypedCall(): void
+    {
+        // $c = totally_unknown_function(); $c->plain_helper(); — before PendingReturnTypedCall
+        // existed, this shape always landed directly in $functionCalls regardless of whether the
+        // source call's return type was ever resolvable; this analyzer doesn't care about
+        // classes at all, so it must keep crediting the name unconditionally the same way, or a
+        // same-named real function starts looking wrongly unused now that this shape has its own
+        // dedicated (class-analyzer-facing) tracking instead of folding into $functionCalls.
+        $file = $this->write('<?php
+function plain_helper() {}
+class My_Controller {
+    public function boot() {
+        $c = totally_unknown_function();
+        $c->plain_helper();
+    }
+}
+');
+        self::assertEmpty($this->analyzer->analyze([$file]));
     }
 
     private function write(string $code): string

@@ -80,6 +80,11 @@ class Application
                                   flag to keep the scan strictly static, at the cost of possible
                                   false-positive unused-class/method findings on classes that only
                                   extend/implement a vendor dependency outside the scan.
+          --no-suppress-unused-class-methods
+                                  By default, a method belonging to a class that's already
+                                  reported as an unused class is dropped from the unused-method
+                                  findings (redundant — the class finding already covers it).
+                                  Pass this flag to report both.
 
         Generate-stubs options:
           --output=<file>        Output path for the stubs file (default: .wp-specter.stubs.json)
@@ -294,7 +299,11 @@ class Application
             // static (no target-project code ever executes), never even reaching the point where
             // that would happen.
             $vendorAutoloadPaths = $config->noVendorReflection ? [] : $this->resolveVendorAutoloadPaths($composerRoot, $targets);
-            $findings = array_merge($findings, (new ClassAnalyzer($parser))->analyze($allFiles, $vendorAutoloadPaths));
+            $findings = array_merge($findings, (new ClassAnalyzer($parser))->analyze(
+                $allFiles,
+                $vendorAutoloadPaths,
+                !$config->noSuppressUnusedClassMethods,
+            ));
         }
 
         // Templates and files need a specific root to know what's "root-level" and which mode's
@@ -628,6 +637,7 @@ class Application
         $generateConfig = false;
         $generateBaseline = false;
         $noVendorReflection = false;
+        $noSuppressUnusedClassMethods = false;
 
         foreach ($args as $arg) {
             if (str_starts_with($arg, '--stubs=')) {
@@ -659,6 +669,8 @@ class Application
                 $generateBaseline = true;
             } elseif ($arg === '--no-vendor-reflection') {
                 $noVendorReflection = true;
+            } elseif ($arg === '--no-suppress-unused-class-methods') {
+                $noSuppressUnusedClassMethods = true;
             } elseif (!str_starts_with($arg, '--')) {
                 $path = $arg;
             } else {
@@ -704,6 +716,7 @@ class Application
             generateConfig: $generateConfig,
             generateBaseline: $generateBaseline,
             noVendorReflection: $noVendorReflection,
+            noSuppressUnusedClassMethods: $noSuppressUnusedClassMethods,
         );
     }
 

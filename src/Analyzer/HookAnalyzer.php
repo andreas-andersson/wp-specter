@@ -28,13 +28,21 @@ final class HookAnalyzer
         // hook in that family. This is what lets a single dynamic dispatcher (one call site
         // fanning out to N hook names, a common WP/plugin pattern) be recognized at all instead
         // of making every hook it fires look permanently unmatched.
+        // $firedSuffixes is the mirror of $firedPrefixes for the opposite shape — dynamic first,
+        // literal last (e.g. "{$this->id_base}_widget_updated" → "_widget_updated") — rarer than
+        // the prefix shape in practice (WP convention overwhelmingly puts the static/plugin-
+        // specific part first), but real (per-widget-ID or per-post-type hook naming).
         $firedTags = [];
         $firedPrefixes = [];
+        $firedSuffixes = [];
         foreach ($parseResults as $result) {
             foreach ($result->hookInvocations as $inv) {
                 if ($inv->isDynamic) {
                     if ($inv->tagPrefix !== '') {
                         $firedPrefixes[$inv->tagPrefix] = true;
+                    }
+                    if ($inv->tagSuffix !== '') {
+                        $firedSuffixes[$inv->tagSuffix] = true;
                     }
                     continue;
                 }
@@ -49,7 +57,11 @@ final class HookAnalyzer
                 if ($reg->isDynamic || StubRegistry::contains($reg->tag)) {
                     continue;
                 }
-                if (isset($firedTags[$reg->tag]) || $this->matchesAnyPrefix($reg->tag, $firedPrefixes)) {
+                if (
+                    isset($firedTags[$reg->tag])
+                    || $this->matchesAnyPrefix($reg->tag, $firedPrefixes)
+                    || $this->matchesAnySuffix($reg->tag, $firedSuffixes)
+                ) {
                     continue;
                 }
                 $findings[] = new Finding(
@@ -73,6 +85,17 @@ final class HookAnalyzer
     {
         foreach ($prefixes as $prefix => $_) {
             if (str_starts_with($tag, $prefix)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** @param array<string,true> $suffixes */
+    private function matchesAnySuffix(string $tag, array $suffixes): bool
+    {
+        foreach ($suffixes as $suffix => $_) {
+            if (str_ends_with($tag, $suffix)) {
                 return true;
             }
         }

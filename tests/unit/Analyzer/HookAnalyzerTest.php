@@ -68,12 +68,84 @@ add_filter( 'my_filter', 'cb' );
         self::assertEmpty($this->analyzer->analyze([$file]));
     }
 
-    public function testDynamicTagSkipped(): void
+    public function testVariableHookTagResolvesAndReportsAsUnmatched(): void
     {
+        // $tag's last-known literal value ('dynamic_hook') resolves the tag exactly the same way
+        // a literal directly in the call already would — since nothing fires it anywhere, this
+        // is now a real, reportable unmatched hook rather than a silent blind spot.
         $file = $this->write("<?php
 \$tag = 'dynamic_hook';
 add_action( \$tag, 'handler' );
 ");
+        $findings = $this->analyzer->analyze([$file]);
+        self::assertCount(1, $findings);
+        self::assertSame('dynamic_hook', $findings[0]->name);
+    }
+
+    public function testUnresolvableVariableHookTagStillSilentlySkipped(): void
+    {
+        // $tag comes from a function call, not a literal assignment -- genuinely no way to know
+        // what it is, so this must still be silently skipped rather than reported.
+        $file = $this->write('<?php
+$tag = get_dynamic_tag();
+add_action( $tag, "handler" );
+');
+        self::assertEmpty($this->analyzer->analyze([$file]));
+    }
+
+    public function testFullyQualifiedAddActionCallIsRecognized(): void
+    {
+        // \add_action(...) -- a namespaced file explicitly opting out of its own namespace for a
+        // WP core global. Before this fix, the whole hook-detection dispatch only ever ran for a
+        // bare (non-namespaced) call.
+        $file = $this->write('<?php
+namespace My_Theme;
+\add_action( "my_namespaced_hook", "handler" );
+');
+        $findings = $this->analyzer->analyze([$file]);
+        self::assertCount(1, $findings);
+        self::assertSame('my_namespaced_hook', $findings[0]->name);
+    }
+
+    public function testFullyQualifiedDoActionMatchesAFullyQualifiedAddAction(): void
+    {
+        $file = $this->write('<?php
+namespace My_Theme;
+\add_action( "my_namespaced_hook", "handler" );
+\do_action( "my_namespaced_hook" );
+');
+        self::assertEmpty($this->analyzer->analyze([$file]));
+    }
+
+    public function testClassConstantHookTagResolvesAndReportsAsUnmatched(): void
+    {
+        // const HOOK_NAME = 'my_plugin_loaded'; add_action(self::HOOK_NAME, ...) -- resolves the
+        // same way a literal directly in the call already would; nothing fires it, so this is a
+        // real, reportable unmatched hook.
+        $file = $this->write('<?php
+class My_Plugin {
+    const HOOK_NAME = "my_plugin_loaded";
+    public function register() {
+        add_action( self::HOOK_NAME, "handler" );
+    }
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        self::assertCount(1, $findings);
+        self::assertSame('my_plugin_loaded', $findings[0]->name);
+    }
+
+    public function testDoesNotReportClassConstantHookMatchedByALiteralDoAction(): void
+    {
+        $file = $this->write('<?php
+class My_Plugin {
+    const HOOK_NAME = "my_plugin_loaded";
+    public function register() {
+        add_action( self::HOOK_NAME, "handler" );
+    }
+}
+do_action( "my_plugin_loaded" );
+');
         self::assertEmpty($this->analyzer->analyze([$file]));
     }
 
@@ -172,6 +244,38 @@ function acf_get_setting($name, $value = null) {
         $findings = $this->analyzer->analyze([$file]);
         self::assertCount(1, $findings);
         self::assertSame('acf/other/thing', $findings[0]->name);
+    }
+
+    public function testRegistrationMatchedByDynamicInvocationSuffixInSameProject(): void
+    {
+        // WP_Widget's own real shape: do_action("{$this->id_base}_widget_updated") -- dynamic
+        // first, literal last, the mirror of the ACF prefix case above.
+        $file = $this->write('<?php
+class My_Widget {
+    public $id_base = "my_widget";
+    public function update_callback() {
+        do_action("{$this->id_base}_widget_updated");
+    }
+}
+add_action( "my_widget_widget_updated", "handler" );
+');
+        self::assertEmpty($this->analyzer->analyze([$file]));
+    }
+
+    public function testRegistrationNotMatchedByUnrelatedDynamicSuffix(): void
+    {
+        $file = $this->write('<?php
+class My_Widget {
+    public $id_base = "my_widget";
+    public function update_callback() {
+        do_action("{$this->id_base}_widget_updated");
+    }
+}
+add_action( "totally_unrelated_hook", "handler" );
+');
+        $findings = $this->analyzer->analyze([$file]);
+        self::assertCount(1, $findings);
+        self::assertSame('totally_unrelated_hook', $findings[0]->name);
     }
 
     public function testCustomStubsPrefixSuppressesHook(): void

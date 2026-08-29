@@ -10,6 +10,7 @@ use WpSpecter\Finding\FindingType;
 use WpSpecter\Parser\ClassDef;
 use WpSpecter\Parser\ParseResult;
 use WpSpecter\Parser\PhpTokenParser;
+use WpSpecter\Stubs\WpCoreContractMethods;
 
 final class ClassAnalyzer
 {
@@ -179,9 +180,14 @@ final class ClassAnalyzer
     /**
      * @param list<string> $files
      * @param list<string> $vendorAutoloadPaths
+     * @param bool $suppressUnusedClassMethods When true (default), a method owned by a class
+     *   that's itself already reported UnusedClass is dropped from the UnusedMethod findings —
+     *   the class finding already says nothing in it is reachable, so the method finding adds
+     *   no new information. Pass false to report both regardless (see --no-suppress-unused-
+     *   class-methods).
      * @return list<Finding>
      */
-    public function analyze(array $files, array $vendorAutoloadPaths = []): array
+    public function analyze(array $files, array $vendorAutoloadPaths = [], bool $suppressUnusedClassMethods = true): array
     {
         $parseResults = array_map(fn(string $f) => $this->parser->parse($f), $files);
 
@@ -205,8 +211,21 @@ final class ClassAnalyzer
             }
         }
 
-        $findings = $this->findUnusedClasses($parseResults, $classDefsByName, $useImports);
-        array_push($findings, ...$this->findUnusedMethods($parseResults, $classDefsByName, $reflector, $useImports));
+        $unusedClassFindings = $this->findUnusedClasses($parseResults, $classDefsByName, $useImports);
+
+        // A method whose owner class is itself already reported as unused is redundant noise —
+        // the class finding already says "nothing here is reachable," so every method under it
+        // says nothing new. Filtered by name, not by cross-referencing Finding objects, since
+        // findUnusedMethods needs a fast set lookup per method, not per-finding matching.
+        $unusedClassNames = [];
+        if ($suppressUnusedClassMethods) {
+            foreach ($unusedClassFindings as $finding) {
+                $unusedClassNames[$finding->name] = true;
+            }
+        }
+
+        $findings = $unusedClassFindings;
+        array_push($findings, ...$this->findUnusedMethods($parseResults, $classDefsByName, $reflector, $useImports, $unusedClassNames));
 
         usort($findings, fn(Finding $a, Finding $b) => $a->file <=> $b->file ?: $a->line <=> $b->line);
 
@@ -276,9 +295,11 @@ final class ClassAnalyzer
      * @param list<ParseResult> $parseResults
      * @param array<string,ClassDef> $classDefsByName
      * @param array<string,string> $useImports
+     * @param array<string,bool> $unusedClassNames Owner class names already reported as
+     *   UnusedClass — their methods are skipped as redundant (see analyze()).
      * @return list<Finding>
      */
-    private function findUnusedMethods(array $parseResults, array $classDefsByName, VendorClassReflector $reflector, array $useImports): array
+    private function findUnusedMethods(array $parseResults, array $classDefsByName, VendorClassReflector $reflector, array $useImports, array $unusedClassNames = []): array
     {
         // Calls PhpTokenParser could resolve to a concrete receiver class — $this->method(),
         // self::/parent::/static::method(), and Foo::method() with a literal class name — are
@@ -289,6 +310,35 @@ final class ClassAnalyzer
         foreach ($parseResults as $result) {
             foreach ($result->scopedMethodCalls as $call) {
                 $scopedCalled[$call->receiverClass][$call->method] = true;
+            }
+        }
+
+        // Class name => property name => the class assigned to it, from every
+        // `$this->prop = new ClassName()` sighting (or constructor-promoted property) across
+        // every file — merged before resolving $propertyMethodCalls below since a property set
+        // in one file's method and read via $this->prop->method() from a different one (or a
+        // different method in the same file, textually earlier or later — order doesn't matter
+        // once everything is merged) both need the same complete picture.
+        $propertyAssignedClasses = [];
+        foreach ($parseResults as $result) {
+            foreach ($result->propertyAssignedClasses as $className => $props) {
+                foreach ($props as $propName => $assignedClass) {
+                    $propertyAssignedClasses[$className][$propName] = $assignedClass;
+                }
+            }
+        }
+
+        // $this->prop->method() resolved against the merged property-type map above, feeding
+        // directly into $scopedCalled itself — a resolved property-typed call is exactly as good
+        // a signal as any other scoped call, and this lets every existing exemption/matching
+        // mechanism below (contract methods, isUsedByDescendantReceiver, trait consumers, ...)
+        // apply to it for free, with no separate matching path to keep in sync.
+        foreach ($parseResults as $result) {
+            foreach ($result->propertyMethodCalls as $call) {
+                $trackedClass = $propertyAssignedClasses[$call->ownerClass][$call->property] ?? null;
+                if ($trackedClass !== null) {
+                    $scopedCalled[$trackedClass][$call->method] = true;
+                }
             }
         }
 
@@ -306,6 +356,76 @@ final class ClassAnalyzer
             }
         }
 
+        // Method/function name => its own declared `: ReturnType`, resolved to a concrete class
+        // — from every FunctionDef across every file (methods keyed by owner class, top-level
+        // functions in a separate flat pool the same way $called already is). Consulted just
+        // below to resolve $pendingReturnTypedCalls; built here (not in the parser) for the same
+        // reason property types are — a factory method's own declaration and its caller are
+        // routinely in different files.
+        $methodReturnTypes = [];
+        $functionReturnTypes = [];
+        foreach ($parseResults as $result) {
+            foreach ($result->functionDefs as $def) {
+                if ($def->returnType === null) {
+                    continue;
+                }
+                if ($def->isMethod && $def->ownerClass !== null) {
+                    $methodReturnTypes[$def->ownerClass][$def->name] = $def->returnType;
+                } elseif (!$def->isMethod) {
+                    $functionReturnTypes[$def->name] = $def->returnType;
+                }
+            }
+        }
+
+        // `$x = SomeFactory::make(); $x->method();` resolved against the return-type maps just
+        // built. A resolved call feeds $scopedCalled directly, same as property-typed calls
+        // above — every existing exemption/matching mechanism applies to it for free. When the
+        // source call's own return type never resolves (an unknown function, no declared type,
+        // a union/intersection type, ...), this falls back to the same unscoped $called pool the
+        // call would have landed in before this feature existed at all — never a net precision
+        // loss relative to the old behavior, only ever a gain when it does resolve.
+        foreach ($parseResults as $result) {
+            foreach ($result->pendingReturnTypedCalls as $call) {
+                $returnType = $call->sourceReceiverClass !== null
+                    ? ($methodReturnTypes[$call->sourceReceiverClass][$call->sourceMethod] ?? null)
+                    : ($functionReturnTypes[$call->sourceMethod] ?? null);
+
+                if ($returnType !== null) {
+                    $scopedCalled[$returnType][$call->readMethod] = true;
+                } else {
+                    $called[$call->readMethod] = true;
+                }
+            }
+        }
+
+        // A callback built via string concatenation with a resolvable receiver — `array($this,
+        // 'footer_html_' . $index)` inside a loop — can't be matched exactly, since the real
+        // suffix is only known at runtime. $scopedCalledPrefixes mirrors $scopedCalled above but
+        // is checked with str_starts_with() instead of an exact key lookup (matchesAnyPrefix()).
+        // Deliberately scoped-only: an *unscoped* prefix pool would match against every method
+        // project-wide by name prefix, and a short incidental one (confirmed against the Astra
+        // theme — plain string-building like 'astra_' . $key, unrelated to any callback) would
+        // hide genuinely dead code far more readily than an unscoped exact-name match does.
+        $scopedCalledPrefixes = [];
+        foreach ($parseResults as $result) {
+            foreach ($result->scopedMethodCallPrefixes as $call) {
+                $scopedCalledPrefixes[$call->receiverClass][] = $call->prefix;
+            }
+        }
+
+        // Class names passed as a bare string to an API that dispatches across every public
+        // method of that class by reflection (currently just WP_CLI::add_command() — see
+        // PhpTokenParser). No fixed method name exists to check per class the way
+        // BASE_CLASS_CONTRACT_METHODS does, so every method on the class is exempt, the same
+        // whole-class effect as isFullyExemptClass() but triggered by a call site instead of an
+        // extends/implements clause.
+        $reflectionDispatchedClassNames = [];
+        foreach ($parseResults as $result) {
+            foreach ($result->reflectionDispatchedClassNames as $name) {
+                $reflectionDispatchedClassNames[$name] = true;
+            }
+        }
+
         // trait name => list of classes/traits whose body directly `use`s it (see TraitUsage /
         // the T_USE handling in PhpTokenParser). A trait's own methods are never called on the
         // trait itself — only through whatever `use`s it — so isUsedByTraitConsumer() walks this
@@ -317,18 +437,48 @@ final class ClassAnalyzer
             }
         }
 
+        // Base class name => every class whose own extends chain passes through it (multi-level
+        // included: Astra_Get_Single_Page -> ... -> Astra_Abstract_Ability makes
+        // 'Astra_Abstract_Ability' => [..., 'Astra_Get_Single_Page']). Real-world gap found in the
+        // Astra theme: Astra_Abstract_Ability::register()/build_output_schema()/get_description()/
+        // get_category() are shared, concrete (non-abstract) methods declared once on the base
+        // class, then called from ~70 concrete subclasses as `Subclass::register()`,
+        // `$this->build_output_schema()` (from inside the subclass), `$instance->get_description()`
+        // — every one of those resolves the scoped call's receiver to the *subclass* name, never
+        // the base class the method is actually declared on, so scopedCalled[ownerClass] alone
+        // never matches. isUsedByDescendantReceiver() below widens the check the same direction
+        // isUsedByPolymorphicCall() already does the opposite way (concrete class -> the
+        // interface/ancestor a call was resolved to): here, base class -> any concrete descendant
+        // a call was actually resolved to.
+        $descendantsOf = [];
+        foreach ($classDefsByName as $name => $def) {
+            $className = $name;
+            for ($depth = 0; $depth < self::MAX_INHERITANCE_DEPTH; $depth++) {
+                $base = ($classDefsByName[$className] ?? null)?->extends[0] ?? null;
+                if ($base === null) {
+                    break;
+                }
+                $descendantsOf[$base][] = $name;
+                $className = $base;
+            }
+        }
+
         $findings = [];
         foreach ($parseResults as $result) {
             foreach ($result->functionDefs as $def) {
                 if (
                     !$def->isMethod
                     || $this->isMagicMethod($def->name)
+                    || isset($unusedClassNames[$def->ownerClass ?? ''])
                     || isset($called[$def->name])
                     || isset($scopedCalled[$def->ownerClass ?? ''][$def->name])
+                    || isset($reflectionDispatchedClassNames[$def->ownerClass ?? ''])
+                    || $this->matchesAnyPrefix($def->name, $scopedCalledPrefixes[$def->ownerClass ?? ''] ?? [])
                     || $this->isFullyExemptClass($def->ownerClass, $classDefsByName, $useImports)
                     || $this->isContractMethod($def->name, $def->ownerClass, $classDefsByName, $reflector, $useImports)
                     || $this->isUsedByTraitConsumer($def->ownerClass, $def->name, $classDefsByName, $traitUsers, $scopedCalled)
                     || $this->isUsedByPolymorphicCall($def->ownerClass, $def->name, $classDefsByName, $scopedCalled)
+                    || $this->isUsedByDescendantReceiver($def->ownerClass, $def->name, $descendantsOf, $scopedCalled)
                 ) {
                     continue;
                 }
@@ -396,7 +546,10 @@ final class ClassAnalyzer
                 return false;
             }
 
-            if (in_array($methodName, self::baseClassContractMethods($base), true)) {
+            if (
+                in_array($methodName, self::baseClassContractMethods($base), true)
+                || in_array($methodName, self::generatedContractMethods($base), true)
+            ) {
                 return true;
             }
 
@@ -475,6 +628,22 @@ final class ClassAnalyzer
     {
         static $ci = null;
         $ci ??= array_change_key_case(self::BASE_CLASS_CONTRACT_METHODS, CASE_LOWER);
+        return $ci[strtolower($base)] ?? [];
+    }
+
+    /**
+     * Same case-insensitive lookup as baseClassContractMethods(), against
+     * WpCoreContractMethods::methods() (see tools/generate-wp-contract-methods-stub.php)
+     * instead of the hand-curated constant — a fallback net for any WP core base class the
+     * hand-curated list doesn't name yet, never a replacement for it (isContractMethod() checks
+     * both and takes either match).
+     *
+     * @return list<string>
+     */
+    private static function generatedContractMethods(string $base): array
+    {
+        static $ci = null;
+        $ci ??= array_change_key_case(WpCoreContractMethods::methods(), CASE_LOWER);
         return $ci[strtolower($base)] ?? [];
     }
 
@@ -584,8 +753,47 @@ final class ClassAnalyzer
         return false;
     }
 
+    /**
+     * A shared, concrete method declared on a base class ($ownerClass) but only ever called
+     * through a concrete descendant's own receiver — `Subclass::method()`, `$this->method()`
+     * from inside the subclass, `$instance->method()` where $instance is known to hold that
+     * subclass — never matches scopedCalled[$ownerClass] directly, since every one of those
+     * calls resolves its receiver to the descendant, not the class the method is actually
+     * declared on. $descendantsOf (built once in findUnusedMethods) already carries every class
+     * whose extends chain passes through $ownerClass, at any depth, so this is a flat lookup
+     * rather than its own chain walk.
+     *
+     * @param array<string,list<string>> $descendantsOf
+     * @param array<string,array<string,bool>> $scopedCalled
+     */
+    private function isUsedByDescendantReceiver(?string $ownerClass, string $methodName, array $descendantsOf, array $scopedCalled): bool
+    {
+        if ($ownerClass === null) {
+            return false;
+        }
+
+        foreach ($descendantsOf[$ownerClass] ?? [] as $descendant) {
+            if (isset($scopedCalled[$descendant][$methodName])) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private function isMagicMethod(string $name): bool
     {
         return str_starts_with($name, '__');
+    }
+
+    /** @param list<string> $prefixes */
+    private function matchesAnyPrefix(string $name, array $prefixes): bool
+    {
+        foreach ($prefixes as $prefix) {
+            if (str_starts_with($name, $prefix)) {
+                return true;
+            }
+        }
+        return false;
     }
 }

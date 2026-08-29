@@ -33,20 +33,72 @@ scope limit that trades recall or precision for staying a single-pass, no-depend
   it through a scoped receiver. A trait method that's never called by any consumer, anywhere, is
   still correctly flagged.
 
-- [ ] **Class names passed as bare strings to WP APIs aren't references.** `register_widget('My_Widget')`,
-  `is_a($x, 'My_Class')`, `class_exists('My_Class')` — none of these produce a `classReferences`
-  entry, since only syntactic references (`new`, `instanceof`, `extends`/`implements`, `::`) are
-  tracked. A class ONLY ever reached this way looks unused.
-  - Fix shape: same heuristic already used for function string-callbacks
-    (`looksLikeCallback` + a curated list of WP functions that take a class name string) could
-    feed `classReferences` too — but risks the same class of false-negative suppression the
-    project already accepts for function detection, just now on the class side.
+- [x] **A bare `'Class::method'` callback string (no array, no receiver) resolved its trailing
+  method segment but dropped the leading class segment entirely.** Real-world finding (Astra
+  theme): `'render_callback' => 'Astra_Customizer_Partials::render_partial_site_title'` (the WP
+  customizer/REST-controller dynamic-partial shape) — the method segment was already extracted
+  via the existing `\`/`::` trailing-literal stripping (added for `__CLASS__ . '::method'`
+  concatenation), but nothing fed the leading class segment into `classReferences`, so the class
+  itself looked permanently unused despite being reached exactly this way. Fixed: when the
+  string's last separator is `::`, the segment before it is also resolved (`shortClassName`) and
+  recorded as both a `classReference` and the scoped call's receiver — skipped for
+  `self`/`parent`/`static`, which aren't resolvable from a bare string literal. Narrower than the
+  open item below: still only covers a literal `'Class::method'` string, not a bare class name on
+  its own.
 
-- [ ] **Dynamic instantiation is unresolvable.** `$class = 'My_Class'; new $class();` — `captureClassNameAfter`
-  requires a literal identifier token right after `new`; a variable never resolves. Same for
-  `new $this->widgetClass()`. This is inherent to a token-based parser without type inference —
-  not realistically fixable without a much bigger rewrite. Documented here so it's not
-  re-investigated as a "bug."
+- [x] **Class names passed as bare strings to WP APIs, general case — turned out to already be
+  covered, not actually open.** Re-investigated to implement a fix and found the existing
+  `findUnusedClasses` fallback (trusting any string literal already in the generic
+  `$functionCalls` pool as a possible class reference — originally added for the
+  `register_panel_type()`/filter-return shapes above) is function-name-*agnostic*: it doesn't
+  care which call a string was an argument to, so `register_widget('My_Widget')`,
+  `is_a($x, 'My_Class')`, `is_subclass_of($x, 'My_Base')`, and a class name used as a plain
+  associative-array *value* (`['class' => 'My_Custom_Control']`, not just the special
+  `[Foo::class, 'method']` callback shape) were all already rescued, with zero code changes
+  needed — confirmed with a small test battery, then locked in with dedicated regression tests
+  (`testDoesNotReportClassPassedAsBareStringToRegisterWidget`,
+  `testDoesNotReportClassPassedAsBareStringToIsAOrIsSubclassOf`,
+  `testDoesNotReportClassNamePassedAsAPlainConfigArrayValue`) since previously this coverage was
+  only an accidental side effect of a fix motivated by different, narrower examples, not
+  something itself under test. Bonus found the same way: the common `$class = 'My_Class'; new
+  $class();` shape (a literal string assigned to a variable, then instantiated dynamically) is
+  *also* already rescued — the literal `'My_Class'` on its own right-hand side flows into the
+  same pool regardless of what later happens to the variable it's assigned to. `class_exists('My_Class')` remains
+  the one deliberate exclusion (see `testReportsClassWrappedInOwnClassExistsGuard` above) — its
+  dominant real-world shape is a redeclaration guard around the class's own definition, not a
+  genuine usage signal. What's still genuinely unresolvable is a class name that's never a clean
+  string literal anywhere at all (built via concatenation, `sprintf`, or sourced from external
+  data) — that's the actual remaining scope of the "Dynamic instantiation" item below, which is
+  narrower than its own text currently suggests.
+
+- [x] **A class name passed as WP-CLI's `add_command()` second argument dispatches by
+  reflection across every public method of that class — no fixed method name exists to check.**
+  Real-world finding (Astra theme): `WP_CLI::add_command('astra abilities',
+  'Astra_Abilities_CLI')`; `enable()` (a WP-CLI subcommand method) looked unused since nothing
+  calls it by name anywhere in project code — WP-CLI matches whichever public method name
+  matches the subcommand typed at the CLI. The class itself wasn't a problem (already rescued by
+  the existing string-literal-in-the-generic-`$functionCalls`-pool fallback in
+  `findUnusedClasses`) — only its *methods* had no equivalent whole-class exemption. Fixed:
+  `PhpTokenParser` detects `WP_CLI::add_command($hook, 'ClassName')` (new
+  `secondArgStringLiteral` helper, same "only trust a plain literal" stance as
+  `firstStringArgIndex`) and records the class name on
+  `ParseResult::$reflectionDispatchedClassNames`; `ClassAnalyzer::findUnusedMethods` exempts
+  every method whose owner class is in that set — the same whole-class effect as
+  `FULLY_EXEMPT_BASE_CLASSES`, just triggered by a call site instead of an extends/implements
+  clause, since there's no fixed base class here at all (`Astra_Abilities_CLI` extends nothing).
+
+- [ ] **Dynamic instantiation via `new $var()` is unresolvable at the `new` expression itself.**
+  `captureClassNameAfter` requires a literal identifier token right after `new`; a variable never
+  resolves there. Narrower in practice than it sounds, though: `$class = 'My_Class'; new
+  $class();` is *already* covered end-to-end — not by resolving `new $class()`, but because the
+  literal `'My_Class'` on the assignment's own right-hand side independently flows into the
+  generic string-literal pool (see the bare-string-class-reference item above), which is enough
+  to keep `My_Class` off the unused-class list regardless of what happens to `$class` afterward.
+  What's genuinely still unresolvable is a class name that's never a clean string literal
+  *anywhere* in the file — built via concatenation/`sprintf` (`'My_' . $suffix`), read from a
+  property (`new $this->widgetClass()`), or sourced from external data (DB option, JSON config).
+  Inherent to a token-based parser without type inference or dataflow analysis — not realistically
+  fixable without a much bigger rewrite. Documented here so it's not re-investigated as a "bug."
 
 ## Method detection
 
@@ -58,14 +110,71 @@ scope limit that trades recall or precision for staying a single-pass, no-depend
   `widget()`/`form()`/`update()` exemption, and an interface attached higher up the chain rather
   than redeclared on every subclass is still honored.
 
-- [ ] **Property types aren't tracked.** `$this->service = new My_Service(); $this->service->render();`
-  — local variable tracking (`$varTypesStack`) only covers local variables, not object
-  properties. `$this->service->render()` falls back to the unscoped/name-only pool.
-  - Fix shape: would need a per-class (not per-function) property-type map, populated from
-    `$this->prop = new ClassName()` assignments seen anywhere in the class body, and consulted
-    for `$this->prop->method()` — meaningfully bigger than local-variable tracking since it's
-    class-scoped rather than function-scoped and has to survive being set in one method and read
-    in another.
+- [x] **A shared, concrete (non-abstract) method declared once on a base class looked unused
+  whenever it was only ever called through a concrete descendant's own receiver.** Real-world
+  finding (Astra theme): `Astra_Abstract_Ability::register()`/`build_output_schema()`/
+  `get_description()`/`get_category()` are declared on the abstract base, then called from ~70
+  concrete subclasses as `Subclass::register()`, `$this->build_output_schema()` (from inside the
+  subclass), `$instance->get_description()` — every one of those resolves the scoped call's
+  receiver to the *subclass*, never the base class the method is actually declared on, so
+  `scopedCalled[ownerClass]`'s exact-match check never fired. Fixed: `ClassAnalyzer` now builds
+  `$descendantsOf` (base class name => every class whose own extends chain passes through it, any
+  depth), and `isUsedByDescendantReceiver()` credits the method when *any* known descendant has a
+  scoped call recorded against it — the mirror direction of the existing
+  `isUsedByPolymorphicCall()` (which walks concrete class → the interface/ancestor a call was
+  resolved to; this walks base class → any concrete descendant a call was actually resolved to).
+
+- [x] **A callback built via string concatenation inside an array-callback with a resolvable
+  receiver was recorded as an exact (and wrong) truncated name instead of the real method.**
+  Real-world finding (Astra theme): `add_action('astra_footer_html_' . $index, array($this,
+  'footer_html_' . $index))` inside a `for` loop wiring N numbered component slots
+  (footer/header builder) — `footer_html_1`..`footer_html_4` are only ever reached through a
+  runtime loop counter, never a literal exact name, so they looked unused; the literal
+  `'footer_html_'` alone was being recorded as if it *were* the whole method name, which matched
+  nothing real either. Fixed: `ScopedMethodCallPrefix` (`ParseResult::$scopedMethodCallPrefixes`)
+  records the literal prefix against the array-callback's resolved receiver when the
+  method-name string is followed by concatenation; `ClassAnalyzer` checks it with
+  `str_starts_with()` instead of an exact key lookup. Deliberately requires a *resolved
+  array-callback receiver* — an earlier version also tried an unscoped fallback pool for the
+  no-receiver case, but auditing it against the real Astra codebase turned up dangerous
+  short/generic prefixes (`'_'`, `'h'`, `'menu'`, `'astra_'`) coming from ordinary string-building
+  entirely unrelated to any callback (option keys, CSS classes, hook *tag* names), which silently
+  dropped 11 genuine unused-function findings project-wide. Reverted that half — an unscoped
+  prefix match is categorically riskier than an unscoped *exact* match, since a short incidental
+  prefix collides via `str_starts_with()` with huge swaths of unrelated real names, where an
+  exact full-identifier collision is rare by comparison.
+
+- [x] **Property types weren't tracked**, unlike local variables. `$this->service = new
+  My_Service(); ... $this->service->render();` (service/collaborator set in the constructor,
+  used elsewhere in the class) fell all the way back to the unscoped/name-only pool — the single
+  most common real-world WP OOP shape this parser was still missing. Fixed:
+  - `PhpTokenParser`'s `$this->` handling (T_VARIABLE branch) gained a new `propertyAccessTarget()`
+    check (same shape as `findScopedCallTarget` but without requiring `(` right after the name,
+    since the caller needs to branch on what comes next) — `$this->prop = new ClassName()`
+    records the assignment on `ParseResult::$propertyAssignedClasses` (class => prop => class,
+    flat/file-wide, last-write-wins, deliberately *not* scoped to function-body depth the way
+    `$varTypesStack` is, since surviving across methods is the whole point); `$this->prop-
+    >method()` records an unresolved `PropertyMethodCall` instead of trying to resolve it inline.
+  - Resolution is deferred to `ClassAnalyzer`, which merges every file's
+    `$propertyAssignedClasses` first, then resolves every `PropertyMethodCall` against the
+    complete map, feeding a match straight into the existing `$scopedCalled` pool — a resolved
+    property-typed call needed no new matching logic of its own; every existing exemption
+    mechanism (contract methods, `isUsedByDescendantReceiver`, trait consumers, ...) already
+    applies to it for free. This also sidesteps the token-based parser's usual single-pass
+    ordering limitation: whether the property is *set* in a method declared before or after the
+    method that *reads* it no longer matters, since resolution only happens once the whole scan
+    is merged.
+  - Constructor-promoted properties (`public function __construct(private My_Service $svc) {}`)
+    auto-assign `$this->svc` — `collectParamTypeHint` now also checks for a
+    `T_PUBLIC`/`T_PROTECTED`/`T_PRIVATE` modifier on the parameter (the promotion marker;
+    `readonly` alone doesn't promote) and records the same implicit assignment.
+  - Bug caught while writing this: `propertyAccessTarget()`'s first draft compared the token
+    after `$this` directly against the bare string `'->'` — but `->` tokenizes as
+    `T_OBJECT_OPERATOR` (an array token), not a plain string, the same way `::`/`->` are already
+    unwrapped via `is_string($sepToken) ? $sepToken : $sepToken[1]` in `findScopedCallTarget`.
+    The bare-string comparison silently never matched anything (return null every time), caught
+    by a manual debug trace after property tracking produced zero results end-to-end on an
+    otherwise-correct test fixture.
 
 - [x] **Type-hinted parameters don't seed variable tracking or count as class references.**
   Fixed: `parseParamTypeHints`/`collectParamTypeHint` in `PhpTokenParser` walk the parameter
@@ -75,11 +184,38 @@ scope limit that trades recall or precision for staying a single-pass, no-depend
   types (`A|B`, `A&B`) are still recorded as references but deliberately don't seed tracking —
   same "don't guess" stance as the rest of the parser's variable tracking.
 
-- [ ] **Return-type-based inference isn't attempted.** `$x = SomeFactory::make();` where `make()`
-  has a declared `: My_Class` return type — not tracked. Would require correlating a call's
-  target function/method definition with its return type, which means either a second pass
-  (defs must be fully collected first) or forward-declaration-order dependence. Bigger lift than
-  anything above; not started.
+- [x] **Return-type-based inference wasn't attempted.** `$x = SomeFactory::make();` where `make()`
+  has a declared `: My_Class` return type fell back to the unscoped pool the same way an
+  unresolvable assignment always does. Fixed, following the same deferred-resolution shape as the
+  property-type fix (the "second pass" this item called for, rather than forward-declaration-
+  order dependence):
+  - **`FunctionDef::$returnType`**: new `PhpTokenParser::parseReturnTypeHint()` resolves a
+    declared `: ReturnType` the same "only trust a single unambiguous type" way `collectParamTypeHint`
+    already does for parameters (`self`/`static` resolved against the owner class, nullable's `?`
+    not counted as a second segment, any union/intersection — counting `array`/`callable` toward
+    ambiguity too, even though they can never resolve to a class themselves — left unresolved
+    rather than guessed at).
+  - **`PendingReturnTypedCall`**: `$x = <call>;` recognized as the *entire* RHS — `Foo::method()`,
+    `self::`/`parent::`/`static::method()`, `$this->method()`, or a bare `helper_fn()` (new
+    `scopedOrBareCallRhs`, mutually exclusive with the existing `new ClassName()` tracking on the
+    same variable) — records the call's own target instead of resolving inline, since `make()`'s
+    declaration is routinely in a different file's parse than this call site.
+  - `ClassAnalyzer::findUnusedMethods` merges every file's method/function return types first,
+    then resolves each pending call against it, feeding a match straight into `$scopedCalled` —
+    every existing exemption mechanism applies to it for free, same as the property-type fix.
+  - **Precision-preserving fallback, caught by running the existing test suite, not by guessing
+    up front**: when a pending call's source doesn't resolve (unknown function, no declared
+    return type, a union type, ...), it now degrades to the same unscoped `$called` pool the call
+    would have landed in before this feature existed — this had to be added explicitly in both
+    `ClassAnalyzer` *and* `FunctionAnalyzer` (which builds its own, separate `$called` map and
+    doesn't care about classes at all), since without it, moving this shape out of the parser's
+    generic `$functionCalls` output entirely would have silently made a same-named real function
+    or method newly (and wrongly) look unused — a real regression the existing
+    `testReassignedLocalVariableInvalidatesTrackedType` test caught immediately.
+  - Ran against the full theme test corpus: zero finding-count changes (declared return types do
+    exist there — e.g. Hello Elementor's `includes/module-base.php` — just not combined with the
+    exact `$x = Class::method(); $x->method();` chain in this particular sample); same
+    prospective-value situation as the generated contract-methods stub.
 
 - [ ] **Local variable tracking has no control-flow awareness** (documented in-code at the
   `$var = new ClassName()` assignment branch in `PhpTokenParser::parse`, not a bug — a
@@ -87,9 +223,53 @@ scope limit that trades recall or precision for staying a single-pass, no-depend
   only tracks whichever assignment is last in source order, not "could be either." Fixing this
   properly means real branch-aware dataflow analysis, out of scope for a token-based parser.
 
-- [ ] **`BASE_CLASS_CONTRACT_METHODS`/`INTERFACE_CONTRACT_METHODS` (`ClassAnalyzer`) are hand-curated, not generated from WP core** the way `WpCoreHooks` is from `tools/generate-wp-hooks-stub.php`. Found while fixing a false-positive `UnusedMethod` on a class extending `Walker_Nav_Menu` (added to the curated list by hand) — the same gap exists for every other WP core base class designed for subclassing that isn't already on the list.
-  - Harder than the hooks case: a `do_action()`/`apply_filters()` call in core is an unambiguous fact (that string IS a hook), but "this method is a template method WP core dispatches polymorphically on a subclass" has no equivalent literal marker in core source — no mechanical way to distinguish an override-intended method from an ordinary internal helper that just happens to be called via `$this->` too.
-  - Fix shape: scan WP core with the project's own `PhpTokenParser`/`ScopedMethodCall` machinery for methods invoked as `$this->method()` from *within another method of the same class* — that's the actual "dispatches on self, possibly the subclass" signature `Walker`/`WP_Widget`/`WP_REST_Controller` all share. Over-broad relative to the current list (would likely pull in some internal helpers not really meant for override), but that trade-off already exists by design elsewhere in this file (favor false negatives over false positives) — would need spot-checking against real WP core output before trusting it unattended the way the hooks generator is.
+- [x] **`BASE_CLASS_CONTRACT_METHODS` (`ClassAnalyzer`) was hand-curated only, not generated from
+  WP core** the way `WpCoreHooks` is from `tools/generate-wp-hooks-stub.php` — every WP core base
+  class designed for subclassing had to be discovered and added by hand as a real-world false
+  positive turned it up (found while adding `Walker_Nav_Menu` to the list). Fixed additively,
+  never replacing the hand list:
+  - New **`tools/generate-wp-contract-methods-stub.php`**, using exactly the fix shape this item
+    originally sketched: scans real WP core (`wp-admin`/`wp-includes`, minus bundled third-party
+    libraries — Requests, PHPMailer, SimplePie, ID3, IXR, a Text_Diff renderer, sodium_compat,
+    the vendored AI-client SDK, and `class-avif-info.php`'s own generically-named internal `Box`/
+    `Parser` classes specifically, since nothing else got caught by the directory-level
+    exclusions) with the project's own `PhpTokenParser`/`ScopedMethodCall` machinery, for exactly
+    the signature described: a `public` method WP core declares on a class *and* calls via
+    `$this->method()` from elsewhere in that same class's own body — the actual "dispatches on
+    self, possibly a subclass" mechanism `WP_Widget`/`Walker`/`WP_Customize_Control` (and ~200
+    others) all share.
+  - Also filters out a WP-core naming *convention* this only surfaced once real output was
+    inspected: a single leading underscore (`_get_display_callback()`, `_register_one()`, ...) is
+    WP core's own long-standing "internal, don't touch, even though PHP visibility says public"
+    signal — real methods, self-dispatched exactly the way this tool looks for, but never a real
+    override point. Caught by spot-checking `WP_Widget`'s own generated entry against the
+    already-known-correct hand list, exactly the "would need spot-checking before trusting it
+    unattended" step this item called for up front.
+  - New **`ContractMethodStub`/`WpCoreContractMethods`** (mirrors `HookStub`/`WpCoreHooks`'
+    shape) — `ClassAnalyzer::isContractMethod()` now checks both
+    `BASE_CLASS_CONTRACT_METHODS` (still the fast, 100%-vetted path — unchanged, untouched) *and*
+    the generated stub at every level of the extends-chain walk, taking either match. Deliberately
+    additive rather than a replacement: the over-broad risk this item flagged up front (an
+    internal helper that merely happens to be self-dispatched, not really meant for override)
+    only ever costs a missed "unused method" warning on a class the hand list doesn't already
+    cover — it can never suppress a finding the hand-curated list would otherwise have caught,
+    since a match on *either* list already short-circuits to "used."
+  - Confirmed complementary value, not just duplication: `Walker`'s generated entry only finds 6
+    of the hand list's 9 known contract methods (missing `walk`/`paged_walk`/
+    `get_number_of_root_elements` — those are called by WP core from *outside* the class, e.g.
+    `wp_nav_menu()` calling `$walker->walk(...)`, never self-dispatched from within `Walker`'s own
+    body, so this specific heuristic can't see them — an inherent limit of "self-dispatch," not a
+    bug), while `WP_Customize_Control`'s generated entry adds four real override points
+    (`get_link`, `input_attrs`, `link`, a second `json`) the hand list didn't have at all. Ran
+    against this project's whole 8-theme test corpus (astra, blocksy, generatepress, hello-biz,
+    hello-elementor, kadence, oceanwp, swiftqueue) — zero finding-count changes, since none of
+    them happen to extend the ~200 newly-covered classes the hand list didn't already name;
+    the value is prospective (the next theme that does), not something this pass could confirm
+    fixed a currently-known false positive the way most other items in this file were.
+  - `INTERFACE_CONTRACT_METHODS` (`ArrayAccess`, `Iterator`, `Countable`, ...) deliberately left
+    untouched — those are built-in *PHP language* interfaces, not WP core ones, so there's no WP
+    core source to scan for them in the first place; this tool only ever targeted the base-class
+    half of the original complaint.
 
 - [ ] **Namespaced static calls aren't scoped.** `Some\Namespace\Foo::method()` — the receiver-token
   branches that resolve `self::`/`parent::`/`Foo::` (in the `T_STRING` branch of the main loop)
@@ -151,18 +331,39 @@ scope limit that trades recall or precision for staying a single-pass, no-depend
   have solved the actual problem, just added a heavy, BC-unstable-internals dependency to a
   currently zero-runtime-dependency tool for a job plain Reflection already does.
 
+## Reporting
+
+- [x] **A method belonging to a class already reported `UnusedClass` was reported again,
+  individually, as `UnusedMethod`** — redundant once the class-level finding already says
+  nothing in it is reachable. Fixed: `ClassAnalyzer::analyze()` takes
+  `$suppressUnusedClassMethods` (default `true`; CLI: `--no-suppress-unused-class-methods` to
+  see both) and drops a method finding whenever its owner class is already in the current scan's
+  unused-class set. Off by default risk: a false-positive `UnusedClass` (e.g. the
+  WP-CLI-registered or `Walker`/`WP_Widget`-subclass shapes documented above, before their
+  dedicated fixes) would have compounded — hiding N real `UnusedMethod` findings underneath one
+  wrong class-level one. Both of the confirmed false-positive shapes found in the Astra theme
+  during this pass are now fixed at the source instead, so the compounding risk is lower than
+  when the flag was designed, but the flag (default-on, escape hatch available) was kept as the
+  agreed design rather than re-litigated after the fact.
+
 ## Suggested priority if picked back up
 
-Items 1-3 below are done (see checked items above). Remaining, in rough priority order:
+Items checked above are done. Remaining, in rough priority order:
 
-1. Property types (`$this->service = new My_Service(); $this->service->render();`) — biggest
-   remaining precision gap for typical WP OOP code (service/collaborator properties set in the
-   constructor, used elsewhere in the class).
-2. Class names passed as bare strings to WP APIs (`register_widget('My_Widget')`,
-   `class_exists('My_Class')`) and dynamic instantiation (`new $class()`) — both false-negative
-   sources on the class-unused check specifically.
-3. Everything else — return-type inference, control-flow awareness, namespaced calls — is
-   progressively more work for progressively rarer real-world patterns in typical WordPress code.
+All of the class/method-detection items in this file are now fixed except the deliberately-
+accepted scope limits (bare-string class references' general case is covered, but truly dynamic/
+concatenated class names remain unresolvable by design; local variable tracking's lack of
+control-flow awareness; namespaced calls). Every item in the Function detection and Hook &
+template tag detection sections below is fixed too, except the ones explicitly marked as
+deliberately out of scope (a suffix-only template-part slug — no real WP convention motivates it).
+
+What's left is only the items already documented throughout this file as deliberate, accepted
+scope limits — the Blade/Acorn convention-based template gaps (Template detection, above),
+dynamic instantiation via a concatenated/computed class name, control-flow-aware variable
+tracking, namespaced static calls, `spl_autoload_register()` class maps, and the rest. None of
+these are "next to fix" so much as "not worth the precision/complexity trade-off for how rarely
+they occur in typical WordPress code" — picking any back up should start by re-reading its own
+entry above rather than this summary, since each one's trade-off reasoning is spelled out there.
 
 # File Detection — Open Issues
 
@@ -275,52 +476,152 @@ way the class/method/file gaps above were found; nothing here has been fixed yet
 
 ## Function detection
 
-- [ ] **Namespaced/fully-qualified function calls are invisible to `FunctionAnalyzer`.** The only
-  call-detection branch in `PhpTokenParser::parse` fires on `T_STRING`; a call like
+- [x] **Namespaced/fully-qualified function calls were invisible to `FunctionAnalyzer`.** The
+  only call-detection branch in `PhpTokenParser::parse` fired on `T_STRING`; a call like
   `Foo\Bar\my_helper()` or `\My\Ns\init()` tokenizes as `T_NAME_QUALIFIED`/
-  `T_NAME_FULLY_QUALIFIED`, and the main loop's per-token dispatch never checks those types for
-  call purposes at all (only in class-name contexts — `new`, `extends`/`implements`,
-  `instanceof`, via `CLASS_NAME_TOKENS`) — the token is silently skipped, not even reaching the
-  `'('`-lookahead that would otherwise register a `FunctionCall`. Note the parser is
-  namespace-*blind*, not namespace-*broken*: a same-namespace unqualified call (`my_helper();`
-  from inside `namespace Foo;`) still matches its bare-name `FunctionDef` fine, since neither side
-  tracks namespace context. It's specifically a cross-namespace or fully-qualified call to a real
-  function that makes that function look unused. Matters for namespaced procedural helpers (Sage-
-  style theme scaffolds, modern plugins mixing namespaces with plain functions) — the same root
-  cause as the already-documented "Namespaced static calls aren't scoped" gap above, just hitting
-  plain functions instead of methods.
-  - Fix shape: extend the main loop's call-detection to also fire on `T_NAME_QUALIFIED`/
-    `T_NAME_FULLY_QUALIFIED` (mirroring the `T_STRING` branch's `'('`-lookahead), resolving to the
-    unqualified tail (`shortClassName()`-style trim) so it still matches the bare-name
-    `FunctionDef` the same namespace-blind way unqualified calls already do.
+  `T_NAME_FULLY_QUALIFIED`, and the main loop's per-token dispatch never checked those types for
+  call purposes at all — the token was silently skipped, not even reaching the `'('`-lookahead
+  that would otherwise register a `FunctionCall`, making a real, called function look unused.
+  Fixed exactly per the fix shape below: the existing `T_NAME_QUALIFIED`/`T_NAME_FULLY_QUALIFIED`
+  block (added earlier for the `::` receiver case — `\SwiftQueue\License_Bridge::initialize()`)
+  now also checks for `'('` and registers a `FunctionCall` resolved to the unqualified tail via
+  `shortClassName()` — consistent, not just convenient, since a function can only ever be
+  *declared* with a bare name in PHP (the enclosing `namespace` block carries the namespace, never
+  the declaration's own name token), so `FunctionDef` was already just as namespace-blind on the
+  definition side.
+  - Deliberately narrower than the `T_STRING` branch: WP's own hook/template/glob/`define`/
+    existence-check special-cased function names (`add_action`, `get_template_part`, `glob`,
+    `class_exists`, ...) aren't given the same special-case dispatch here. Found while
+    implementing this: a fully-qualified call to one of *those* — `\add_action(...)`, a realistic
+    pattern in namespaced WP code that explicitly opts out of the current namespace for a global
+    core function — is **also** presently invisible to hook/template/glob detection specifically
+    (not just `FunctionAnalyzer`), completely independent of this fix (it was already exactly as
+    invisible before). Not fixed here — genuinely out of scope for what this item asked for, and
+    not yet documented anywhere else, so recorded as its own new item just below rather than
+    silently left to be rediscovered.
+  - Also confirmed (not a new bug, pre-existing and unrelated): `new Foo\Bar()`/`new Foo()` were
+    already adding the bare class name to `$functionCalls` too, a coincidental cross-contamination
+    between the class-reference and function-call pools that predates this fix entirely — the new
+    qualified-name handling is consistent with that existing behavior, not introducing a new
+    instance of it.
+
+- [x] **WP core's own hook/template/glob/`define`/existence-check functions weren't recognized
+  when called via a namespaced or fully-qualified name.** `\add_action(...)`,
+  `\get_template_part(...)`, `\Foo\Bar\class_exists(...)` inside a namespaced file that explicitly
+  opts out of the current namespace for a WP core global — the large `T_STRING`-only dispatch
+  block that recognizes these specific function names by string comparison
+  (`HOOK_REGISTER_FUNCS`, `HOOK_INVOKE_FUNCS`, `TEMPLATE_FUNCS`, `glob`/`scandir`, `define`,
+  `EXISTENCE_CHECK_FUNCS`) never ran for a `T_NAME_QUALIFIED`/`T_NAME_FULLY_QUALIFIED` token, so
+  a real hook registration/invocation, template-part reference, bulk-include glob, or
+  redeclaration guard called this way was silently invisible to `HookAnalyzer`/
+  `TemplateAnalyzer`/`FileAnalyzer` alike. Fixed exactly per the fix shape below:
+  - The whole dispatch block (previously inline in the `T_STRING` branch) is now
+    `dispatchBareFunctionCall()`, a shared private method taking the call's already-resolved name
+    — the bare value for a `T_STRING` call, or the unqualified tail (`shortClassName()`) for a
+    qualified one — plus every accumulator array it mutates (hook registrations/invocations,
+    template refs, glob dirs, defined constants, ...), most by reference. Both the `T_STRING`
+    branch and the qualified-name branch now call it, so a WP core function reached either way is
+    recognized identically, with no duplicated dispatch logic to keep in sync.
+  - Confirmed the resulting cross-contamination (a `define()`/`add_action()`'s own string
+    arguments *also* landing in the generic `$functionCalls` pool, since nothing suppresses them
+    the way `EXISTENCE_CHECK_FUNCS` explicitly does) is identical, pre-existing behavior for the
+    plain non-qualified call shape too — not a new regression introduced by sharing the dispatch,
+    just newly visible because a test's first draft wrongly assumed otherwise.
+  - Caught by phpstan, not by guessing: extracting the dispatch into its own method turned
+    `$line`'s type from an inferred `int` (destructured from the `Token` phpstan-type in the outer
+    scope) into an explicit `string|int` parameter (matching the same loose typing
+    `parseHookRegistration` and its siblings already declared) — losing the narrowing that let
+    `new FunctionCall($name, $line, $file)` type-check before. Fixed with the same `(int) $line`
+    cast every other constructor in this method already uses.
 
 ## Hook & template tag detection
 
-- [ ] **A hook or template-part tag held in a variable/constant resolves to nothing.**
-  `$hook = 'my_plugin_loaded'; do_action($hook);`, `do_action(self::HOOK_NAME)`, or
-  `get_template_part($dynamic_slug)` — `extractStringArgAt`/`classifyArgTokens` only look at the
-  literal tokens directly inside the call's argument; there's no lightweight value-tracking for
-  string variables/constants the way `$varTypesStack` already tracks object types for method
-  scoping. The argument comes back fully dynamic (empty tag, no prefix), so a real, literal
-  `add_action('my_plugin_loaded', ...)` registration elsewhere in the project reports as
-  unmatched, and a real `template-parts/hero.php` file looks unused. Shared root cause across
-  `HookAnalyzer` and `TemplateAnalyzer` since both consume the same `extractStringArgAt` parser
-  output.
-  - Fix shape: reuse the existing `$varTypesStack`-style scoping infrastructure, but for string
-    literals instead of `new ClassName()` — `$var = 'literal'` seeds the scope, consulted when
-    that variable is later passed as a hook/template-part argument. Class constants
-    (`self::HOOK_NAME`) would need a separate, smaller lookup (constant name → literal value,
-    collected in the same pass) since they're not scope-local the way a variable is.
+- [x] **A hook or template-part tag held in a variable resolved to nothing** —
+  `$hook = 'my_plugin_loaded'; do_action($hook);` or `get_template_part($dynamic_slug)` came back
+  fully dynamic (empty tag, no prefix), so a real, literal `add_action('my_plugin_loaded', ...)`
+  registration elsewhere in the project reported as unmatched, and a real
+  `template-parts/hero.php` file looked unused. Fixed per the sketched fix shape, for the
+  *variable* half of this item (constants are a separate, still-open item just below):
+  - New `$varLiteralValueStack`, last-write-wins exactly like `$varTypesStack` but for a string
+    value instead of a class name — `$var = 'literal';` seeds it (reusing the same
+    `singleStringLiteralRhs` check that already feeds the accumulating
+    `$varLiteralAssignmentsStack` for the unrelated return-value-resolution feature; deliberately
+    a *separate* stack rather than reusing that one, since accumulating every literal ever
+    assigned — right for "what might this function return across every branch" — is the wrong
+    semantics for "what does this variable's value actually resolve to right here").
+  - `classifyArgTokens` (via `extractStringArgAt`, threaded through
+    `parseHookRegistration`/`parseHookInvocation`/`parseCronScheduleHook`/`parseTemplateRef`) now
+    also recognizes a bare single-variable argument and resolves it against the current scope's
+    map — a resolved variable is treated exactly like a literal directly in the call, so every
+    existing consumer (`HookAnalyzer`, `TemplateAnalyzer`, `generate-stubs`) benefits without its
+    own separate change.
+  - Confirmed real-world (not just theoretical) in the Blocksy theme:
+    `inc/components/woocommerce/archive/product-card.php` builds `$action_to_hook` across several
+    conditional branches (`'init'`, then reassigned to `'elementor/editor/init'` inside an
+    Elementor-editor-context check) before `add_action($action_to_hook, ...)` — previously
+    invisible to `HookAnalyzer` entirely; now correctly resolves to (whichever assignment is
+    textually last, the same no-control-flow-awareness trade-off `$varTypesStack` already
+    accepts) `'elementor/editor/init'` and reports it as unmatched, the same as every other
+    external-plugin hook already in that report.
+  - Updated three existing tests whose whole premise was the old "always fully dynamic" behavior
+    for this exact shape (`PhpTokenParserTest`, `HookAnalyzerTest`, `GenerateStubsTest`) — each
+    now also has a companion test confirming a *genuinely* unresolvable variable (assigned from a
+    function call, not a literal) still falls back to the old dynamic/skipped behavior correctly.
 
-- [ ] **Dynamic hook segment *before* the literal part isn't caught.** `classifyArgTokens` only
-  recognizes a resolvable *prefix* when the literal comes first (`'foo_' . $x` or
-  `"foo_{$x}"`); `do_action("{$this->id_base}_widget_updated")` — dynamic first, literal
-  suffix — yields no prefix at all, so any literal registration in that hook family always
-  reports unmatched. Rarer than the literal-first case in practice, since WP convention
-  overwhelmingly puts the static/plugin-specific prefix first and the dynamic per-instance part
-  last, but does occur (e.g. per-widget-ID or per-post-type hook naming).
-  - Fix shape: `classifyArgTokens` would need a fourth case mirroring the existing "literal +
-    concat" case, but checking the *last* token instead of the first two — same shape as the
-    `findTrailingStringLiteral` helper already introduced for `glob()`/include paths above,
-    just returning a literal *suffix* instead of treating the whole trailing segment as the
-    payload.
+- [x] **A hook or template-part tag held in a class constant resolved to nothing.**
+  `do_action(self::HOOK_NAME)` — fixed per the sketched fix shape:
+  - New `$classConstants` (class name => constant name => literal value), populated by a new
+    `parseClassConstants()` triggered on `T_CONST` directly inside a class/interface/trait/enum
+    body (same brace-depth guard already used for the in-class-body trait `use` case) — file-
+    scoped/flat, populated live as the file scans, same trade-off as the existing `$definedConstants`
+    (for `define()`) it directly mirrors. Handles multiple comma-separated constants per
+    statement (`const A = 'x', B = 'y';`); deliberately doesn't attempt PHP 8.3+ typed constants
+    (`const string NAME = ...`) — rare enough in current WP code that guessing which token is the
+    type versus the name risked misparsing an untyped one by mistake.
+  - `classifyArgTokens` now also recognizes a bare `self`/`static`/`parent`/`Foo::CONST_NAME`
+    argument shape (three tokens: receiver, `T_DOUBLE_COLON`, name) and resolves it against
+    `$classConstants`, `self`/`static` resolved to whichever class the call is physically inside,
+    `parent` to that class's own `extends` target — same resolution logic used everywhere else in
+    this parser for a `::` receiver, just reached from inside argument-classification instead of
+    the main token loop. Threaded through `parseHookRegistration`/`parseHookInvocation`/
+    `parseCronScheduleHook`/`parseTemplateRef` alongside the variable-value map from the item
+    above, so `HookAnalyzer`/`TemplateAnalyzer`/`generate-stubs` all benefit without their own
+    separate change, the same way the variable fix did.
+  - Bug caught while first writing this: comparing the receiver-to-constant separator token
+    directly against the bare string `'::'` — like `->` before it, `::` tokenizes as
+    `T_DOUBLE_COLON` (an array token), not a plain string, so the naive comparison would have
+    silently matched nothing. Caught this time by checking the existing `findScopedCallTarget`
+    precedent *before* writing the comparison, rather than by a failing test afterward.
+  - Confirmed end-to-end (parser-level tag resolution, `HookAnalyzer` reporting a
+    constant-resolved registration as correctly unmatched, and `TemplateAnalyzer` not flagging a
+    constant-referenced template part) before writing the regression suite. Not yet observed
+    turning up a new real-world finding in this project's own theme test corpus (unlike the
+    variable case, which caught a real one in Blocksy) — consistent with this being the rarer of
+    the two patterns, as expected going in.
+
+- [x] **Dynamic hook segment *before* the literal part wasn't caught.** `classifyArgTokens` only
+  recognized a resolvable *prefix* when the literal came first (`'foo_' . $x` or `"foo_{$x}"`);
+  `do_action("{$this->id_base}_widget_updated")` — dynamic first, literal suffix — yielded no
+  prefix at all, so any literal registration in that hook family always reported unmatched.
+  Fixed exactly per the fix shape below:
+  - `classifyArgTokens`'s return tuple grew a 4th element (literal suffix, alongside the existing
+    tag/isDynamic/prefix), populated by two new cases mirroring the existing prefix ones but
+    checking the *last* two tokens instead of the first two: `$dynamic . 'literal_suffix'`
+    (concatenation) and `"...{$expr}literal_suffix"` (an interpolated string ending in a literal
+    segment right before the closing quote — doesn't need to understand what precedes it, a
+    property access, a function call, several concatenated variables, whatever). Checked only
+    after the prefix cases already had their chance, so a tag with *both* a literal prefix and
+    suffix (rare — e.g. `"foo_{$x}_bar"`) still credits the prefix, the same "first match wins,
+    don't over-engineer" stance the rest of this method already takes.
+  - New `HookInvocation::$tagSuffix` (the mirror of the existing `$tagPrefix`), threaded through
+    `parseHookInvocation`/`parseCronScheduleHook`; `HookRegistration` deliberately untouched — the
+    prefix/suffix mechanism only ever exists to rescue a *literal* registration from looking
+    unmatched when what fires it is dynamic, so it only ever needed to live on the firing
+    (`do_action`/`apply_filters`) side, same asymmetry the existing prefix mechanism already has.
+  - `HookAnalyzer` builds a `$firedSuffixes` set alongside its existing `$firedPrefixes` one and
+    checks `str_ends_with()` the same way `matchesAnyPrefix()` already checks `str_starts_with()`.
+  - Deliberately scoped to hooks only, not template-part slugs — `TemplateAnalyzer`'s equivalent
+    prefix case exists for a real WP convention (`get_template_part("variants/$variant")`, general
+    directory before a dynamic filename), but a *suffix*-only template slug (dynamic first,
+    literal last) isn't an idiomatic WP naming shape the TODO item or any real example called for,
+    so no matching change was made there.

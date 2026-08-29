@@ -43,6 +43,19 @@ final class FunctionAnalyzer
             }
         }
 
+        // $var = someCall(); $var->render(); — before PendingReturnTypedCall existed, this always
+        // landed directly in $functionCalls above, regardless of whether someCall()'s return type
+        // was ever resolvable; ClassAnalyzer now resolves it against a declared return type when
+        // it can, but this analyzer doesn't care about classes at all — it just needs the same
+        // "credit the name, unconditionally" behavior it always had, so a same-named plain
+        // function isn't newly (and wrongly) reported unused now that this shape has its own
+        // dedicated tracking instead of folding into $functionCalls at the parser level.
+        foreach ($parseResults as $result) {
+            foreach ($result->pendingReturnTypedCalls as $call) {
+                $called[$call->readMethod] = true;
+            }
+        }
+
         // Report defined-but-never-called
         $findings = [];
         foreach ($definitions as $name => $def) {

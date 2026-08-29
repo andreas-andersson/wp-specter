@@ -50,6 +50,61 @@ final class TemplateAnalyzerTest extends TestCase
         self::assertEmpty($findings);
     }
 
+    public function testDoesNotReportTemplatePartReferencedThroughAVariableSlug(): void
+    {
+        // $slug = 'template-parts/hero'; get_template_part($slug); -- the variable's last-known
+        // literal value resolves the slug exactly the same way a literal directly in the call
+        // already would.
+        $themeDir = $this->tmp;
+        $part = $this->touch('template-parts/hero.php');
+        $main = $this->writeCode("<?php
+\$slug = 'template-parts/hero';
+get_template_part( \$slug );
+");
+
+        $findings = $this->analyzer->analyze([$part, $main], WpMode::Classic, $themeDir);
+
+        self::assertEmpty($findings);
+    }
+
+    public function testDoesNotReportTemplatePartReferencedThroughAClassConstantSlug(): void
+    {
+        // const SLUG = 'template-parts/hero'; get_template_part(self::SLUG); -- resolves the same
+        // way a literal directly in the call already would.
+        $themeDir = $this->tmp;
+        $part = $this->touch('template-parts/hero.php');
+        $main = $this->writeCode('<?php
+class My_Theme {
+    const SLUG = "template-parts/hero";
+    public function render() {
+        get_template_part( self::SLUG );
+    }
+}
+');
+
+        $findings = $this->analyzer->analyze([$part, $main], WpMode::Classic, $themeDir);
+
+        self::assertEmpty($findings);
+    }
+
+    public function testDoesNotReportTemplatePartReferencedThroughANamespaceQualifiedCall(): void
+    {
+        // Sub\get_template_part(...) -- a namespaced or fully-qualified call, invisible to
+        // template detection entirely before this fix (not just FunctionAnalyzer).
+        $themeDir = $this->tmp;
+        $part = $this->touch('template-parts/hero.php');
+        $main = $this->writeCode('<?php
+namespace My_Theme;
+function render() {
+    Sub\get_template_part( "template-parts/hero" );
+}
+');
+
+        $findings = $this->analyzer->analyze([$part, $main], WpMode::Classic, $themeDir);
+
+        self::assertEmpty($findings);
+    }
+
     public function testExemptsWpHierarchyTemplatesInClassicMode(): void
     {
         $themeDir = $this->tmp;
