@@ -82,9 +82,9 @@ if ( ! function_exists( 'my_helper' ) ) {
         // Only a function declared DIRECTLY inside its own matching guard is exempted — a
         // same-named function declared plainly elsewhere (no guard at all) must still be
         // evaluated normally.
-        $file = $this->write("<?php
+        $file = $this->write('<?php
 function my_helper() {}
-");
+');
         $findings = $this->analyzer->analyze([$file]);
         self::assertCount(1, $findings);
         self::assertSame('my_helper', $findings[0]->name);

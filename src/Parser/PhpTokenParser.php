@@ -338,8 +338,15 @@ final class PhpTokenParser
                             if ($hasInclude && $defIndex !== null) {
                                 $d = $functionDefs[$defIndex];
                                 $functionDefs[$defIndex] = new FunctionDef(
-                                    $d->name, $d->line, $d->file, $d->isMethod, $d->ownerClass,
-                                    $d->returnType, guarded: $d->guarded, fqcn: $d->fqcn, hasIncludeInBody: true,
+                                    $d->name,
+                                    $d->line,
+                                    $d->file,
+                                    $d->isMethod,
+                                    $d->ownerClass,
+                                    $d->returnType,
+                                    guarded: $d->guarded,
+                                    fqcn: $d->fqcn,
+                                    hasIncludeInBody: true,
                                 );
                             }
                         }
