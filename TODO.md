@@ -331,6 +331,46 @@ scope limit that trades recall or precision for staying a single-pass, no-depend
   have solved the actual problem, just added a heavy, BC-unstable-internals dependency to a
   currently zero-runtime-dependency tool for a job plain Reflection already does.
 
+- [x] **A real plugin's own `ABSPATH` "no direct access" guard could silently kill the entire
+  scan process, with no error at all — not a detection gap, a scan-reliability bug.** Found by
+  switching the test corpus from themes to real plugins and running wp-specter against a real
+  WooCommerce checkout: `wp-specter scan woocommerce` printed only the header (path/mode/file
+  count) and then nothing — no findings, no summary, no error, exit code 0, looking exactly like
+  a clean "all clear" run despite `--type=classes` alone reproducing it in under 2 seconds.
+  Root cause: `VendorClassReflector::classHasMethod()`'s `class_exists($className)` triggers
+  Composer's autoloader on whatever PSR-4 file declares that class — and `defined('ABSPATH') ||
+  exit;`, WordPress's ubiquitous "no direct access" convention, sits at the top of 927 files in
+  that one WooCommerce checkout alone, including
+  `Automattic\WooCommerce\Admin\API\Reports\Query`, which is *also* part of WooCommerce's own
+  Composer PSR-4 map — reached while `isContractMethod()` was resolving a completely unrelated
+  extends chain, having nothing to do with that class itself. `exit()` isn't a catchable
+  `\Throwable`, so the existing per-path `try/catch \Throwable` wrapping (added for exactly this
+  class of vendor-code risk) couldn't help — the bare `exit;` terminates the whole PHP process
+  immediately, mid-scan, with exit code 0 and zero output, which is what made this so easy to
+  mistake for "the tool succeeded and found nothing" rather than "the tool silently died."
+  Reproduced in complete isolation down to two lines (`require 'vendor/autoload.php';
+  class_exists('Automattic\WooCommerce\Admin\API\Reports\Query');` — the second line's `echo`
+  right after it never runs) before touching any wp-specter code, to be certain of the exact
+  mechanism rather than guessing from the symptom alone.
+  - Fixed: `VendorClassReflector::isAvailable()` now defines `ABSPATH` (to an arbitrary
+    non-empty placeholder, `'/'` — nothing reachable here is expected to call a real WordPress
+    function that would depend on its actual value) before the very first `require_once`, so
+    every subsequent autoload this reflector triggers — the initial "files"-autoload entries
+    *and* any class lazily autoloaded later via `class_exists()` in `classHasMethod()` — sees it
+    already defined and never takes the `|| exit` branch.
+  - Deliberately narrow: this neutralizes the single most common instance of this class of guard
+    (confirmed as the *only* guard pattern found across all 7 real plugins in the new test
+    corpus, and by far the most common — 927 files in WooCommerce alone, vs. a handful in
+    Elementor/Jetpack/Smush and zero in Akismet/CF7/Wordfence), not every conceivable
+    direct-access check a plugin's vendor code might make. A fully robust fix would isolate
+    vendor-autoload loading and reflection in a separate process so *any* hard exit there
+    couldn't take the main scan down with it — not attempted here, since the `ABSPATH` guard
+    alone already accounts for every real failure found across the whole new corpus.
+  - Verified against all 7 plugins in the new corpus post-fix: every one now completes with a
+    real, non-empty findings summary (previously silent/incomplete only for WooCommerce, since
+    it's the only one of the seven whose vendor tree happens to be reachable from an
+    extends/implements chain wp-specter's own scan actually walks).
+
 ## Reporting
 
 - [x] **A method belonging to a class already reported `UnusedClass` was reported again,
@@ -380,6 +420,60 @@ not shipped bugs.
   list empty — most themes/plugins don't declare their own, and this analyzer already runs once
   per scan target, so it's a no-op for them, not an error.
 
+- [x] **A plugin that ships `vendor/` but no `composer.json` of its own has none of the above
+  to read, yet every dependency class is still genuinely autoloaded — false positives.**
+  Real-world case (WooCommerce): `composer.json` is dev-only tooling stripped from the shipped
+  plugin zip, but `vendor/` ships anyway; `FileAnalyzer::isCandidate` had nothing to exempt
+  `src/*.php` with, so every PSR-4-autoloaded class under `src/` (e.g.
+  `Automattic\WooCommerce\Internal\Admin\Marketing\MarketingCampaign`) was flagged
+  `UnusedFile`. Fixed: `FileAnalyzer::loadGeneratedComposerAutoload` additionally reads
+  Composer's own *generated* `vendor/composer/autoload_psr4.php`,
+  `autoload_namespaces.php` (legacy PSR-0), `autoload_classmap.php`, and `autoload_files.php` —
+  each a plain `return array(...)` file Composer itself keeps fully resolved and merged across
+  the *whole* dependency tree (unlike `composer.json`, which only ever has the top-level
+  package's own declared rules) — and folds their entries into the same `$autoloadDirs`/
+  `$autoloadFiles` lists the `composer.json` path already populates. `include`d directly rather
+  than parsed: each file only computes two local path variables (`$vendorDir`/`$baseDir`) from
+  its own location and has no other side effects, so there's nothing here for a JSON parse or
+  `PhpTokenParser` pass to buy over just letting PHP evaluate the `return`. Verified against the
+  real corpus: WooCommerce's `MarketingCampaign.php` false positive is gone, and all 7 real
+  plugins in the test corpus (akismet, contact-form-7, elementor, jetpack, woocommerce,
+  wordfence, wp-smushit) still scan clean (no crashes, no regressions) post-fix.
+
+- [x] **Every Composer-mapped file above was exempted wholesale — being autoloadABLE isn't proof
+  a class is actually used.** Raised directly: "just because a file can be autoloaded does not
+  mean it is used." Fixed for the case where it's actually sound: PSR-4/classmap dirs/files
+  resolving OUTSIDE `$rootDir/vendor/` (`$projectAutoloadDirs`/`$projectAutoloadClassFiles`) are
+  the scanned project's OWN first-party code laid out for Composer's class loader instead of a
+  literal `include()`/`require()` — exactly what this analyzer exists to check, unlike a genuine
+  third-party dependency under `vendor/` (still blanket-exempted; auditing a dependency's own
+  internal dead code is out of scope). `isProjectAutoloadedClassUsed()` now requires the mapped
+  class's short name (a classmap entry's own array key, or a PSR-4/psr-0 file's own basename —
+  the same filename-equals-class-name rule PSR-4 autoloading itself depends on, so trustworthy
+  here unlike the spl_autoload_register case below) to actually appear in
+  `$referencedClassNames`, built the same way `ClassAnalyzer::findUnusedClasses` already builds
+  its own version of this set: every `PhpTokenParser`-tracked `$classReferences` entry, PLUS
+  every string literal in `$result->functionCalls` (needed for WP's bare-string class
+  registration pattern — WooCommerce's own `Init.php` hands an array of FQCNs to a generic
+  "instantiate each of these" REST-controller loop; without this fallback,
+  `MarketingCampaigns`/`MarketingCampaignTypes` false-positived the moment real-usage-proof
+  replaced the blanket pass). Two more corpus-driven fixes to the vendor/project split itself:
+  (1) some plugins vendor a dependency *outside* `vendor/` via php-scoper/Mozart/Strauss-style
+  prefixing (WooCommerce bundles GraphQL, Symfony Polyfill, League/ISO3166, Pelago/Emogrifier,
+  and PSR/Container under `lib/packages`, mapped through the PSR-4 prefix
+  `Automattic\WooCommerce\Vendor\`) — `isVendorPrefixedNamespace()` additionally treats any PSR-4
+  prefix with a literal `Vendor\` segment (Mozart's own documented default convention) as
+  vendor-like regardless of physical path, else all 26 of those files false-positived at once;
+  (2) composer.json's own classmap/psr-4 entries are always project-own by construction (a
+  package only ever declares its own layout in its own composer.json) except this same
+  Vendor-prefix case, which a project can just as easily declare locally. Known accepted
+  residual: WooCommerce's `MarketingCampaign.php` (the original motivating example — a public
+  extension-point class with zero internal callers by design, confirmed via its own docblock)
+  correctly comes out "unreferenced" under this stricter check, but stays unflagged in practice
+  because `src/Autoloader.php`'s own hand-rolled `spl_autoload_register()` fallback separately
+  blanket-exempts the whole `src/` tree (see the entry below) — a real, if narrow, gap where two
+  independent exemption mechanisms happen to cover the same directory in the same plugin.
+
 - [x] **Dynamic bulk-include loops are a blind spot.** Fixed: `PhpTokenParser` now recognizes
   `glob(...)` calls (`parseGlobDirRef`, sharing a `findTrailingStringLiteral` helper refactored
   out of `parseIncludeRef` — the same "take the trailing literal segment of a possibly-dynamic
@@ -399,13 +493,42 @@ not shipped bugs.
   called out up front: it doesn't prove the `glob()` result is actually what gets `require`'d,
   just that both appear somewhere in the same file.
 
-- [ ] **Legacy `spl_autoload_register()` class-map callbacks aren't recognized.** Pre-Composer (or
-  hybrid) WP plugins sometimes register their own autoloader mapping class name → file path
-  in code, rather than declaring `composer.json` autoload rules. Not currently detected at all.
-  Lower priority than the Composer case — much rarer in current WP code, and the callback body can
-  be arbitrary PHP (string manipulation, `str_replace` on the class name, etc.), so there's no
-  single fixed shape to pattern-match against the way `composer.json`'s declarative `autoload` key
-  offers.
+- [x] **Legacy `spl_autoload_register()` class-map callbacks — partially recognized, known
+  remaining gap accepted as-is.** Pre-Composer (or hybrid) WP plugins sometimes register their
+  own autoloader mapping class name → file path in code, rather than declaring `composer.json`
+  autoload rules. `FileAnalyzer::loadDynamicLoadExemptDirs` already detects any
+  `spl_autoload_register(...)` call and exempts the *calling file's own directory* from
+  candidacy (real-world cases confirmed: Kadence, Hello Biz, Hello Elementor — the callback and
+  every file it can load live together in the same directory tree). Confirmed against a fourth
+  real plugin (Elementor's `includes/autoloader.php`) that this heuristic is too narrow in
+  general: Elementor's `Autoloader::run()` defaults its target root to `ELEMENTOR_PATH` — a
+  constant defined in the plugin's main bootstrap file, resolving to the whole plugin root, not
+  `includes/` — so files it autoloads outside `includes/` still false-positive as unused.
+  Widening the exemption to the whole project root whenever *any* file anywhere calls
+  `spl_autoload_register()` would fix this (and is probably closer to correct for most
+  real-world hybrid autoloaders, which are rarely restricted to a single sibling directory) —
+  but was considered and explicitly declined: the cost is that unused-file detection turns off
+  entirely, project-wide, for any theme/plugin with a hand-rolled autoloader anywhere in it,
+  which is a much bigger precision trade than the current directory-scoped exemption. A fully
+  precise fix (actually resolving the callback's own path logic) remains intractable in general
+  — confirmed by reading Elementor's real callback, which combines a hardcoded class map, a
+  CamelCase→kebab-case convention transform, *and* a deprecated-alias system in the same
+  function, with no single shape a generic parser could match. Left as-is: caller-directory
+  exemption only, Elementor-style project-root autoloaders remain a known, accepted false-
+  positive source.
+
+  Also tried and reverted: extending the same real-usage-proof built for Composer's PSR-4 case
+  (see the entry above) to this exemption too — requiring the caller directory's basename-as-
+  class-name to appear in `$referencedClassNames` before exempting, instead of a blanket pass.
+  Sound for Composer because PSR-4 *enforces* filename-equals-class-name as part of the
+  autoloading spec itself; a hand-rolled `spl_autoload_register()` callback is bound by no such
+  rule. Falsified immediately against a fifth real plugin (wp-smushit): `app/class-admin.php`
+  declares `class Admin` — WP's own long-standing `class-{slug}.php` file-naming convention,
+  which strips the `class-` prefix before ever comparing to a real class name — so "does the
+  basename appear as a referenced class name" was always false there, and every file under that
+  autoloader's tree false-positived at once (a previously fully-clean plugin, 0 → 221 findings).
+  Confirms the original scope call above rather than superseding it: reverted back to the
+  directory-scoped blanket exemption.
 
 # Function, Hook & Template Detection — Open Issues
 

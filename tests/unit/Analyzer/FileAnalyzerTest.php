@@ -136,8 +136,11 @@ get_template_part("inc/shortcodes/variants/$variant", null);
             'autoload' => ['psr-4' => ['My_Plugin\\' => 'src/']],
         ]);
         $class = $this->write('src/Service.php', '<?php namespace My_Plugin; class Service {}');
+        // Root-level file: not itself a candidate (WP template hierarchy), but still parsed for
+        // class references — real-usage-proof needs *something* to reference "Service".
+        $caller = $this->write('plugin.php', '<?php new Service();');
 
-        self::assertEmpty($this->analyzer->analyze([$class], $this->tmp));
+        self::assertEmpty($this->analyzer->analyze([$class, $caller], $this->tmp));
     }
 
     public function testPsr4WithMultipleDirsPerPrefixExemptsAll(): void
@@ -147,8 +150,9 @@ get_template_part("inc/shortcodes/variants/$variant", null);
         ]);
         $a = $this->write('src/A.php', '<?php // a');
         $b = $this->write('lib/B.php', '<?php // b');
+        $caller = $this->write('plugin.php', '<?php new A(); new B();');
 
-        self::assertEmpty($this->analyzer->analyze([$a, $b], $this->tmp));
+        self::assertEmpty($this->analyzer->analyze([$a, $b, $caller], $this->tmp));
     }
 
     public function testAutoloadDevPsr4IsExempt(): void
@@ -157,8 +161,9 @@ get_template_part("inc/shortcodes/variants/$variant", null);
             'autoload-dev' => ['psr-4' => ['My_Plugin\\Tests\\' => 'tests/']],
         ]);
         $test = $this->write('tests/ServiceTest.php', '<?php // test');
+        $caller = $this->write('plugin.php', '<?php new ServiceTest();');
 
-        self::assertEmpty($this->analyzer->analyze([$test], $this->tmp));
+        self::assertEmpty($this->analyzer->analyze([$test, $caller], $this->tmp));
     }
 
     public function testClassmapDirIsExempt(): void
@@ -167,8 +172,9 @@ get_template_part("inc/shortcodes/variants/$variant", null);
             'autoload' => ['classmap' => ['legacy/']],
         ]);
         $legacy = $this->write('legacy/Old_Class.php', '<?php // legacy');
+        $caller = $this->write('plugin.php', '<?php new Old_Class();');
 
-        self::assertEmpty($this->analyzer->analyze([$legacy], $this->tmp));
+        self::assertEmpty($this->analyzer->analyze([$legacy, $caller], $this->tmp));
     }
 
     public function testClassmapSingleFileIsExempt(): void
@@ -177,8 +183,22 @@ get_template_part("inc/shortcodes/variants/$variant", null);
             'autoload' => ['classmap' => ['inc/bootstrap.php']],
         ]);
         $bootstrap = $this->write('inc/bootstrap.php', '<?php // bootstrap');
+        $caller = $this->write('plugin.php', '<?php new bootstrap();');
 
-        self::assertEmpty($this->analyzer->analyze([$bootstrap], $this->tmp));
+        self::assertEmpty($this->analyzer->analyze([$bootstrap, $caller], $this->tmp));
+    }
+
+    public function testProjectAutoloadedFileWithNoReferenceIsStillReported(): void
+    {
+        // The whole point of real-usage-proof: being PSR-4-autoloadable doesn't automatically
+        // mean the class is used — nothing anywhere references "Orphan_Service".
+        $this->writeComposerJson([
+            'autoload' => ['psr-4' => ['My_Plugin\\' => 'src/']],
+        ]);
+        $class = $this->write('src/Orphan_Service.php', '<?php namespace My_Plugin; class Orphan_Service {}');
+
+        $names = array_column($this->analyzer->analyze([$class], $this->tmp), 'name');
+        self::assertContains('Orphan_Service.php', $names);
     }
 
     public function testAutoloadFilesEntryIsExempt(): void
@@ -213,6 +233,95 @@ get_template_part("inc/shortcodes/variants/$variant", null);
 
         $names = array_column($this->analyzer->analyze([$legacy], $this->tmp), 'name');
         self::assertContains('Old.php', $names);
+    }
+
+    public function testGeneratedComposerPsr4MapExemptsFileWithNoComposerJson(): void
+    {
+        // Real-world shape (WooCommerce): composer.json is dev-only tooling stripped from the
+        // shipped plugin — vendor/ ships anyway, and vendor/composer/autoload_psr4.php is the
+        // generated, already-resolved source of truth for what Composer actually autoloads,
+        // merged across the whole dependency tree. No composer.json present in this fixture at
+        // all.
+        $this->writeGeneratedAutoload('autoload_psr4.php', <<<'PHP'
+<?php
+$vendorDir = dirname(__DIR__);
+$baseDir = dirname($vendorDir);
+return array(
+    'Automattic\\WooCommerce\\' => array($baseDir . '/src'),
+);
+PHP);
+        $class = $this->write('src/Service.php', '<?php namespace Automattic\WooCommerce; class Service {}');
+        $caller = $this->write('plugin.php', '<?php new Service();');
+
+        self::assertEmpty($this->analyzer->analyze([$class, $caller], $this->tmp));
+    }
+
+    public function testGeneratedComposerClassmapExemptsMappedFile(): void
+    {
+        $this->writeGeneratedAutoload('autoload_classmap.php', <<<'PHP'
+<?php
+$vendorDir = dirname(__DIR__);
+$baseDir = dirname($vendorDir);
+return array(
+    'Legacy_Report' => $baseDir . '/includes/reports/class-legacy-report.php',
+);
+PHP);
+        $legacy = $this->write('includes/reports/class-legacy-report.php', '<?php // legacy report');
+        $caller = $this->write('plugin.php', '<?php new Legacy_Report();');
+
+        self::assertEmpty($this->analyzer->analyze([$legacy, $caller], $this->tmp));
+    }
+
+    public function testGeneratedComposerMappedFileWithNoReferenceIsStillReported(): void
+    {
+        $this->writeGeneratedAutoload('autoload_psr4.php', <<<'PHP'
+<?php
+$vendorDir = dirname(__DIR__);
+$baseDir = dirname($vendorDir);
+return array(
+    'Automattic\\WooCommerce\\' => array($baseDir . '/src'),
+);
+PHP);
+        $class = $this->write('src/Orphan_Campaign.php', '<?php namespace Automattic\WooCommerce; class Orphan_Campaign {}');
+
+        $names = array_column($this->analyzer->analyze([$class], $this->tmp), 'name');
+        self::assertContains('Orphan_Campaign.php', $names);
+    }
+
+    public function testGeneratedComposerAutoloadFilesEntryIsExempt(): void
+    {
+        $this->writeGeneratedAutoload('autoload_files.php', <<<'PHP'
+<?php
+$vendorDir = dirname(__DIR__);
+$baseDir = dirname($vendorDir);
+return array(
+    'abc123' => $baseDir . '/src/functions.php',
+);
+PHP);
+        $functions = $this->write('src/functions.php', '<?php // global helper functions');
+
+        self::assertEmpty($this->analyzer->analyze([$functions], $this->tmp));
+    }
+
+    public function testFileOutsideGeneratedComposerMapIsStillReported(): void
+    {
+        $this->writeGeneratedAutoload('autoload_psr4.php', <<<'PHP'
+<?php
+$vendorDir = dirname(__DIR__);
+$baseDir = dirname($vendorDir);
+return array(
+    'Automattic\\WooCommerce\\' => array($baseDir . '/src'),
+);
+PHP);
+        $orphan = $this->write('inc/orphan.php', '<?php // not under the generated psr-4 map');
+
+        $names = array_column($this->analyzer->analyze([$orphan], $this->tmp), 'name');
+        self::assertContains('orphan.php', $names);
+    }
+
+    private function writeGeneratedAutoload(string $filename, string $code): string
+    {
+        return $this->write('vendor/composer/' . $filename, $code);
     }
 
     public function testGlobLoopBulkIncludeExemptsSubdirectory(): void

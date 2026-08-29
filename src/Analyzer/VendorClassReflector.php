@@ -21,6 +21,20 @@ namespace WpSpecter\Analyzer;
  * autoload files, and resolving a class executes whatever PSR-4 file declares it. Every entry
  * point is wrapped against \Throwable, per path, so one missing/broken/side-effecting vendor
  * file degrades to "no answer from that path" rather than aborting the scan or losing the others.
+ *
+ * One failure mode \Throwable can't help with: WordPress's own "no direct access" convention,
+ * `defined('ABSPATH') || exit;`, sits at the top of an enormous number of real plugin files (927
+ * in a real WooCommerce checkout alone) — including ones that are also part of a Composer PSR-4
+ * autoload map, and therefore reachable the instant `class_exists()`/`ReflectionClass` triggers
+ * autoloading on them below. `exit()` isn't a catchable `\Throwable` — it silently kills this
+ * entire PHP process, not just this one lookup, with no error output and exit code 0 (confirmed
+ * against a real scan: `Automattic\WooCommerce\Admin\API\Reports\Query`, autoloaded while
+ * resolving a completely unrelated extends chain, terminated the whole scan mid-run, producing
+ * only the scan header and nothing else — no findings, no summary, no error). `isAvailable()`
+ * defines `ABSPATH` up front (if not already defined) specifically to neutralize this — any
+ * non-empty value works, since nothing reachable here is expected to call a real WordPress
+ * function that would depend on its actual value; this only guards the single most common
+ * instance of the pattern, not every conceivable direct-access guard a plugin might use.
  */
 final class VendorClassReflector
 {
@@ -37,6 +51,13 @@ final class VendorClassReflector
 
         if ($this->autoloadersLoaded) {
             return true;
+        }
+
+        // See this class's own docblock — must happen before the very first require_once below,
+        // since a "files"-autoload entry can trigger the same guard just as easily as a lazily
+        // autoloaded PSR-4 class can later in classHasMethod().
+        if (!defined('ABSPATH')) {
+            define('ABSPATH', '/');
         }
 
         foreach ($this->autoloadPaths as $path) {
