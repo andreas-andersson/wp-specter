@@ -211,12 +211,9 @@ scope limit that trades recall or precision for staying a single-pass, no-depend
     tracking brace-scoped namespace resets — a file using this form has subsequent code resolve
     as if still in the previous/global namespace.
   - **`FunctionAnalyzer`'s identical-looking flat short-name collision for namespaced top-level
-    functions was deliberately NOT touched.** PHP resolves an unqualified function *call* by
-    trying the current namespace first and falling back to the *global* namespace at runtime if
-    not found there — a real ambiguity class-name resolution doesn't have (an unqualified class
-    reference always resolves to exactly one place, never a runtime fallback). Applying the same
-    FQCN scheme to functions without modeling that fallback would risk introducing false "unused
-    function" positives rather than fixing anything. Left as a real, separate follow-up.
+    functions was deliberately NOT touched here** — see the "Function detection" section below
+    for the follow-up that fixed it properly, modeling PHP's real fallback-to-global-namespace
+    call-resolution rule instead of just reapplying the class-name scheme.
 
 ## Method detection
 
@@ -639,6 +636,202 @@ not shipped bugs.
   called out up front: it doesn't prove the `glob()` result is actually what gets `require`'d,
   just that both appear somewhere in the same file.
 
+- [x] **A dynamic-middle-segment `require`'s captured directory-prefix literal wasn't trimmed to
+  a real directory boundary when it also carried a filename prefix.** `PhpTokenParser::
+  findIncludeDirPrefixBeforeVariable()` (the mechanism behind the Kadence-theme fix above it,
+  confirmed via `require_once get_template_directory() . '/inc/customizer/options/' . $key .
+  '-options.php';`) captures whichever string literal sits directly before the dynamic segment
+  and trusts it as-is — correct for Kadence's own shape, since that literal already ends in `/`
+  (a clean directory boundary), but wrong whenever the literal instead mashes a real directory
+  together with a filename *prefix*. Found by a fresh gap-hunting pass over an expanded real-theme
+  corpus: Sydney theme's `inc/dashboard/class-dashboard.php`:
+  `require get_template_directory() . '/inc/dashboard/html-' . $tab_id . '.php';` — the captured
+  literal `/inc/dashboard/html-` was trusted verbatim as a directory, which can never match a real
+  file (`html-` isn't a subdirectory), silently defeating the whole exemption — 8 of Sydney's 14
+  `--type=files` findings were every `inc/dashboard/html-*.php` tab-content partial this exact
+  line loads, none of them actually dead. Fixed: the captured literal is now trimmed back to the
+  last real `/` boundary whenever it doesn't already end in one (a no-op for Kadence's own clean
+  case); a literal with no `/` at all (nothing directory-shaped to exempt) now returns null rather
+  than an empty string, which would otherwise be misread downstream as "exempt the whole project"
+  the same empty-string convention `FileAnalyzer::isUnderDynamicLoadExemptDir` already gives a
+  root-level bulk-include caller. Verified: Sydney's own dashboard tab partials no longer flagged
+  (14 → 7 findings), full 19-target corpus sanity pass (11 plugins + 8 themes) shows no crashes,
+  and the existing Kadence/`__DIR__`-relative regression tests pass completely unchanged. This
+  "prefix + dynamic-tab + suffix" `require` shape is a common WP admin tabbed-settings-page
+  convention — likely to recur beyond just these two themes.
+
+- [x] **A cross-file "bulk-directory-loader" method call wasn't recognized as a bulk-include at
+  all.** Every existing bulk-include mechanism (`glob()`/`scandir()` loops, the dynamic-middle-
+  segment `require` fix above, `spl_autoload_register()`) only looks *within a single file* for the
+  co-occurring signals (a directory-shaped literal, an include/require keyword). Found by a fresh
+  gap-hunting pass over an expanded real-theme corpus: Flynt theme's `functions.php` calls
+  `FileLoader::loadPhpFiles('inc')`, and `loadPhpFiles()` itself — declared in a completely
+  different file, `lib/Utils/FileLoader.php` — walks that directory via `DirectoryIterator` and
+  `require_once`s every PHP file it finds, from inside a closure passed to a second helper method.
+  There's no `glob()`/`scandir()` call anywhere in either file, and the literal directory name and
+  the `require_once` that actually consumes it live in two separate files, connected only by an
+  ordinary method call — invisible to every existing mechanism, and ~20 of Flynt's `inc/*.php`
+  files were false-positived as a result. Fixed with the same "coarse net, not proven causality"
+  trade-off the existing `glob()`-loop detection already accepts, just spanning two files instead
+  of one: `PhpTokenParser` now tracks, per function/method body (including nested closures, via a
+  brace-depth-tracked stack matching the existing per-scope tracking pattern), whether an
+  include/require keyword appears anywhere inside it (`FunctionDef::$hasIncludeInBody`); every
+  scoped call (`Foo::bulkLoad('inc')`) with a plain string-literal first argument is recorded
+  unconditionally as a candidate (`PendingDirectoryLoaderCall`), regardless of what the callee
+  actually does. `FileAnalyzer::loadDynamicLoadExemptDirs` resolves these once every scanned
+  file's parse is merged: a candidate only becomes a real directory exemption when
+  `$receiverClass::$methodName` resolves to a method whose own `hasIncludeInBody` is true — the
+  same merge-after-all-files-parsed pattern `ClassAnalyzer`'s `PendingReturnTypedCall` resolution
+  already uses. Verified: new `PhpTokenParserTest` cases confirm `hasIncludeInBody` detection (both
+  a direct `require` and one nested inside a closure) and `PendingDirectoryLoaderCall` capture at
+  the call site; new `FileAnalyzerTest` end-to-end cases confirm the Flynt shape is exempted and
+  that a lookalike call to a method whose body has no include is correctly left un-exempted (no
+  false negative introduced); real Flynt corpus (`../wp-tests/themes/flynt-v2.1.2`) now scans
+  `--type=files` with zero findings; full 19-target corpus sanity pass (11 plugins + 8 themes)
+  shows no crashes; full suite (506 tests) and phpstan both green. **Scope limitations**: only the
+  `Class::method('literal')`/`self::method('literal')`/`static::method('literal')` scoped-call
+  shape is recognized — `$this->method('literal')` (an ordinary property/local-variable-scoped
+  call, a different code path in the parser entirely) is not instrumented, so that variant of the
+  same pattern would still go undetected; the literal must be the call's *first* argument
+  specifically.
+
+- [x] **Two related base-class/interface widening gaps found in Yoast SEO's heavily
+  interface-and-abstract-class-based dashboard code, both variants of the same "declared on the
+  base/interface, only ever satisfied by a descendant" shape `isUsedByDescendantReceiver()`
+  already exists for.**
+
+  1. **A property declared on an abstract base class, only ever populated by a concrete
+     subclass's own constructor via a plain (non-promoted) typed parameter, was invisible to a
+     `$this->prop->method()` read site back in the base class's own body.**
+     `Abstract_Scores_Route::$score_results_repository` is read via
+     `$this->score_results_repository->get_score_results(...)` from inside
+     `Abstract_Scores_Route`'s own method — but the property is only ever assigned in a concrete
+     subclass's constructor: `Readability_Scores_Route::__construct(Readability_Score_Results_Repository
+     $x) { $this->score_results_repository = $x; }`. `$this->` at the read site resolves to
+     `Abstract_Scores_Route` (where the code physically is), never the subclass that did the
+     assigning, so `$propertyAssignedClasses[$call->ownerClass]` always missed — even though the
+     parser already correctly tracked the assignment itself (`assignedVariableClassName()` already
+     resolves a plain typed-parameter-to-property assignment, this part of the pipeline wasn't the
+     gap). Fixed: `ClassAnalyzer::findUnusedMethods`'s `propertyMethodCalls` resolution now falls
+     back to `$descendantsOf[$call->ownerClass]` (already built for
+     `isUsedByDescendantReceiver`'s own scoped-call case) when the direct lookup misses, trusting
+     the first known descendant that assigned the same property name — same coarse
+     "any resolvable concrete type is good enough" trade-off `isUsedByPolymorphicCall` already
+     accepts.
+  2. **`$descendantsOf` only ever walked `extends`, never `implements` — so an interface's own
+     bodyless method declaration had no equivalent rescue mechanism at all**, unlike an abstract
+     class's shared concrete method (which is usually incidentally rescued the moment *any*
+     concrete subclass is itself called via its own receiver somewhere).
+     `Score_Results_Collector_Interface::get_score_results()` is only ever reached through a
+     concrete implementer resolved to its own concrete type
+     (`Cached_Readability_Score_Results_Collector::get_score_results()`, via fix 1's property
+     resolution above) — never through a call scoped to the interface type itself — so
+     `scopedCalled[interface][method]` was never populated, and no widening mechanism existed to
+     credit the interface's own declaration from a satisfied implementer the way base-class
+     methods already are. Fixed: `$descendantsOf`'s build walk now also records every class's own
+     `implements` clause at each level of the extends chain walked (mirrors `isContractMethod`'s
+     existing "implements is checked at every level" stance), turning it into a general "who
+     satisfies this type" map instead of a pure extends-chain one; `isUsedByDescendantReceiver`
+     needed no change at all, since it already just does a flat lookup regardless of whether
+     `$ownerClass` names a class or an interface.
+
+  Verified: two new `ClassAnalyzerTest` cases (one per fix, both modeled directly on the real
+  Yoast shapes above, including a genuinely-unused sibling method in each fixture to prove no
+  false negative was introduced); real Yoast SEO corpus — both real `get_score_results` findings
+  (the abstract-repository one and the interface one) gone; full 19-target corpus sanity pass (11
+  plugins + 8 themes) shows finding counts only ever decreasing or unchanged, never increasing,
+  and no crashes — most notably Yoast SEO itself, 492 → 441 unused-method findings; full suite
+  (508 tests) and phpstan both green. **Scope limitation**: the interface fix is deliberately only
+  one level deep — an interface that itself `extends` another interface
+  (`Section_Interface extends Item_Interface`) is not walked further when building the reverse
+  map, so a class implementing only the child interface won't count as a descendant of the
+  grandparent interface. Not hit by either real-world case found here, but a known, narrower gap
+  than full transitive-interface support would close.
+
+- [x] **`use function Fully\Qualified\Name;` (PHP's function-import syntax) wasn't tracked at
+  all — a bare call to an imported function never resolved to its real declaration when that
+  declaration lives in a namespace that's neither the caller's own nor the global fallback.**
+  `PhpTokenParser::parseUseImports()` explicitly bailed out (`return [];`) the moment it saw
+  `use function`/`use const`, treating both as "not a class import, nothing to record" — correct
+  for `use const` (irrelevant to this tool), but silently discarded exactly the information needed
+  to resolve the call it imports. A bare call's only two existing candidates
+  (`FunctionCall::$extraCandidateFqcn` — the plain name, or a current-namespace-prefixed guess)
+  both miss whenever the real declaration lives in a *third* namespace, imported by name instead
+  of inferred from context. Found by a fresh gap-hunting pass over the plugin corpus: Jetpack's
+  `json-endpoints/class.wpcom-json-api-update-post-v1-2-endpoint.php` has
+  `use function Automattic\Jetpack\Extensions\Map\map_block_from_geo_points;`, then calls it bare
+  — the function is declared in a completely different file/namespace
+  (`extensions/blocks/map/map.php`), so neither existing candidate ever named it. Not an isolated
+  case: 164 `use function` import lines exist across 5 of the 11 scanned plugins. Fixed generally,
+  not just for this one call site: `parseUseImports()` now also parses `use function
+  Name\Space\foo [as alias];` (still bailing cleanly on `use const` and on group-use, exactly as
+  before), returning a second, separate alias => FQCN map alongside the existing class-import one
+  — kept separate because a function import and a class import don't collide even when they'd
+  share a bare name, and because a *function*-imported name changes what a same-named bare *call*
+  resolves to, never what a class *reference* does. Both bare-call-dispatch sites that compute
+  `extraCandidateFqcn` now check this map first — a `use function` import shadows the usual
+  current-namespace-then-global runtime fallback deterministically (PHP fixes it at compile time),
+  so a match there takes priority over the plain namespace-prefixed guess, not just an additional
+  fallback.
+
+  Verified: 4 new `PhpTokenParserTest` cases (import + bare call across namespaces, `as`-aliasing,
+  import-wins-over-namespace-fallback priority, and confirming the existing "`use function`
+  is not recorded as a class" test still passes unchanged) and one new end-to-end
+  `FunctionAnalyzerTest` case modeled directly on the real Jetpack shape (declaration and importing
+  caller in different namespaces, in different files); real Jetpack corpus:
+  `map_block_from_geo_points` no longer flagged, and the plugin's total unused-function count
+  dropped from 51 to 49 (more than the one traced case — other `use function` imports elsewhere in
+  Jetpack benefited too); full 19-target corpus sanity pass (11 plugins + 8 themes) shows every
+  other finding count unchanged and no crashes; full suite (512 tests) and phpstan both green.
+
+- [x] **A callback-name or file-path literal split across a bounded numeric `for`-loop's own
+  counter (`'prefix_' . $i` inside `for ($i = 1; $i < 5; $i++)`) couldn't be resolved to any of
+  its N real concrete values at all — the parser has no concept of loop semantics.** Found by a
+  fresh gap-hunting pass over the full corpus, independently in **two** themes:
+  - Sydney's customizer (`inc/customizer/customizer.php`):
+    `'render_callback' => 'sydney_partial_slider_title_' . $i` inside `for ($i = 1; $i < 5; $i++)`
+    — 8 real functions (`sydney_partial_slider_title_1..4`/`subtitle_1..4`) false-positived as
+    unused. Bonus: Sydney's own loop bound is off-by-one — `sydney_partial_slider_title_5`/
+    `subtitle_5` also exist as real declarations but the loop never reaches 5, so a *correct* fix
+    needed to keep flagging those two specifically, not just quiet everything with that prefix.
+  - Astra's icon loader (`inc/core/common-functions.php`):
+    `"{$icons_dir}/icons-v6-{$i}.php"` inside a similar bounded loop — 4 files false-positived.
+
+  Fixed generally, not by special-casing either theme: `PhpTokenParser` now recognizes the clean
+  canonical bounded-ascending `for` form (`parseForLoopBoundedRange()` — int-literal init,
+  int-literal bound compared with `<`/`<=`, unit `$var++` increment; anything else, e.g. a
+  non-literal bound, is left completely untracked, same "don't guess" stance as everywhere else
+  in this parser) and tracks the loop variable's own concrete value range with the same brace-
+  depth-tracked stack pattern used throughout (`$forLoopVarDepthStack`/`$forLoopVarNameStack`/
+  `$forLoopVarValuesStack`). A new `resolveForLoopConcatenatedLiteral()` recognizes a string
+  literal immediately concatenated with a tracked loop variable (optionally followed by a further
+  literal suffix) and enumerates one concrete string per value in the loop's range — computed
+  once per literal and shared by both existing consumption sites it affects (the bare/scoped
+  callback-name resolution, and the `.php`-suffixed file-path check), since a callback-shaped
+  identifier and a `.php`-suffixed path are mutually exclusive per literal in practice. A
+  resolved array-callback receiver present at the same time now gets *exact* enumerated
+  `ScopedMethodCall`s instead of the coarser `ScopedMethodCallPrefix` fallback the existing
+  `array($this, 'footer_html_' . $index)` mechanism already used — a real, automatic precision
+  upgrade to that pre-existing mechanism, confirmed by updating its own test to the sharper
+  expected behavior once the loop in that exact fixture became recognizably bounded.
+
+  Verified: 3 new `PhpTokenParserTest` cases (Sydney's exact bare-callback shape enumerating all 4
+  names, a file-path-via-concatenation case for the same mechanism applied to `phpPathStrings`,
+  and a non-literal-bound loop confirming no enumeration/no regression when the shape isn't
+  recognized) plus one existing test updated to its new, more precise expected output (see above);
+  real Sydney corpus — `sydney_partial_slider_title_1..4`/`subtitle_1..4` no longer flagged, `_5`
+  *correctly still flagged* (proving this isn't just "quieter," it's more precise), and the
+  theme's total unused-function count dropped from 32 to 24; full 19-target corpus sanity pass (11
+  plugins + 8 themes) shows every other finding count unchanged and no crashes; full suite (516
+  tests) and phpstan both green. **Scope limitation, found and deliberately not chased further
+  here**: Astra's own real-world case uses double-quoted *string interpolation*
+  (`"...{$icons_dir}/icons-v6-{$i}.php"`) assigned to a variable, then `include_once`d — a
+  fundamentally different token shape (interpolated strings tokenize as several separate tokens,
+  not one literal) than the concatenation this fix recognizes, and this parser has no interpolated-
+  string-to-template resolution mechanism at all yet (elsewhere or here) to build on. Astra's
+  `icons-v6-0..3.php` false positives remain unresolved; would need a separate, larger effort to
+  parse interpolated-string templates generally, not a small extension of this fix.
+
 - [x] **Legacy `spl_autoload_register()` class-map callbacks — partially recognized, known
   remaining gap accepted as-is.** Pre-Composer (or hybrid) WP plugins sometimes register their
   own autoloader mapping class name → file path in code, rather than declaring `composer.json`
@@ -764,25 +957,74 @@ way the class/method/file gaps above were found; nothing here has been fixed yet
   collection. Covered by new unit tests
   (`testDoesNotExemptHierarchyNamedTemplatesInPluginMode`/`testStillExemptsHierarchyTemplatesInHybridMode`).
 
-  **Deliberately NOT wired up to actually run for Plugin mode**, though — `Application.php`
-  independently skips the whole templates check for `WpMode::Plugin` targets (unrelated to the
-  bug above; a second, separate gate), and this was tried and reverted after enabling it: WooCommerce
-  loads most of its own `templates/` directory through its own wrapper functions
-  (`wc_get_template()`/`wc_get_template_part()`), not the WP-core `get_template_part()`/
-  `get_header()`/`get_footer()`/`get_sidebar()` calls `PhpTokenParser`'s `TEMPLATE_FUNCS` list
-  tracks. Confirmed real false positives from enabling the check: `content-product.php` and
-  `content-single-product.php` are genuinely used — reached via literal
-  `wc_get_template_part('content', 'product')`/`('content', 'single-product')` calls — but the
-  parser has no way to know `wc_get_template_part` maps its two string arguments to a
-  `slug-name.php` filename the way it already knows `get_template_part`'s single argument does.
-  Net result in the one real plugin this whole investigation was built around: 2 confirmed new
-  false positives per 2 genuine catches — a wash at best, likely worse across other plugins with
-  their own similarly-named wrapper (EDD's `edd_get_template_part()` and others follow the exact
-  same pattern). Real fix would need either a curated list of known plugin template-loader
-  wrapper names (unbounded, whack-a-mole — a new one for every plugin ecosystem) or a generic
-  "two-string-argument call producing a `slug-name.php`-shaped file reference" heuristic broad
-  enough to catch this shape without also matching unrelated two-string-argument calls. Left
-  disabled for Plugin mode until that's actually solved, not merely flipped on.
+  **Originally NOT wired up to actually run for Plugin mode** — `Application.php` independently
+  skipped the whole templates check for `WpMode::Plugin` targets (a second, separate gate), first
+  enabling it was tried and reverted after real false positives surfaced: WooCommerce loads most
+  of its own `templates/` directory through its own wrapper functions (`wc_get_template()`/
+  `wc_get_template_part()`), not the WP-core `get_template_part()`/`get_header()`/`get_footer()`/
+  `get_sidebar()` calls `PhpTokenParser`'s `TEMPLATE_FUNCS` list tracked at the time —
+  `wc_get_template_part('content', 'product')`/`('content', 'single-product')` calls were
+  genuinely used but statically invisible, since the parser had no way to know
+  `wc_get_template_part` maps its two string arguments to a `slug-name.php` filename the way it
+  already knew `get_template_part`'s single argument does.
+
+  **Fixed properly, then re-enabled**, in two parts:
+  1. `TEMPLATE_FUNCS` originally also listed `wc_get_template_part`/`wc_get_template` and
+     WooCommerce's own documented legacy aliases `woocommerce_get_template_part`/
+     `woocommerce_get_template` by exact name — treated identically to `get_template_part` (arg 0
+     becomes the template ref), deliberately scoped to WooCommerce specifically rather than a
+     generic suffix guess since that was the only confirmed real-world example in this project's
+     test corpus at the time.
+
+     **Superseded** once a second, independent real-world instance of the exact same shape
+     turned up (Sydney theme's own `sydney_get_template_part()`) — confirming this is a
+     widely-replicated WordPress-ecosystem naming convention, not one plugin's own invention, and
+     a fixed name list would only ever cover whichever specific plugins happened to get traced by
+     hand. Replaced with `PhpTokenParser::isTemplateLoaderFunc()`: a name matching
+     `TEMPLATE_FUNCS` (now just the 4 WP-core functions) OR ending in `_get_template_part`/
+     `_get_template` is treated the same way — no per-plugin addition ever needed again. Found
+     and fixed as part of this generalization: a bare call to a recognized template-loader
+     function was never also credited as an ordinary function call (`return;` right after
+     recording the template ref, before ever reaching the generic `$functionCalls[] = ...` at the
+     bottom of `dispatchBareFunctionCall`) — harmless for a WP-core name (never itself
+     project-declared) but a real false positive the instant a project both declares AND calls
+     its own wrapper, exactly Sydney's `sydney_get_template_part()` shape. Fixed by also pushing
+     to `$functionCalls` inside the template-loader branch itself, using the same
+     already-computed `$extraCandidateFqcn` the generic fallback path uses.
+
+     Verified: new `PhpTokenParserTest` cases (the general suffix match across 4 independently-
+     named wrappers including one with no real-world corpus evidence at all — EDD's
+     `edd_get_template_part()` — proving genuine generalization, not just re-listing what was
+     already confirmed; and a negative case confirming a merely-similar name like
+     `wc_get_templates()`/`some_get_template_data()` doesn't false-positive) and a new
+     `FunctionAnalyzerTest` case for the call-credit fix; real corpus — WooCommerce's own
+     unused-template count unchanged (5, confirming no regression from the delisting), Sydney's
+     `sydney_get_template_part()` no longer flagged unused and 3 more of its own real templates
+     (reached only through it) no longer flagged either; full 19-target sanity pass shows every
+     other finding count unchanged and no crashes; full suite (519 tests) and phpstan both green.
+  2. A second, independent bug found while verifying the first fix: `TemplateAnalyzer`'s
+     existing `isReferencedByPartialMatch()` (the mechanism that already made
+     `get_template_part('slug', $name)` => any `slug-*.php` file reachable) checked the
+     candidate file's *full relative path* (`templates/content-product.php` for a plugin) against
+     the bare slug ref (`content`) — a prefix match that can never succeed once a directory
+     segment sits in front of it. This never mattered for a theme, where hierarchy files
+     conventionally sit at the theme root with no such prefix; it broke immediately for a
+     plugin's own nested `templates/` directory. Fixed by also checking the candidate's bare
+     basename (no directory, no extension) against the same partial-match logic, bringing Plugin
+     mode's precision up to parity with what theme mode already had.
+
+  `Application.php`'s Plugin-mode exclusion removed once both were verified fixed. Real-corpus
+  result for WooCommerce (the only plugin among all 7 in the test corpus that ships a
+  `templates/` directory at all): 8 → 5 findings, with the 3 removed
+  (`content-product.php`/`content-single-product.php`/`content-product-cat.php`) confirmed
+  previously-genuine false positives, and the remaining 5 confirmed either directly (the two
+  taxonomy files) or by the same "resolved only via runtime string concatenation, unresolvable
+  statically" pattern (`taxonomy-product_brand.php`, and `my-downloads.php`/`my-orders.php`,
+  which have zero reference anywhere in the codebase under any name). New test coverage:
+  `PluginTest::testUnusedPluginTemplateIsDetected` (integration, a fixture plugin's own
+  `templates/` directory with a used and an orphaned file). Full 7-plugin sanity pass (all 6 of
+  the other plugins have no `templates/`/`template-parts/`/`parts/` directory at all, so nothing
+  to check either way) shows no crashes.
 
 ## Function detection
 
@@ -799,6 +1041,55 @@ way the class/method/file gaps above were found; nothing here has been fixed yet
   *declared* with a bare name in PHP (the enclosing `namespace` block carries the namespace, never
   the declaration's own name token), so `FunctionDef` was already just as namespace-blind on the
   definition side.
+
+- [x] **`FunctionAnalyzer` had the same flat, short-name-only collision `ClassAnalyzer` had before
+  its own namespace-aware rework — deliberately deferred at the time since function-call
+  resolution has a real ambiguity classes don't (PHP falls back to the global namespace for an
+  unqualified call it can't resolve locally; there's no equivalent fallback for an unqualified
+  class reference).** Confirmed real and worth fixing by checking the actual corpus first:
+  namespaced top-level function *declarations* turned out to be common in real code even where
+  namespaced *classes* dominate — Jetpack alone declares roughly 440 of them, Elementor ~50,
+  wp-smushit ~10 (WordPress convention keeps hook-callback/helper functions global far more
+  consistently than it keeps classes global, but far from universally).
+
+  Fixed with a scheme that respects the real asymmetry between declarations and calls, not a
+  copy-paste of the class-name fix:
+  - `FunctionDef` gained an `$fqcn` field (declarations have no resolution ambiguity of their
+    own — resolved the same deterministic way `ClassDef::$fqcn` is). `FunctionAnalyzer` now keys
+    `$definitions` by this instead of the bare name.
+  - `FunctionCall` gained `$extraCandidateFqcn` (nullable) instead of changing `$name`'s existing
+    meaning at all — `$name` stays the bare identifier every other consumer of
+    `ParseResult::$functionCalls` (`ClassAnalyzer`'s bare-string class-reference fallback,
+    `FileAnalyzer`'s equivalent) already relies on unchanged. Three shapes, three treatments:
+    - A qualified/fully-qualified call (`Foo\Bar\helper()`, `\My\Ns\init()`) resolves
+      deterministically — no runtime fallback — via the same `resolveFqcn()` a class reference
+      uses; `$extraCandidateFqcn` holds that one real target.
+    - A bare call made from *inside* a namespaced file is the genuinely ambiguous case:
+      `$extraCandidateFqcn` holds the "if it resolves locally" candidate
+      (`$currentNamespace . '\\' . $name`), while `$name` itself still stands in for the "or it
+      falls back to global" candidate — `FunctionAnalyzer` credits a definition matching either,
+      favoring a false negative over a false positive in the rare case both exist (the same
+      conservative bias this analyzer already took for its own unscoped-pool fallback).
+    - A bare call from *un-namespaced* code (still the common case — around 60% of real files in
+      this corpus) gets `$extraCandidateFqcn: null`; `$name` is already the only candidate,
+      exactly as before this fix existed. Zero behavior change there.
+  - The same string-literal-callback path that already needed a namespace-aware fix once before
+    (`__NAMESPACE__ . '\my_handler'`, the Sakurairo theme regression covered above) needed the
+    identical `$extraCandidateFqcn` treatment applied to it too — found by an existing regression
+    test failing the moment `$definitions` switched to FQCN keys, confirming that code path is a
+    second, independent `FunctionCall` producer this fix had to cover, not just the main
+    `dispatchBareFunctionCall()` one.
+
+  Verified against the real corpus (before/after `git stash` comparison, `--type=functions`):
+  akismet, contact-form-7, woocommerce unchanged (no real collisions present). Jetpack: 49 → 51,
+  both new findings traced to a real root cause, not a false positive from this fix — a bare call
+  made from *un-namespaced* legacy code (`json-endpoints/class.wpcom-json-api-update-post-v1-2-
+  endpoint.php`, a WordPress.com REST API v1.2 endpoint) to a function only ever declared inside
+  `Automattic\Jetpack\Extensions\Map`/`...\Shared`, with no `use function` import anywhere bringing
+  it into global scope — as written, that call would fail at runtime with "call to undefined
+  function." Whether the true root cause is dead code or a latent bug elsewhere in Jetpack, a
+  bare, unqualified call from the global namespace to a namespace-only function is exactly the
+  case this fix is designed to stop silently masking. No crashes on any of the 7 plugins.
 
 - [x] **`FunctionAnalyzer`'s blanket `wp_`/`get_`/`the_`/`is_`/`has_`/`do_`/`apply_` name-prefix
   exclusion was undocumented since the project's very first commit and provably too broad in one

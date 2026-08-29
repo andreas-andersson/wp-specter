@@ -539,6 +539,20 @@ final class FileAnalyzer
         $this->dynamicLoadExemptDirs = [];
         $this->autoloadRegisterExemptDirs = [];
 
+        // (ownerClass fqcn)::(methodName) => does that method's own body contain an
+        // include/require keyword anywhere (see FunctionDef::$hasIncludeInBody). Built across
+        // every scanned file before any PendingDirectoryLoaderCall is resolved against it,
+        // since the callee method commonly lives in a different file than the call site — see
+        // PendingDirectoryLoaderCall's own docblock (Flynt theme's FileLoader::loadPhpFiles()).
+        $methodHasInclude = [];
+        foreach ($parseResults as $result) {
+            foreach ($result->functionDefs as $def) {
+                if ($def->isMethod && $def->ownerClass !== null && $def->hasIncludeInBody) {
+                    $methodHasInclude[$def->ownerClass . '::' . $def->name] = true;
+                }
+            }
+        }
+
         foreach ($parseResults as $result) {
             $callerRelDir = $this->relativeDir($result->file, $rootDir);
 
@@ -587,6 +601,20 @@ final class FileAnalyzer
                 if ($call->name === 'spl_autoload_register') {
                     $this->autoloadRegisterExemptDirs[] = $callerRelDir;
                     break;
+                }
+            }
+
+            // Foo::bulkLoad('inc') where bulkLoad()'s own body (possibly declared in a
+            // different file entirely) turns out to contain a require/include — same
+            // "co-occurrence, not proven causality" trade-off as the glob() case above, just
+            // spanning two files instead of one. See PendingDirectoryLoaderCall's own docblock.
+            foreach ($result->pendingDirectoryLoaderCalls as $call) {
+                if (!isset($methodHasInclude[$call->receiverClass . '::' . $call->methodName])) {
+                    continue;
+                }
+                $exemptDir = trim($this->resolveGlobExemptDir($call->literalArg, $callerRelDir), '/');
+                if ($exemptDir !== '') {
+                    $this->dynamicLoadExemptDirs[] = $exemptDir;
                 }
             }
         }

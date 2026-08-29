@@ -301,6 +301,48 @@ final class ClassAnalyzer
             }
         }
 
+        // Base class/interface name => every class whose own extends chain passes through it, OR
+        // that implements it at any level along that chain (multi-level extends included:
+        // Astra_Get_Single_Page -> ... -> Astra_Abstract_Ability makes 'Astra_Abstract_Ability'
+        // => [..., 'Astra_Get_Single_Page']). Built early since the property-assignment fallback
+        // just below needs it too, not just isUsedByDescendantReceiver further down.
+        //
+        // Real-world gap (Yoast SEO): an interface's own bodyless method declaration
+        // (Score_Results_Collector_Interface::get_score_results()) is only ever actually reached
+        // through a concrete implementer resolved to its own concrete type
+        // (Cached_Readability_Score_Results_Collector::get_score_results(), via the property-
+        // assignment fallback above) — never through a call scoped to the interface type itself.
+        // Before interfaces were folded into this same map, an interface's own declaration had no
+        // equivalent to isUsedByDescendantReceiver's abstract-class case: an abstract class's
+        // bodyless method is (usually incidentally) rescued because some concrete subclass is
+        // *also* called via its own concrete receiver somewhere, which this map already covered
+        // for extends chains — interfaces just never got the same benefit, since `implements` was
+        // never walked when building it. Deliberately only the implementer's own direct
+        // `implements` clause at each level walked (mirrors isContractMethod's own "implements is
+        // checked at every level" stance) — an interface that itself `extends` another interface
+        // (Section_Interface extends Item_Interface) is not walked further, so a class implementing
+        // only the child interface won't count as a descendant of the grandparent interface. Not
+        // hit by this specific real-world case, but a known, narrower scope limitation.
+        $descendantsOf = [];
+        foreach ($classDefsByName as $fqcn => $def) {
+            $className = $fqcn;
+            for ($depth = 0; $depth < self::MAX_INHERITANCE_DEPTH; $depth++) {
+                $currentDef = $classDefsByName[$className] ?? null;
+                if ($currentDef === null) {
+                    break;
+                }
+                foreach ($currentDef->implements as $ifaceRef) {
+                    $descendantsOf[$ifaceRef->fqcn][] = $fqcn;
+                }
+                $baseRef = $currentDef->extends[0] ?? null;
+                if ($baseRef === null) {
+                    break;
+                }
+                $descendantsOf[$baseRef->fqcn][] = $fqcn;
+                $className = $baseRef->fqcn;
+            }
+        }
+
         // Class name => property name => the class assigned to it, from every
         // `$this->prop = new ClassName()` sighting (or constructor-promoted property) across
         // every file — merged before resolving $propertyMethodCalls below since a property set
@@ -324,6 +366,29 @@ final class ClassAnalyzer
         foreach ($parseResults as $result) {
             foreach ($result->propertyMethodCalls as $call) {
                 $trackedClass = $propertyAssignedClasses[$call->ownerClass][$call->property] ?? null;
+
+                // Real-world gap (Yoast SEO): a property declared on an abstract base class
+                // (`Abstract_Scores_Route::$score_results_repository`) is only ever populated by
+                // a concrete subclass's own constructor (`$this->score_results_repository =
+                // $readability_score_results_repository;` — a plain, non-promoted, typed
+                // constructor parameter), while the actual `$this->prop->method()` read site
+                // lives back in the *base* class's own method body. $this-> there resolves to
+                // the base class, never the subclass that did the assigning, so the direct
+                // lookup above always misses. Same "declared on the base, populated/consumed by
+                // a descendant" shape $descendantsOf already exists for (see
+                // isUsedByDescendantReceiver's own docblock), just for a property assignment
+                // instead of a call receiver — trusts the first descendant found to have
+                // assigned this exact property name, same coarse "any resolvable concrete type
+                // is good enough" trade-off isUsedByPolymorphicCall already accepts.
+                if ($trackedClass === null) {
+                    foreach ($descendantsOf[$call->ownerClass] ?? [] as $descendant) {
+                        if (isset($propertyAssignedClasses[$descendant][$call->property])) {
+                            $trackedClass = $propertyAssignedClasses[$descendant][$call->property];
+                            break;
+                        }
+                    }
+                }
+
                 if ($trackedClass !== null) {
                     $scopedCalled[$trackedClass][$call->method] = true;
                 }
@@ -425,31 +490,6 @@ final class ClassAnalyzer
             }
         }
 
-        // Base class name => every class whose own extends chain passes through it (multi-level
-        // included: Astra_Get_Single_Page -> ... -> Astra_Abstract_Ability makes
-        // 'Astra_Abstract_Ability' => [..., 'Astra_Get_Single_Page']). Real-world gap found in the
-        // Astra theme: Astra_Abstract_Ability::register()/build_output_schema()/get_description()/
-        // get_category() are shared, concrete (non-abstract) methods declared once on the base
-        // class, then called from ~70 concrete subclasses as `Subclass::register()`,
-        // `$this->build_output_schema()` (from inside the subclass), `$instance->get_description()`
-        // — every one of those resolves the scoped call's receiver to the *subclass* name, never
-        // the base class the method is actually declared on, so scopedCalled[ownerClass] alone
-        // never matches. isUsedByDescendantReceiver() below widens the check the same direction
-        // isUsedByPolymorphicCall() already does the opposite way (concrete class -> the
-        // interface/ancestor a call was resolved to): here, base class -> any concrete descendant
-        // a call was actually resolved to.
-        $descendantsOf = [];
-        foreach ($classDefsByName as $fqcn => $def) {
-            $className = $fqcn;
-            for ($depth = 0; $depth < self::MAX_INHERITANCE_DEPTH; $depth++) {
-                $baseRef = ($classDefsByName[$className] ?? null)?->extends[0] ?? null;
-                if ($baseRef === null) {
-                    break;
-                }
-                $descendantsOf[$baseRef->fqcn][] = $fqcn;
-                $className = $baseRef->fqcn;
-            }
-        }
 
         $findings = [];
         foreach ($parseResults as $result) {
@@ -748,7 +788,11 @@ final class ClassAnalyzer
      * calls resolves its receiver to the descendant, not the class the method is actually
      * declared on. $descendantsOf (built once in findUnusedMethods) already carries every class
      * whose extends chain passes through $ownerClass, at any depth, so this is a flat lookup
-     * rather than its own chain walk.
+     * rather than its own chain walk. $ownerClass may equally be an interface's own name —
+     * $descendantsOf also carries every class that `implements` it, so a bodyless interface
+     * method declaration is rescued the same way a shared abstract-class method already was,
+     * whenever some concrete implementer is itself called via its own concrete receiver
+     * somewhere (see $descendantsOf's own build-site comment for the real-world case this closed).
      *
      * @param array<string,list<string>> $descendantsOf
      * @param array<string,array<string,bool>> $scopedCalled

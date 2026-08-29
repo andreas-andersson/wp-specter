@@ -29,5 +29,19 @@ final class FunctionDef
         // FunctionAnalyzer::isExcluded()'s own docblock for why this replaced a blanket
         // name-prefix exclusion.
         public readonly bool $guarded = false,
+        // $name resolved against the file's own `namespace X;` declaration (empty namespace ⇒
+        // $fqcn === $name, the common un-namespaced case). Unlike a class reference, a function
+        // *declaration* has no resolution ambiguity of its own — only a bare, unqualified *call*
+        // to it does, since PHP falls back to the global namespace for an unqualified call it
+        // can't find locally (see ParseResult::$functionCalls' own $namespaceFallbackFqcn field
+        // and FunctionAnalyzer's own docblock for why calls and declarations need different
+        // treatment here).
+        public readonly string $fqcn = '',
+        // True when an include/require-family keyword appears anywhere in this function/
+        // method's own body, including nested closures (but not further-nested named
+        // methods/functions — each gets its own independent flag). Consulted by FileAnalyzer via
+        // PendingDirectoryLoaderCall to recognize a bulk-directory-loader method called from a
+        // different file with a literal directory-name argument — see that class's own docblock.
+        public readonly bool $hasIncludeInBody = false,
     ) {}
 }

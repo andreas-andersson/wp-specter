@@ -313,18 +313,14 @@ class Application
             // A target with no detected mode isn't a recognizable theme (e.g. an mu-plugins
             // directory, which WP auto-loads directly with no template hierarchy at all) — the
             // WP template hierarchy simply doesn't apply, so there's nothing to check here.
-            //
-            // Plugin mode is ALSO excluded, deliberately — see TODO.md's "Template detection"
-            // section for the full story: TemplateAnalyzer's hierarchy-exemption bug (fixed) only
-            // half of this — actually enabling the check for plugins was tried and reverted after
-            // it surfaced real false positives against the very plugin (WooCommerce) the fix was
-            // built around. WooCommerce's own template-loading convention (`wc_get_template()`/
-            // `wc_get_template_part()`, not the WP-core functions this parser tracks) makes
-            // dozens of genuinely-used bundled templates statically invisible; enabling the check
-            // flagged at least 2 confirmed false positives per 2 genuine catches in that one
-            // plugin alone — a worse signal than not checking at all. Needs plugin-template-
-            // loader-wrapper recognition (a real, larger fix) before this can be safely enabled.
-            if ($config->wantsType('templates') && $target->mode !== null && $target->mode !== WpMode::Plugin) {
+            // Plugin mode DOES still run this — see TODO.md's "Template detection" section: this
+            // was previously excluded entirely after enabling it surfaced real false positives
+            // (WooCommerce's own `wc_get_template()`/`wc_get_template_part()` template-loading
+            // convention was statically invisible), re-enabled once `PhpTokenParser` learned to
+            // recognize those wrapper functions and `TemplateAnalyzer`'s own partial-match
+            // resolution was fixed to work against a plugin's directory-nested template files the
+            // same way it already did for a theme's root-level ones.
+            if ($config->wantsType('templates') && $target->mode !== null) {
                 $findings = array_merge($findings, (new TemplateAnalyzer($parser, $modeDetector))->analyze($allFiles, $target->mode, $target->path));
             }
 

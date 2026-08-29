@@ -965,6 +965,65 @@ class Not_Related {
         self::assertSame(9, $unusedMethods[0]->line, 'Should flag Not_Related::register(), not Base_Ability::register()');
     }
 
+    public function testCreditsInterfaceMethodCalledThroughConcreteImplementerReceiver(): void
+    {
+        // Real-world finding (Yoast SEO): an interface's own bodyless method declaration
+        // (Score_Results_Collector_Interface::get_score_results()) is never called through the
+        // interface type itself — only through a concrete implementer resolved to its own
+        // concrete receiver elsewhere (Concrete_Collector::get_score_results()). Before
+        // $descendantsOf walked `implements` (not just `extends`), an interface's own declaration
+        // had no equivalent to the abstract-base-class case just above — isUsedByDescendantReceiver
+        // must widen the same way for an interface ownerClass, crediting the interface's own
+        // declaration once any known implementer is itself called via its own receiver.
+        $file = $this->write('<?php
+interface Collector_Interface {
+    public function get_score_results();
+}
+class Concrete_Collector implements Collector_Interface {
+    public function get_score_results() {}
+}
+function boot(Concrete_Collector $c) {
+    $c->get_score_results();
+}
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('get_score_results', $unusedMethods);
+    }
+
+    public function testCreditsBasePropertyPopulatedByTypedConstructorParamInSubclass(): void
+    {
+        // Real-world finding (Yoast SEO): a property declared on an abstract base class
+        // ($score_results_collector on Abstract_Repository) is only ever populated by a concrete
+        // subclass's own constructor, via a plain (non-promoted) typed parameter — not `new
+        // ClassName()`, not constructor promotion — while the actual `$this->prop->method()` read
+        // site lives back in the *base* class's own method body. $this-> there resolves to the
+        // base class, never the subclass that did the assigning, so a direct
+        // $propertyAssignedClasses[$call->ownerClass] lookup always misses; the descendant
+        // fallback must resolve it via any known subclass that assigned the same property name.
+        $file = $this->write('<?php
+class Concrete_Collector {
+    public function get_score_results() {}
+    public function truly_unused() {}
+}
+abstract class Abstract_Repository {
+    protected $collector;
+    public function read() {
+        $this->collector->get_score_results();
+    }
+}
+class Concrete_Repository extends Abstract_Repository {
+    public function __construct(Concrete_Collector $collector) {
+        $this->collector = $collector;
+    }
+}
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('get_score_results', $unusedMethods);
+        self::assertContains('truly_unused', $unusedMethods);
+    }
+
     public function testExcludesInterfaceContractMethods(): void
     {
         $file = $this->write('<?php

@@ -16,6 +16,18 @@ final class FunctionAnalyzer
     public function __construct(private readonly PhpTokenParser $parser) {}
 
     /**
+     * Keyed by FQCN (`ParseResult::$functionDefs`/`$functionCalls` — see `FunctionDef::$fqcn`/
+     * `FunctionCall::$extraCandidateFqcn`), not bare short name — two unrelated namespaced
+     * functions sharing a short name no longer collide the way `ClassAnalyzer` used to before
+     * its own namespace-aware rework. Deliberately NOT the same treatment as classes throughout,
+     * though: an unqualified *class* reference always resolves to exactly one place, but PHP
+     * resolves an unqualified *function call* by trying the current namespace first and falling
+     * back to the *global* namespace at runtime if nothing matches there — a real ambiguity a
+     * static parser can't resolve on its own. `$called` below credits BOTH candidates for a bare
+     * call made from namespaced code (the current-namespace form and the bare/global form),
+     * favoring a false negative over a false positive in the rare case both happen to exist —
+     * the same conservative bias this analyzer already takes everywhere else.
+     *
      * @param list<string> $files
      * @return list<Finding>
      */
@@ -31,7 +43,7 @@ final class FunctionAnalyzer
                 if ($def->isMethod || $def->guarded || $this->isExcluded($def->name)) {
                     continue;
                 }
-                $definitions[$def->name] = $def;
+                $definitions[$def->fqcn] = $def;
             }
         }
 
@@ -40,6 +52,9 @@ final class FunctionAnalyzer
         foreach ($parseResults as $result) {
             foreach ($result->functionCalls as $call) {
                 $called[$call->name] = true;
+                if ($call->extraCandidateFqcn !== null) {
+                    $called[$call->extraCandidateFqcn] = true;
+                }
             }
         }
 
@@ -58,11 +73,11 @@ final class FunctionAnalyzer
 
         // Report defined-but-never-called
         $findings = [];
-        foreach ($definitions as $name => $def) {
-            if (!isset($called[$name])) {
+        foreach ($definitions as $fqcn => $def) {
+            if (!isset($called[$fqcn])) {
                 $findings[] = new Finding(
                     type: FindingType::UnusedFunction,
-                    name: $name,
+                    name: $def->name,
                     file: $def->file,
                     line: $def->line,
                     certainty: FindingCertainty::Error,

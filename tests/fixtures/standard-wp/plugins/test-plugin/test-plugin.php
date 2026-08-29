@@ -9,3 +9,5 @@ stdwp_plugin_used_func();
 
 // UNUSED
 function stdwp_plugin_orphan() {}
+
+include plugin_dir_path(__FILE__) . 'templates/used-template.php';

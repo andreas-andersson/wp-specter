@@ -58,6 +58,13 @@ final class ParseResult
      *                                           declared return type might be defined in a
      *                                           different file's parse (or later in this one) —
      *                                           see PendingReturnTypedCall's own docblock.
+     * @param list<PendingDirectoryLoaderCall> $pendingDirectoryLoaderCalls A scoped call with a
+     *                                           plain string-literal first argument
+     *                                           (`Foo::bulkLoad('inc')`) — unresolved, since
+     *                                           whether the callee actually bulk-loads that
+     *                                           directory can only be known once every file's
+     *                                           parse is merged — see
+     *                                           PendingDirectoryLoaderCall's own docblock.
      * @param list<TraitUsage>      $traitUsages Each `use TraitName;` seen directly inside a
      *                                            class/trait body, paired with the enclosing
      *                                            class/trait's own name (see PhpTokenParser's
@@ -108,6 +115,7 @@ final class ParseResult
         public readonly array $propertyAssignedClasses = [],
         public readonly array $propertyMethodCalls = [],
         public readonly array $pendingReturnTypedCalls = [],
+        public readonly array $pendingDirectoryLoaderCalls = [],
         public readonly array $traitUsages = [],
         public readonly array $globIncludeDirs = [],
         public readonly array $rootRelativeIncludeDirs = [],

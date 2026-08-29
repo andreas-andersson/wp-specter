@@ -133,6 +133,93 @@ function bootstrap() {
         self::assertContains('truly_unused_helper', $unused);
     }
 
+    public function testTwoNamespacedFunctionsWithTheSameShortNameAreTrackedSeparately(): void
+    {
+        // Two unrelated functions named "helper" in different namespaces -- before FQCN-keying,
+        // $definitions['helper'] silently held only whichever was parsed last, and a genuine
+        // call to one would falsely credit the other's identically-named, actually-dead sibling.
+        $usedFile = $this->write('<?php
+namespace My\App;
+function helper() {}
+helper();
+');
+        $deadFile = $this->write('<?php
+namespace Other\App;
+function helper() {}
+');
+        $findings = $this->analyzer->analyze([$usedFile, $deadFile]);
+        $unused = array_column($findings, 'name', 'file');
+        self::assertArrayNotHasKey($usedFile, $unused);
+        self::assertSame('helper', $unused[$deadFile] ?? null);
+    }
+
+    public function testBareCallInsideNamespaceResolvesToTheLocalFunctionFirst(): void
+    {
+        $file = $this->write('<?php
+namespace My\App;
+function helper() {}
+function bootstrap() { helper(); }
+bootstrap();
+');
+        self::assertEmpty($this->analyzer->analyze([$file]));
+    }
+
+    public function testBareCallInsideNamespaceFallsBackToTheGlobalFunction(): void
+    {
+        // PHP resolves an unqualified call by trying the current namespace first, falling back
+        // to the global namespace only if nothing matches locally -- a real runtime decision
+        // (unlike an unqualified class reference, which never falls back). "helper" isn't
+        // declared inside My\App at all, so the bare call here must credit the global one.
+        $globalFile = $this->write('<?php
+function helper() {}
+');
+        $callerFile = $this->write('<?php
+namespace My\App;
+function bootstrap() { helper(); }
+');
+        $findings = $this->analyzer->analyze([$globalFile, $callerFile]);
+        self::assertEmpty(array_filter($findings, fn($f) => $f->name === 'helper'));
+    }
+
+    public function testUseFunctionImportedCallResolvesToItsRealDeclarationAcrossFiles(): void
+    {
+        // Real-world finding (Jetpack): a function declared in one namespace, imported via
+        // `use function Fully\Qualified\Name;` into a file under a *different* namespace, then
+        // called bare there. Neither of the two existing bare-call candidates (the plain name,
+        // or the current-namespace-prefixed guess) names the real declaration's namespace, so
+        // without the import being consulted this false-positives as unused.
+        $declaringFile = $this->write('<?php
+namespace Automattic\Jetpack\Extensions\Map;
+function map_block_from_geo_points() {}
+');
+        $callerFile = $this->write('<?php
+namespace Automattic\Jetpack\Json_Endpoints;
+use function Automattic\Jetpack\Extensions\Map\map_block_from_geo_points;
+function bootstrap() { map_block_from_geo_points(); }
+bootstrap();
+');
+        $findings = $this->analyzer->analyze([$declaringFile, $callerFile]);
+        self::assertEmpty(array_filter($findings, fn($f) => $f->name === 'map_block_from_geo_points'));
+    }
+
+    public function testProjectOwnTemplateLoaderWrapperFunctionIsNotFlaggedUnusedByItsOwnCallSites(): void
+    {
+        // Real-world regression (Sydney theme): a project can both declare AND call its own
+        // template-loader wrapper (sydney_get_template_part() — matches the general
+        // "<prefix>_get_template_part" convention TemplateAnalyzer relies on). Every real call
+        // site gets recorded as a template ref (for TemplateAnalyzer's own purposes) — but that
+        // must not come at the cost of FunctionAnalyzer never seeing those same call sites as
+        // genuine calls to the wrapper's own declaration.
+        $file = $this->write('<?php
+function sydney_get_template_part( $slug, $name = null ) {
+    get_template_part( $slug, $name );
+}
+sydney_get_template_part( "content", "quick-view" );
+');
+        $names = array_column($this->analyzer->analyze([$file]), 'name');
+        self::assertNotContains('sydney_get_template_part', $names);
+    }
+
     public function testWpPrefixedFunctionsAreNotBlanketExcluded(): void
     {
         // A wp_/get_/the_/is_-prefixed name is no longer an automatic exemption on its own —

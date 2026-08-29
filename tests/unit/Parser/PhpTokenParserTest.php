@@ -305,6 +305,48 @@ get_sidebar();
         self::assertContains('get_sidebar', $funcs);
     }
 
+    public function testPrefixedTemplateLoaderWrapperFunctionsAreRecognizedGenerically(): void
+    {
+        // `<prefix>_get_template_part()`/`<prefix>_get_template()` is a widely-replicated
+        // WordPress-ecosystem naming convention, not one specific plugin's own invention —
+        // confirmed independently in WooCommerce (`wc_get_template_part`/`wc_get_template`,
+        // plus its documented legacy aliases `woocommerce_get_template_part`/
+        // `woocommerce_get_template`) and Sydney theme (`sydney_get_template_part`). Matched by
+        // suffix (isTemplateLoaderFunc()) rather than a fixed name list, so any other plugin's
+        // own wrapper following the same convention (e.g. Easy Digital Downloads'
+        // `edd_get_template_part()`, not itself in this project's real-world corpus) is covered
+        // too, with no per-plugin addition ever needed.
+        $result = $this->parse("<?php
+wc_get_template_part( 'content', 'product' );
+wc_get_template( 'single-product.php' );
+woocommerce_get_template_part( 'content', 'single-product' );
+woocommerce_get_template( 'checkout/form-checkout.php' );
+sydney_get_template_part( 'content', 'quick-view' );
+edd_get_template_part( 'content', 'download' );
+");
+        self::assertCount(6, $result->templateRefs);
+        // arg 0 becomes the ref, same as get_template_part('slug', $name) — 'content' repeats
+        // across 4 of these 6 calls for exactly that reason, not a test mistake.
+        $paths = array_column($result->templateRefs, 'path');
+        self::assertContains('content', $paths);
+        self::assertContains('single-product.php', $paths);
+        self::assertContains('checkout/form-checkout.php', $paths);
+    }
+
+    public function testFunctionNameMerelyContainingGetTemplateIsNotTreatedAsALoader(): void
+    {
+        // The suffix match is deliberately exact ("_get_template_part"/"_get_template", not a
+        // bare "contains get_template" substring check) — a function that just happens to share
+        // some of those words, or that's plural ("templates"), must not false-positive into
+        // treating an unrelated argument as a template reference.
+        $result = $this->parse("<?php
+get_template_directory();
+wc_get_templates( 'not-a-loader' );
+some_get_template_data( 'also-not-a-loader' );
+");
+        self::assertEmpty($result->templateRefs);
+    }
+
     public function testExtractsIncludeRequire(): void
     {
         $result = $this->parse("<?php
@@ -793,13 +835,15 @@ if ( ! \class_exists( "My_Guarded_Class" ) ) {
         self::assertContains('Astra_Customizer_Partials::render_partial_site_title', $calls);
     }
 
-    public function testConcatenatedArrayCallbackMethodNameRegistersAScopedPrefix(): void
+    public function testConcatenatedArrayCallbackMethodNameEnumeratesExactCallsAcrossBoundedLoop(): void
     {
         // Real-world finding (Astra theme): `add_action('astra_footer_html_'.$i, array($this,
-        // 'footer_html_'.$i))` inside a `for` loop wiring N numbered component slots. The
-        // literal 'footer_html_' alone isn't a real method name — the suffix only exists at
-        // runtime — so it must land as a *prefix* against the resolved $this receiver, not an
-        // exact-match scoped call for the truncated string.
+        // 'footer_html_'.$i))` inside a `for` loop wiring N numbered component slots. The loop
+        // here is a clean bounded-ascending range (parseForLoopBoundedRange recognizes it), so
+        // every concrete method name it actually produces is now enumerated exactly
+        // (My_Builder::footer_html_1..4) instead of falling back to the coarser prefix match —
+        // see the sibling test just below for the case where the bound genuinely isn't literal
+        // and the prefix fallback is still the right, and only, available answer.
         $result = $this->parse('<?php
 class My_Builder {
     public function wire() {
@@ -810,12 +854,105 @@ class My_Builder {
     public function footer_html_1() {}
 }
 ');
+        self::assertEmpty($result->scopedMethodCallPrefixes);
+        $calls = array_map(
+            fn($c) => $c->receiverClass . '::' . $c->method,
+            $result->scopedMethodCalls,
+        );
+        self::assertSame([
+            'My_Builder::footer_html_1',
+            'My_Builder::footer_html_2',
+            'My_Builder::footer_html_3',
+            'My_Builder::footer_html_4',
+        ], $calls);
+    }
+
+    public function testConcatenatedArrayCallbackMethodNameRegistersAScopedPrefixWhenLoopBoundIsNotLiteral(): void
+    {
+        // Same shape as the sibling test above, but the loop's upper bound comes from a
+        // variable, not a literal int — parseForLoopBoundedRange() deliberately doesn't guess
+        // here (the whole point of only recognizing a *provably* finite range), so the suffix
+        // stays unresolvable and must still fall back to the coarser prefix match, exactly as
+        // before this mechanism existed.
+        $result = $this->parse('<?php
+class My_Builder {
+    public function wire( $count ) {
+        for ($i = 1; $i <= $count; $i++) {
+            add_action("astra_footer_html_" . $i, array($this, "footer_html_" . $i));
+        }
+    }
+}
+');
         self::assertEmpty($result->scopedMethodCalls);
         $prefixes = array_map(
             fn($p) => $p->receiverClass . '::' . $p->prefix,
             $result->scopedMethodCallPrefixes,
         );
         self::assertContains('My_Builder::footer_html_', $prefixes);
+    }
+
+    public function testBareCallbackNameConcatenatedWithBoundedLoopVarEnumeratesEveryRealName(): void
+    {
+        // Real-world finding (Sydney theme): `'render_callback' =>
+        // 'sydney_partial_slider_title_' . $i` inside `for ($i = 1; $i < 5; $i++)` — a bare
+        // (no array, no receiver) callback-name literal split across a loop-counter
+        // concatenation. Without loop-range tracking this either records the single truncated
+        // prefix as a wrong exact-match name, or (once a receiver-based prefix mechanism exists)
+        // still can't apply here since there's no resolvable receiver at all — every one of the
+        // 4 real functions must be enumerated by name directly into the unscoped call pool.
+        $result = $this->parse('<?php
+for ($i = 1; $i < 5; $i++) {
+    $x = array(
+        "render_callback" => "sydney_partial_slider_title_" . $i,
+    );
+}
+');
+        // "render_callback" itself (the array key) also passes through this same general
+        // string-literal handling and lands in the pool too — pre-existing, unrelated "coarse
+        // net" behavior (any bare identifier-shaped literal anywhere is a candidate), not
+        // something this test is about; only the 4 enumerated names matter here.
+        $names = array_column($result->functionCalls, 'name');
+        self::assertContains('sydney_partial_slider_title_1', $names);
+        self::assertContains('sydney_partial_slider_title_2', $names);
+        self::assertContains('sydney_partial_slider_title_3', $names);
+        self::assertContains('sydney_partial_slider_title_4', $names);
+        self::assertNotContains('sydney_partial_slider_title_5', $names);
+        self::assertNotContains('sydney_partial_slider_title_', $names);
+    }
+
+    public function testFilePathConcatenatedWithBoundedLoopVarEnumeratesEveryPhpPathString(): void
+    {
+        // General form of the file-path-via-concatenation shape a bounded loop can split a
+        // literal across, mirroring the callback-name case above but for phpPathStrings instead
+        // of functionCalls — the prefix alone ('icons-v6-') doesn't end in '.php', so the plain
+        // single-literal check never fires without this.
+        $result = $this->parse('<?php
+for ($i = 0; $i <= 3; $i++) {
+    $x = "icons-v6-" . $i . ".php";
+}
+');
+        self::assertSame([
+            'icons-v6-0.php',
+            'icons-v6-1.php',
+            'icons-v6-2.php',
+            'icons-v6-3.php',
+        ], $result->phpPathStrings);
+    }
+
+    public function testUnboundedForLoopDoesNotEnumerateConcatenatedLiterals(): void
+    {
+        // A non-canonical for-loop (non-literal bound) must leave the loop variable completely
+        // untracked — no enumeration, no crash, same behavior as before this mechanism existed.
+        $result = $this->parse('<?php
+function boot( $count ) {
+    for ($i = 1; $i < $count; $i++) {
+        my_helper( "item_" . $i );
+    }
+}
+');
+        $names = array_column($result->functionCalls, 'name');
+        self::assertNotContains('item_1', $names);
+        self::assertNotContains('item_2', $names);
     }
 
     public function testWpCliAddCommandRegistersTheClassForReflectionDispatch(): void
@@ -1001,6 +1138,53 @@ function boot() {
         self::assertNull($result->pendingReturnTypedCalls[0]->sourceReceiverClass);
         self::assertSame('some_factory', $result->pendingReturnTypedCalls[0]->sourceMethod);
         self::assertSame('render', $result->pendingReturnTypedCalls[0]->readMethod);
+    }
+
+    public function testMethodHasIncludeInBodyDetectsDirectRequire(): void
+    {
+        $result = $this->parse('<?php
+class File_Loader {
+    public function loadPhpFiles( $dir ) {
+        require_once $dir . "/x.php";
+    }
+    public function noop() {}
+}
+');
+        $defs = [];
+        foreach ($result->functionDefs as $def) {
+            $defs[$def->name] = $def;
+        }
+        self::assertTrue($defs['loadPhpFiles']->hasIncludeInBody);
+        self::assertFalse($defs['noop']->hasIncludeInBody);
+    }
+
+    public function testMethodHasIncludeInBodyDetectsRequireInsideNestedClosure(): void
+    {
+        // Real-world shape (Flynt theme): loadPhpFiles() itself has no require directly in its
+        // own body — it delegates to a closure passed to a directory-iteration helper, and the
+        // require lives inside *that* closure instead.
+        $result = $this->parse('<?php
+class File_Loader {
+    public function loadPhpFiles( $dir ) {
+        $this->iterate( $dir, function ( $file ) {
+            require_once $file;
+        } );
+    }
+}
+');
+        $defs = array_column($result->functionDefs, null, 'name');
+        self::assertTrue($defs['loadPhpFiles']->hasIncludeInBody);
+    }
+
+    public function testScopedCallWithLiteralFirstArgRecordsPendingDirectoryLoaderCall(): void
+    {
+        $result = $this->parse('<?php
+File_Loader::loadPhpFiles( "inc" );
+');
+        self::assertCount(1, $result->pendingDirectoryLoaderCalls);
+        self::assertSame('File_Loader', $result->pendingDirectoryLoaderCalls[0]->receiverClass);
+        self::assertSame('loadPhpFiles', $result->pendingDirectoryLoaderCalls[0]->methodName);
+        self::assertSame('inc', $result->pendingDirectoryLoaderCalls[0]->literalArg);
     }
 
     public function testLocalVariableTypeDoesNotLeakAcrossFunctions(): void
@@ -1613,6 +1797,95 @@ if ( ! function_exists( "my_helper" ) && true ) {
 ');
         $defs = array_column($result->functionDefs, null, 'name');
         self::assertFalse($defs['my_helper']->guarded);
+    }
+
+    // ── FunctionDef/FunctionCall FQCN resolution ─────────────────────────────
+
+    public function testNamespacedFunctionDefResolvesFqcn(): void
+    {
+        $result = $this->parse('<?php
+namespace My\App;
+function helper() {}
+');
+        $defs = array_column($result->functionDefs, null, 'name');
+        self::assertSame('My\App\helper', $defs['helper']->fqcn);
+    }
+
+    public function testUnnamespacedFunctionDefFqcnEqualsName(): void
+    {
+        $result = $this->parse('<?php
+function helper() {}
+');
+        $defs = array_column($result->functionDefs, null, 'name');
+        self::assertSame('helper', $defs['helper']->fqcn);
+    }
+
+    public function testBareCallInsideNamespaceRecordsTheLocalCandidateFqcn(): void
+    {
+        $result = $this->parse('<?php
+namespace My\App;
+helper();
+');
+        self::assertSame('My\App\helper', $result->functionCalls[0]->extraCandidateFqcn);
+    }
+
+    public function testBareCallOutsideAnyNamespaceHasNoExtraCandidate(): void
+    {
+        $result = $this->parse('<?php
+helper();
+');
+        self::assertNull($result->functionCalls[0]->extraCandidateFqcn);
+    }
+
+    public function testFullyQualifiedCallRecordsItsDeterministicCandidateFqcn(): void
+    {
+        $result = $this->parse('<?php
+namespace My\App;
+\Vendor\Pkg\helper();
+');
+        self::assertSame('Vendor\Pkg\helper', $result->functionCalls[0]->extraCandidateFqcn);
+    }
+
+    public function testUseFunctionImportedBareCallRecordsTheImportedCandidateFqcn(): void
+    {
+        // Real-world finding (Jetpack): `use function Automattic\Jetpack\Extensions\Map\
+        // map_block_from_geo_points;` then a bare call to it elsewhere in the same file —
+        // PHP fixes a `use function`-imported name to its target at compile time, shadowing the
+        // usual current-namespace-then-global runtime fallback entirely. Deliberately declared
+        // inside a *different* namespace than the import target, so a plain
+        // currentNamespace-prefixed guess (the existing ambiguous-bare-call candidate) would
+        // never have matched this on its own.
+        $result = $this->parse('<?php
+namespace My\App;
+use function Automattic\Jetpack\Extensions\Map\map_block_from_geo_points;
+map_block_from_geo_points();
+');
+        self::assertSame(
+            'Automattic\Jetpack\Extensions\Map\map_block_from_geo_points',
+            $result->functionCalls[0]->extraCandidateFqcn,
+        );
+    }
+
+    public function testUseFunctionImportWithAliasRecordsTheImportedCandidateUnderTheAlias(): void
+    {
+        $result = $this->parse('<?php
+use function My\Ns\helper as aliased_helper;
+aliased_helper();
+');
+        self::assertSame('My\Ns\helper', $result->functionCalls[0]->extraCandidateFqcn);
+    }
+
+    public function testUseFunctionImportTakesPriorityOverNamespaceFallbackCandidate(): void
+    {
+        // If the import and the current namespace disagree on where the call resolves, the
+        // import wins deterministically — PHP never falls back to the current namespace once a
+        // `use function` import shadows the bare name.
+        $result = $this->parse('<?php
+namespace My\App;
+use function Vendor\Pkg\helper;
+helper();
+');
+        self::assertSame('Vendor\Pkg\helper', $result->functionCalls[0]->extraCandidateFqcn);
     }
 
     private function parse(string $code): \WpSpecter\Parser\ParseResult

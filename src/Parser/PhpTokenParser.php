@@ -16,7 +16,31 @@ final class PhpTokenParser
     // Hook tag argument position (0-indexed) for WP-Cron scheduling calls — the hook itself
     // fires later inside WP-Cron core, not via a visible do_action() in project code.
     private const CRON_SCHEDULE_FUNCS = ['wp_schedule_event' => 2, 'wp_schedule_single_event' => 1];
+    // get_header()/get_footer()/get_sidebar() are WP core's own three template-hierarchy loader
+    // functions — each gets its own filename-stem prefix rewrite in parseTemplateRef() (arg 0
+    // 'kiosk' => 'header-kiosk.php'), a WP-core-specific convention no third-party wrapper
+    // replicates under its own name, so these three stay fixed, exact entries rather than folded
+    // into the suffix-based check below.
     private const TEMPLATE_FUNCS = ['get_template_part', 'get_header', 'get_footer', 'get_sidebar'];
+    // `<prefix>_get_template_part()`/`<prefix>_get_template()` — a widely-replicated WordPress-
+    // ecosystem naming convention for a plugin/theme's own template-loader wrapper, not a single
+    // plugin's own invention: WooCommerce's `wc_get_template_part()`/`wc_get_template()` (plus
+    // its documented legacy aliases `woocommerce_get_template_part()`/`woocommerce_get_template()`)
+    // and Sydney theme's own `sydney_get_template_part()` are two independently-confirmed
+    // real-world instances of the exact same shape — both treat arg 0 as the template ref exactly
+    // like WP core's own get_template_part(), and TemplateAnalyzer's existing partial-match logic
+    // (get_template_part('slug', $name) => any "slug-*" file is reachable) already generalizes
+    // correctly to the two-argument form with no further special-casing. A fixed name list would
+    // only ever cover whichever specific plugins happened to get scanned and traced by hand;
+    // matching the naming convention itself covers every current and future wrapper that follows
+    // it, at the one-time cost of a slightly wider (but still narrow — this exact suffix, not a
+    // bare "contains get_template") net. See isTemplateLoaderFunc()'s own docblock.
+    private function isTemplateLoaderFunc(string $name): bool
+    {
+        return in_array($name, self::TEMPLATE_FUNCS, true)
+            || str_ends_with($name, '_get_template_part')
+            || str_ends_with($name, '_get_template');
+    }
     // `if ( ! class_exists( 'My_Class' ) ) { class My_Class { ... } }` — an extremely common WP
     // redeclaration guard, self-referencing the very thing it's about to define. Without
     // excluding it, the guard's own string argument flows into the same generic name pool
@@ -71,6 +95,7 @@ final class PhpTokenParser
         $propertyAssignedClasses = [];
         $propertyMethodCalls = [];
         $pendingReturnTypedCalls = [];
+        $pendingDirectoryLoaderCalls = [];
         $traitUsages = [];
         // glob(__DIR__ . '/inc/*.php') + a foreach/require loop is a common WP bulk-include
         // pattern this tokenizer can't trace as dataflow (the require target is a plain loop
@@ -82,6 +107,30 @@ final class PhpTokenParser
         $rootRelativeIncludeDirs = [];
         $hasIncludeStatement = false;
         $useImports = [];
+        // Alias/bare-name => FQCN, from `use function Some\Namespace\name [as alias];`. Unlike
+        // $useImports (which only ever disambiguates a class *reference*, never a function call's
+        // own resolution), a matching entry here changes what a later BARE call actually resolves
+        // to: PHP fixes a `use function`-imported name to its target at compile time, shadowing
+        // the usual current-namespace-then-global runtime fallback entirely — see the two
+        // extraCandidateFqcn computation sites below (T_STRING bare-call dispatch and the string-
+        // callback shape) for where this gets consulted instead of the plain namespace-prefixed
+        // guess.
+        $useFunctionImports = [];
+        // Bounded numeric for-loop variable tracking: `for ($i = 1; $i < 5; $i++) { ... }` — a
+        // loop variable concatenated into a literal (`'prefix_' . $i`) can't be resolved to its N
+        // concrete suffixes without knowing $i's own range (see parseForLoopBoundedRange/
+        // resolveForLoopConcatenatedLiteral). Parallel brace-depth-tracked stacks, same push-on-
+        // '{'/pop-on-'}' lockstep pattern used throughout this parser (see $expectingFunctionOpen
+        // above); $expectingForLoopOpen only gets set when parseForLoopBoundedRange actually
+        // recognized the clean canonical form, so an unrecognized/unbounded for-loop simply never
+        // pushes anything — the loop variable then behaves exactly as before this mechanism
+        // existed (unresolved, same as any other ordinary variable).
+        $expectingForLoopOpen = false;
+        $forLoopVarDepthStack = [];
+        $forLoopVarNameStack = [];
+        $forLoopVarValuesStack = [];
+        $pendingForLoopVarName = null;
+        $pendingForLoopVarValues = null;
         // CONST_NAME => trailing string literal from a `define('CONST_NAME', <expr>)` call in
         // this file — e.g. `define('ASTRA_HEADER_BUILDER_CONFIGS_DIR', ASTRA_THEME_DIR .
         // 'inc/.../configs/')` records 'inc/.../configs/'. Lets a later `scandir(CONST_NAME)`
@@ -178,6 +227,22 @@ final class PhpTokenParser
         $functionNameStack = [];
         $pendingFunctionName = null;
         $varLiteralAssignmentsStack = [[]];
+
+        // Per-function-body "does this function/method's own body (including nested closures)
+        // contain an include/require-family keyword anywhere" tracking — same push-on-'{'/
+        // pop-on-'}' lockstep as $functionDepthStack, but the *value* accumulates true instead of
+        // being reset per scope, so a require inside a closure correctly marks every currently-
+        // open enclosing scope too. $functionDefIndexForBodyStack pairs each open scope with its
+        // FunctionDef's own index in $functionDefs (null for an anonymous closure, which has no
+        // FunctionDef to update, or for a bodyless abstract/interface method signature, which
+        // never opens a '{' at all and so never reaches this stack in the first place) so the
+        // real value can be written back once the body actually closes — parseFunctionDef() runs,
+        // and $def gets pushed, before any of its body has been scanned at all, so this can't be
+        // known any earlier than that. See FunctionDef::$hasIncludeInBody's own docblock for what
+        // this feeds.
+        $functionHasIncludeStack = [];
+        $functionDefIndexForBodyStack = [];
+        $pendingFunctionDefIndex = null;
         // $hook = 'my_plugin_loaded'; do_action($hook); — last-write-wins (unlike
         // $varLiteralAssignmentsStack's accumulation above), the same semantics as $varTypesStack
         // but for a string value instead of a class name: a hook/template-part call site cares
@@ -224,14 +289,32 @@ final class PhpTokenParser
                         $varLiteralAssignmentsStack[] = [];
                         $varLiteralValueStack[] = [];
                         $varAssignedFromFunctionStack[] = [];
+                        $functionHasIncludeStack[] = false;
+                        $functionDefIndexForBodyStack[] = $pendingFunctionDefIndex;
                         $expectingFunctionOpen = false;
                         $pendingParamTypes = [];
                         $pendingFunctionName = null;
+                        $pendingFunctionDefIndex = null;
                     }
                     if ($pendingFunctionExistsGuardName !== null) {
                         $functionExistsGuardDepthStack[] = $braceDepth;
                         $functionExistsGuardNameStack[] = $pendingFunctionExistsGuardName;
                         $pendingFunctionExistsGuardName = null;
+                    }
+                    if ($expectingForLoopOpen) {
+                        $forLoopVarDepthStack[] = $braceDepth;
+                        // The `?? ''`/`?? []` fallbacks are unreachable in practice —
+                        // $expectingForLoopOpen is only ever set true in the same branch that
+                        // sets both pending values from a non-null parseForLoopBoundedRange()
+                        // result — but keep the stacks' own element type non-nullable (unlike
+                        // $functionDefIndexForBodyStack just above, where null is itself a
+                        // meaningful value) since nothing downstream ever wants to match a
+                        // tracked loop variable's name against null.
+                        $forLoopVarNameStack[] = $pendingForLoopVarName ?? '';
+                        $forLoopVarValuesStack[] = $pendingForLoopVarValues ?? [];
+                        $expectingForLoopOpen = false;
+                        $pendingForLoopVarName = null;
+                        $pendingForLoopVarValues = null;
                     }
                 } elseif ($token === '}') {
                     if ($interpolationDepth > 0) {
@@ -250,10 +333,24 @@ final class PhpTokenParser
                             array_pop($varLiteralAssignmentsStack);
                             array_pop($varLiteralValueStack);
                             array_pop($varAssignedFromFunctionStack);
+                            $hasInclude = array_pop($functionHasIncludeStack);
+                            $defIndex = array_pop($functionDefIndexForBodyStack);
+                            if ($hasInclude && $defIndex !== null) {
+                                $d = $functionDefs[$defIndex];
+                                $functionDefs[$defIndex] = new FunctionDef(
+                                    $d->name, $d->line, $d->file, $d->isMethod, $d->ownerClass,
+                                    $d->returnType, guarded: $d->guarded, fqcn: $d->fqcn, hasIncludeInBody: true,
+                                );
+                            }
                         }
                         if (!empty($functionExistsGuardDepthStack) && end($functionExistsGuardDepthStack) === $braceDepth) {
                             array_pop($functionExistsGuardDepthStack);
                             array_pop($functionExistsGuardNameStack);
+                        }
+                        if (!empty($forLoopVarDepthStack) && end($forLoopVarDepthStack) === $braceDepth) {
+                            array_pop($forLoopVarDepthStack);
+                            array_pop($forLoopVarNameStack);
+                            array_pop($forLoopVarValuesStack);
                         }
                         $braceDepth--;
                     }
@@ -377,8 +474,12 @@ final class PhpTokenParser
                 // $classDepthStack being empty here. Recorded so VendorClassReflector can resolve
                 // an extends/implements short name (PhpTokenParser only ever keeps short names,
                 // see shortClassName) back to a real, autoloadable vendor class.
-                foreach ($this->parseUseImports($tokens, $i) as $alias => $fqcn) {
+                [$classImports, $functionImports] = $this->parseUseImports($tokens, $i);
+                foreach ($classImports as $alias => $fqcn) {
                     $useImports[$alias] = $fqcn;
+                }
+                foreach ($functionImports as $alias => $fqcn) {
+                    $useFunctionImports[$alias] = $fqcn;
                 }
                 continue;
             }
@@ -433,6 +534,20 @@ final class PhpTokenParser
                 continue;
             }
 
+            // `for ($i = 1; $i < 5; $i++) { ... }` — see parseForLoopBoundedRange's own docblock
+            // for exactly which shapes are recognized. Only sets $expectingForLoopOpen (the push
+            // itself happens at the loop's own next '{', mirroring $expectingFunctionOpen) when
+            // the canonical bounded-ascending form is confirmed; anything else leaves the loop
+            // variable untracked, same as before this mechanism existed.
+            if ($type === T_FOR) {
+                $forResult = $this->parseForLoopBoundedRange($tokens, $i);
+                if ($forResult !== null) {
+                    [$pendingForLoopVarName, $pendingForLoopVarValues] = $forResult;
+                    $expectingForLoopOpen = true;
+                }
+                continue;
+            }
+
             // foreach ($ability_files as $file) { ... require ...$file... ...; } — a bulk-include
             // driven by a plain array-of-literals instead of glob()/scandir(). Real-world example
             // (Astra theme): a 64-entry array of relative path fragments, each require_once'd in
@@ -482,8 +597,10 @@ final class PhpTokenParser
                 $ownerClass = empty($classNameStack) ? null : end($classNameStack);
                 $ownerParent = empty($classParentStack) ? null : end($classParentStack);
                 $def = $this->parseFunctionDef($tokens, $i, $file, $insideClass, $ownerClass);
-                if ($def !== null && !empty($functionExistsGuardNameStack) && end($functionExistsGuardNameStack) === $def->name) {
-                    $def = new FunctionDef($def->name, $def->line, $def->file, $def->isMethod, $def->ownerClass, $def->returnType, guarded: true);
+                if ($def !== null) {
+                    $isGuarded = !empty($functionExistsGuardNameStack) && end($functionExistsGuardNameStack) === $def->name;
+                    $fqcn = $currentNamespace === '' ? $def->name : $currentNamespace . '\\' . $def->name;
+                    $def = new FunctionDef($def->name, $def->line, $def->file, $def->isMethod, $def->ownerClass, $def->returnType, guarded: $isGuarded, fqcn: $fqcn);
                 }
                 // Type-hinted parameters: `function foo(My_Class $x)` both references My_Class
                 // and, same as `$x = new My_Class()`, tells us $x's type for the rest of the
@@ -501,12 +618,13 @@ final class PhpTokenParser
                         : null;
                     if ($returnType !== null) {
                         $classReferences[] = $returnType->short;
-                        $def = new FunctionDef($def->name, $def->line, $def->file, $def->isMethod, $def->ownerClass, $returnType->fqcn, guarded: $def->guarded);
+                        $def = new FunctionDef($def->name, $def->line, $def->file, $def->isMethod, $def->ownerClass, $returnType->fqcn, guarded: $def->guarded, fqcn: $def->fqcn);
                     }
                 }
                 if ($def !== null) {
                     $functionDefs[] = $def;
                 }
+                $pendingFunctionDefIndex = $def !== null ? count($functionDefs) - 1 : null;
                 if ($parenIndex !== null) {
                     [$hintClassRefs, $pendingParamTypes, $promotedPropertyTypes] = $this->parseParamTypeHints($tokens, $parenIndex, $ownerClass, $ownerParent, $currentNamespace, $useImports);
                     foreach ($hintClassRefs as $ref) {
@@ -741,6 +859,23 @@ final class PhpTokenParser
                         if ($receiverClass !== null) {
                             $scopedMethodCalls[] = new ScopedMethodCall($receiverClass, $methodName);
                             $i = $methodNameIndex;
+
+                            // Foo::bulkLoad('inc') — a scoped call with a plain string-literal
+                            // first argument. Recorded as a *candidate* directory-loader call
+                            // regardless of what the callee actually does with it; resolved once
+                            // every file's parse is merged, against whether the callee method's
+                            // own body turns out to contain a require/include keyword anywhere
+                            // (see FunctionDef::$hasIncludeInBody and PendingDirectoryLoaderCall's
+                            // own docblock for the real-world shape this covers — Flynt theme's
+                            // `FileLoader::loadPhpFiles('inc')`).
+                            $literalArgIndex = $this->firstStringArgIndex($tokens, $methodNameIndex);
+                            if ($literalArgIndex !== null) {
+                                $pendingDirectoryLoaderCalls[] = new PendingDirectoryLoaderCall(
+                                    $receiverClass,
+                                    $methodName,
+                                    $this->stripQuotes($tokens[$literalArgIndex][1]),
+                                );
+                            }
                         }
                     }
                     continue;
@@ -753,6 +888,12 @@ final class PhpTokenParser
 
                 $this->dispatchBareFunctionCall(
                     $name,
+                    // A `use function`-imported name resolves deterministically (the import
+                    // shadows the runtime fallback entirely — see $useFunctionImports' own
+                    // declaration-site comment); otherwise a bare call inside a namespaced file
+                    // is genuinely ambiguous at runtime (current-namespace tried first, falling
+                    // back to global) — see FunctionCall::$extraCandidateFqcn's own docblock.
+                    $useFunctionImports[$name] ?? ($currentNamespace === '' ? null : $currentNamespace . '\\' . $name),
                     $tokens,
                     $i,
                     $line,
@@ -818,6 +959,10 @@ final class PhpTokenParser
                 if ($nextNonWhitespace === '(') {
                     $this->dispatchBareFunctionCall(
                         $this->shortClassName($value),
+                        // Qualified/fully-qualified calls resolve deterministically (no runtime
+                        // fallback the way a bare call has) — the real resolveFqcn() target,
+                        // same rule a class reference would use.
+                        $this->resolveFqcn($value, $currentNamespace, $useImports),
                         $tokens,
                         $i,
                         $line,
@@ -851,6 +996,14 @@ final class PhpTokenParser
                     continue;
                 }
                 $stringVal = $this->stripQuotes($value);
+                // A literal directly concatenated with a currently-tracked bounded for-loop
+                // variable (`'prefix_' . $i` inside `for ($i = 1; $i < 5; $i++) { ... }`) —
+                // computed once per literal and shared by both the callback-name and file-path
+                // checks below, since exactly one of them ever consumes it for a given literal
+                // (a callback-shaped identifier can't also end in '.php' — PHP identifiers don't
+                // contain dots). See resolveForLoopConcatenatedLiteral's own docblock for the
+                // real-world shapes this covers.
+                $forLoopEnumeration = $this->resolveForLoopConcatenatedLiteral($tokens, $i, $stringVal, $forLoopVarNameStack, $forLoopVarValuesStack);
                 // Namespaced/class-scoped code commonly builds a fully-qualified callback string
                 // via concatenation — `__NAMESPACE__ . '\my_callback'` or `__CLASS__ .
                 // '::my_method'` (or writes the FQ form out directly: '\My\Namespace\my_callback')
@@ -881,7 +1034,35 @@ final class PhpTokenParser
                     }
                 }
                 $callbackName = $sepEnd !== null ? substr($stringVal, $sepEnd) : $stringVal;
-                if ($this->looksLikeCallback($callbackName)) {
+                $isCallbackShaped = $this->looksLikeCallback($callbackName);
+                // Only meaningful when there's no '\\'/'::' separator (the concatenation is with
+                // the *whole* callback name, not a fully-qualified prefix built some other way —
+                // that composite shape has no confirmed real-world case and isn't attempted) and
+                // the prefix genuinely looks like a callback identifier in the first place —
+                // tracked separately from $forLoopEnumeration itself so the ".php"-suffixed
+                // file-path check further below can tell whether this literal's enumeration was
+                // already consumed here, without re-deriving the same condition twice.
+                $forLoopCallbackEnumeration = ($sepEnd === null && $isCallbackShaped) ? $forLoopEnumeration : null;
+                if ($forLoopCallbackEnumeration !== null) {
+                    // Real-world shape (Sydney theme): `'render_callback' =>
+                    // 'sydney_partial_slider_title_' . $i` inside `for ($i = 1; $i < 5; $i++)` —
+                    // enumerate every concrete name the loop actually produces instead of the
+                    // single truncated prefix a plain (), which would both fail to match any real
+                    // declaration and — if $receiverClass ever resolves here — pollute
+                    // scopedCalled with a name nothing declares.
+                    [$enumeratedNames, $lastForLoopIndex] = $forLoopCallbackEnumeration;
+                    $receiverClass = $this->arrayCallbackReceiverClass($tokens, $i, $classNameStack, $classParentStack, $currentNamespace, $useImports);
+                    foreach ($enumeratedNames as $enumeratedName) {
+                        if ($receiverClass !== null) {
+                            $scopedMethodCalls[] = new ScopedMethodCall($receiverClass, $enumeratedName);
+                        } else {
+                            $extraCandidateFqcn = $useFunctionImports[$enumeratedName]
+                                ?? ($currentNamespace === '' ? null : $currentNamespace . '\\' . $enumeratedName);
+                            $functionCalls[] = new FunctionCall($enumeratedName, $line, $file, $extraCandidateFqcn);
+                        }
+                    }
+                    $i = $lastForLoopIndex;
+                } elseif ($isCallbackShaped) {
                     // [$this, 'method'] / [self::class, 'method'] / [Foo::class, 'method'] /
                     // ['Foo', 'method'] — the common add_action/add_filter array-callback shape
                     // — has a resolvable receiver often enough to be worth checking here, same
@@ -937,14 +1118,37 @@ final class PhpTokenParser
                     } elseif ($receiverClass !== null) {
                         $scopedMethodCalls[] = new ScopedMethodCall($receiverClass, $callbackName);
                     } else {
-                        $functionCalls[] = new FunctionCall($callbackName, $line, $file);
+                        // Real-world shape (Sakurairo theme): `__NAMESPACE__ . '\my_handler'` —
+                        // the whole point of the __NAMESPACE__ concatenation is resolving into
+                        // the calling file's own namespace, so the same "extra candidate"
+                        // treatment a bare call gets applies here too — including a `use
+                        // function`-imported name taking priority, same as the plain bare-call
+                        // dispatch site above.
+                        $extraCandidateFqcn = $useFunctionImports[$callbackName]
+                            ?? ($currentNamespace === '' ? null : $currentNamespace . '\\' . $callbackName);
+                        $functionCalls[] = new FunctionCall($callbackName, $line, $file, $extraCandidateFqcn);
                     }
                 }
                 // Any ".php"-suffixed literal is a plausible file reference — e.g. ACF's
                 // 'render_template' => get_template_directory() . '/blocks/foo.php', page
                 // template registration arrays, or other config-driven includes that never
                 // pass through include()/require(). Cheap net, no call-site required.
-                if (str_ends_with($stringVal, '.php')) {
+                //
+                // A prefix concatenated with a tracked bounded for-loop variable
+                // (`'icons-v6-' . $i . '.php'`) doesn't end in '.php' on its own — the plain
+                // check below would never fire — but was already computed once above
+                // ($forLoopEnumeration); only consumed here when the callback branch didn't
+                // already claim it (a callback-shaped identifier can't also end in '.php', so in
+                // practice these two are mutually exclusive per literal, never a double-count).
+                if ($forLoopEnumeration !== null && $forLoopCallbackEnumeration === null) {
+                    [$enumeratedPaths, $lastForLoopIndex] = $forLoopEnumeration;
+                    foreach ($enumeratedPaths as $enumeratedPath) {
+                        if (str_ends_with($enumeratedPath, '.php')) {
+                            $phpPathStrings[] = $enumeratedPath;
+                        }
+                    }
+                    $i = $lastForLoopIndex;
+                } elseif (str_ends_with($stringVal, '.php')) {
                     $phpPathStrings[] = $stringVal;
                 }
                 continue;
@@ -952,6 +1156,13 @@ final class PhpTokenParser
 
             if (in_array($type, self::INCLUDE_KEYWORDS, true)) {
                 $hasIncludeStatement = true;
+                // Mark every currently-open function/method scope, not just the innermost — a
+                // require inside a closure nested within a named method's body must still count
+                // as that enclosing method's own body containing one (see
+                // FunctionDef::$hasIncludeInBody's own docblock).
+                foreach (array_keys($functionHasIncludeStack) as $depthIndex) {
+                    $functionHasIncludeStack[$depthIndex] = true;
+                }
                 $ref = $this->parseIncludeRef($tokens, $i, $line, $file, token_name($type));
                 if ($ref !== null) {
                     $templateRefs[] = $ref;
@@ -981,7 +1192,12 @@ final class PhpTokenParser
 
         return new ParseResult(
             file: $file,
-            functionDefs: $functionDefs,
+            // array_values(): $functionDefs is mutated by index (not just appended to) once a
+            // function/method body turns out to contain an include — see FunctionDef::
+            // $hasIncludeInBody. Still a genuine list at runtime (every index written back is
+            // one already inside the array's own current bounds), just not something phpstan can
+            // prove from a plain index-assignment; array_values() re-establishes that.
+            functionDefs: array_values($functionDefs),
             functionCalls: $functionCalls,
             hookRegistrations: $hookRegistrations,
             hookInvocations: $hookInvocations,
@@ -995,6 +1211,7 @@ final class PhpTokenParser
             propertyAssignedClasses: $propertyAssignedClasses,
             propertyMethodCalls: $propertyMethodCalls,
             pendingReturnTypedCalls: $pendingReturnTypedCalls,
+            pendingDirectoryLoaderCalls: $pendingDirectoryLoaderCalls,
             traitUsages: $traitUsages,
             globIncludeDirs: $globIncludeDirs,
             rootRelativeIncludeDirs: $rootRelativeIncludeDirs,
@@ -1391,6 +1608,7 @@ final class PhpTokenParser
      */
     private function dispatchBareFunctionCall(
         string $name,
+        ?string $extraCandidateFqcn,
         array $tokens,
         int $i,
         string|int $line,
@@ -1427,8 +1645,19 @@ final class PhpTokenParser
             return;
         }
 
-        if (in_array($name, self::TEMPLATE_FUNCS, true)) {
+        if ($this->isTemplateLoaderFunc($name)) {
             $templateRefs[] = $this->parseTemplateRef($tokens, $i, $line, $file, $name, $varLiteralValues, $classConstants, $currentClass, $currentParent, $currentNamespace, $useImports);
+
+            // Recording a template ref doesn't preclude this also being a genuine function call —
+            // a WP-core name (get_template_part, never itself project-declared) gains nothing from
+            // this, but a project's own template-loader wrapper (wc_get_template_part,
+            // sydney_get_template_part, ... — see isTemplateLoaderFunc()) is both called here AND
+            // declared elsewhere in the same project, and deserves the same "is this used" credit
+            // any other function call gives its own declaration. Real-world regression this
+            // fixes: Sydney theme's own sydney_get_template_part() looked unused the moment its
+            // real call sites started being recognized as template refs instead of ordinary calls
+            // — the fix that exposed the gap shouldn't be the fix that creates a new one.
+            $functionCalls[] = new FunctionCall($name, (int) $line, $file, $extraCandidateFqcn);
 
             // get_template_part( ocean_single_post_header_template() ) — the sole argument is a
             // bare call to a project helper, not a string at all, so parseTemplateRef() above
@@ -1496,7 +1725,7 @@ final class PhpTokenParser
         }
 
         // Regular function call
-        $functionCalls[] = new FunctionCall($name, (int) $line, $file);
+        $functionCalls[] = new FunctionCall($name, (int) $line, $file, $extraCandidateFqcn);
     }
 
     /**
@@ -1941,6 +2170,28 @@ final class PhpTokenParser
             return null;
         }
 
+        // The captured literal is whatever string segment sits between the last quote before
+        // the variable and the variable itself — for `'.../inc/options/' . $key . ...` that's
+        // already a clean directory (ends in '/'), matching a real bulk-directory-load exactly
+        // the way it's treated below. But `'.../inc/dashboard/html-' . $tab_id . ...` (real-world
+        // regression, Sydney theme) mashes a directory together with a filename *prefix* —
+        // treating "html-" itself as a subdirectory can never match a real file, silently
+        // defeating the whole exemption for this shape. Trimmed back to the last real '/'
+        // boundary so it's treated as the directory it actually names.
+        if (!str_ends_with($lastLiteral, '/')) {
+            $slashPos = strrpos($lastLiteral, '/');
+            $lastLiteral = $slashPos === false ? '' : substr($lastLiteral, 0, $slashPos + 1);
+        }
+
+        // No '/' at all in the literal (e.g. just a bare filename-prefix with no directory
+        // component) leaves nothing meaningful to exempt — bailing here matters more than usual,
+        // since an empty string reaching $rootRelativeIncludeDirs/$globIncludeDirs would be
+        // misread downstream as "exempt the whole project" (FileAnalyzer's own empty-string
+        // convention for a root-level bulk-include caller), not "no signal."
+        if ($lastLiteral === '') {
+            return null;
+        }
+
         return [$lastLiteral, $isRootRelative];
     }
 
@@ -2345,17 +2596,25 @@ final class PhpTokenParser
     }
 
     /**
-     * Parses a file-level `use Name\Space\Foo [as Alias], Other\Bar;` statement starting at the
-     * T_USE token, returning alias/short-name => fully-qualified name. Handles multiple
-     * comma-separated imports on one line and `as` aliasing. Deliberately does NOT support
-     * group-use (`use App\{Foo, Bar as B};`) — bails out (returning whatever it already
-     * collected) the moment it sees `{`, rather than guessing; the main token loop's own generic
-     * brace-depth tracking still balances that `{`/`}` pair correctly on its own since they're
-     * real, matched tokens, so bailing here doesn't corrupt anything downstream. `use function
-     * ...`/`use const ...` imports aren't classes either, so they're skipped entirely.
+     * Parses a file-level `use Name\Space\Foo [as Alias], Other\Bar;` or
+     * `use function Name\Space\foo [as alias], Other\bar;` statement starting at the T_USE token,
+     * returning `[$classImports, $functionImports]` (each alias/short-name => fully-qualified
+     * name). Handles multiple comma-separated imports on one line and `as` aliasing. Deliberately
+     * does NOT support group-use (`use App\{Foo, Bar as B};`) — bails out (returning whatever it
+     * already collected) the moment it sees `{`, rather than guessing; the main token loop's own
+     * generic brace-depth tracking still balances that `{`/`}` pair correctly on its own since
+     * they're real, matched tokens, so bailing here doesn't corrupt anything downstream.
+     * `use const ...` imports affect neither classes nor function-call resolution, so they're
+     * skipped entirely (empty tuple).
+     *
+     * A `use function`-imported name isn't just another class-import lookalike: unlike
+     * $classImports (which only ever disambiguates a class *reference*), it changes what a later
+     * BARE call actually resolves to — see $useFunctionImports' own declaration-site comment in
+     * parse() for why a matching entry there takes priority over the usual current-namespace-
+     * then-global runtime fallback a bare call would otherwise get.
      *
      * @param list<Token> $tokens
-     * @return array<string,string>
+     * @return array{array<string,string>,array<string,string>}
      */
     private function parseUseImports(array $tokens, int $i): array
     {
@@ -2364,8 +2623,16 @@ final class PhpTokenParser
             $j++;
         }
 
-        if (isset($tokens[$j]) && is_array($tokens[$j]) && in_array($tokens[$j][0], [T_FUNCTION, T_CONST], true)) {
-            return [];
+        if (isset($tokens[$j]) && is_array($tokens[$j]) && $tokens[$j][0] === T_CONST) {
+            return [[], []];
+        }
+
+        $isFunctionImport = isset($tokens[$j]) && is_array($tokens[$j]) && $tokens[$j][0] === T_FUNCTION;
+        if ($isFunctionImport) {
+            $j++;
+            while (isset($tokens[$j]) && is_array($tokens[$j]) && $tokens[$j][0] === T_WHITESPACE) {
+                $j++;
+            }
         }
 
         $imports = [];
@@ -2410,7 +2677,7 @@ final class PhpTokenParser
             $j++;
         }
 
-        return $imports;
+        return $isFunctionImport ? [[], $imports] : [$imports, []];
     }
 
     private function shortClassName(string $name): string
@@ -2444,6 +2711,166 @@ final class PhpTokenParser
         }
 
         return $currentNamespace === '' ? $name : $currentNamespace . '\\' . $name;
+    }
+
+    /**
+     * $i points at T_FOR. Recognizes only the clean canonical bounded-ascending form —
+     * `for ($var = <int>; $var <op> <int>; $var++)` where <op> is '<' or '<=', both bounds plain
+     * non-negative decimal integer literals — and returns null for anything else (a non-literal
+     * bound, a mismatched/different variable in the condition or increment, a decrementing loop,
+     * a step other than 1, ...). Same "don't guess" stance every other literal-resolution
+     * mechanism in this parser takes: the payoff (enumerating a handful of concrete suffix
+     * values from a *provably* finite, literal range — see resolveForLoopConcatenatedLiteral)
+     * isn't worth guessing wrong on a shape a naive reader couldn't already tell terminates.
+     * Bounded to a sane max range size as a defensive cap, not a realistic real-world limit.
+     *
+     * @param list<Token> $tokens
+     * @return array{string, list<int>}|null [loopVarName, every value the loop actually assigns]
+     */
+    private function parseForLoopBoundedRange(array $tokens, int $i): ?array
+    {
+        $j = $this->skipInsignificant($tokens, $i + 1);
+        if (!isset($tokens[$j]) || $tokens[$j] !== '(') {
+            return null;
+        }
+        $j = $this->skipInsignificant($tokens, $j + 1);
+        if (!isset($tokens[$j]) || !is_array($tokens[$j]) || $tokens[$j][0] !== T_VARIABLE) {
+            return null;
+        }
+        $varName = $tokens[$j][1];
+
+        $j = $this->skipInsignificant($tokens, $j + 1);
+        if (!isset($tokens[$j]) || $tokens[$j] !== '=') {
+            return null;
+        }
+        $j = $this->skipInsignificant($tokens, $j + 1);
+        if (!isset($tokens[$j]) || !is_array($tokens[$j]) || $tokens[$j][0] !== T_LNUMBER || !ctype_digit($tokens[$j][1])) {
+            return null;
+        }
+        $start = (int) $tokens[$j][1];
+
+        $j = $this->skipInsignificant($tokens, $j + 1);
+        if (!isset($tokens[$j]) || $tokens[$j] !== ';') {
+            return null;
+        }
+        $j = $this->skipInsignificant($tokens, $j + 1);
+        if (!isset($tokens[$j]) || !is_array($tokens[$j]) || $tokens[$j][0] !== T_VARIABLE || $tokens[$j][1] !== $varName) {
+            return null;
+        }
+
+        $j = $this->skipInsignificant($tokens, $j + 1);
+        if (!isset($tokens[$j])) {
+            return null;
+        }
+        if ($tokens[$j] === '<') {
+            $inclusive = false;
+        } elseif (is_array($tokens[$j]) && $tokens[$j][0] === T_IS_SMALLER_OR_EQUAL) {
+            $inclusive = true;
+        } else {
+            return null;
+        }
+
+        $j = $this->skipInsignificant($tokens, $j + 1);
+        if (!isset($tokens[$j]) || !is_array($tokens[$j]) || $tokens[$j][0] !== T_LNUMBER || !ctype_digit($tokens[$j][1])) {
+            return null;
+        }
+        $bound = (int) $tokens[$j][1];
+
+        $j = $this->skipInsignificant($tokens, $j + 1);
+        if (!isset($tokens[$j]) || $tokens[$j] !== ';') {
+            return null;
+        }
+        $j = $this->skipInsignificant($tokens, $j + 1);
+        if (!isset($tokens[$j]) || !is_array($tokens[$j]) || $tokens[$j][0] !== T_VARIABLE || $tokens[$j][1] !== $varName) {
+            return null;
+        }
+        $j = $this->skipInsignificant($tokens, $j + 1);
+        if (!isset($tokens[$j]) || !is_array($tokens[$j]) || $tokens[$j][0] !== T_INC) {
+            return null;
+        }
+        $j = $this->skipInsignificant($tokens, $j + 1);
+        if (!isset($tokens[$j]) || $tokens[$j] !== ')') {
+            return null;
+        }
+
+        $end = $inclusive ? $bound : $bound - 1;
+        if ($end < $start || ($end - $start) > 10000) {
+            return null;
+        }
+
+        return [$varName, range($start, $end)];
+    }
+
+    /**
+     * $i points at a T_CONSTANT_ENCAPSED_STRING token already read as $prefixValue. Real-world
+     * shapes this covers: Sydney theme's customizer partials (`'render_callback' =>
+     * 'sydney_partial_slider_title_' . $i` inside `for ($i = 1; $i < 5; $i++)`) and Astra
+     * theme's numbered icon files (`'icons-v6-' . $i . '.php'`-shaped concatenation, inside a
+     * similar bounded loop) — a callback name or file-path literal whose real identity is split
+     * across a loop-counter concatenation this parser otherwise can't evaluate at all, silently
+     * missing every one of the N real declarations/files the loop actually produces.
+     *
+     * If $prefixValue is immediately followed by `. $loopVar` where $loopVar matches a
+     * currently-open, tracked bounded for-loop variable (innermost/most-recently-opened wins on
+     * a name collision across nested loops — the same "flat stack, last match wins" convention
+     * every other per-scope stack in this parser already uses), optionally followed by
+     * `. 'literal-suffix'`, returns one concrete `"{$prefixValue}{value}{suffix}"` string per
+     * value the loop variable actually takes across its known range, plus the index of the last
+     * token consumed (so the caller can sync $i past the variable/suffix instead of
+     * re-processing them as anything else). Returns null when the shape doesn't match — no `.`
+     * follows, the variable isn't tracked, or nothing looks like this pattern at all — the same
+     * safe fallback as returning no enumeration ever did before this mechanism existed.
+     *
+     * @param list<Token> $tokens
+     * @param list<string> $forLoopVarNameStack
+     * @param list<list<int>> $forLoopVarValuesStack
+     * @return array{list<string>, int}|null [enumerated strings, last consumed token index]
+     */
+    private function resolveForLoopConcatenatedLiteral(
+        array $tokens,
+        int $i,
+        string $prefixValue,
+        array $forLoopVarNameStack,
+        array $forLoopVarValuesStack,
+    ): ?array {
+        $dotIndex = $this->skipInsignificant($tokens, $i + 1);
+        if (!isset($tokens[$dotIndex]) || $tokens[$dotIndex] !== '.') {
+            return null;
+        }
+        $varIndex = $this->skipInsignificant($tokens, $dotIndex + 1);
+        if (!isset($tokens[$varIndex]) || !is_array($tokens[$varIndex]) || $tokens[$varIndex][0] !== T_VARIABLE) {
+            return null;
+        }
+        $varName = $tokens[$varIndex][1];
+
+        $values = null;
+        for ($k = count($forLoopVarNameStack) - 1; $k >= 0; $k--) {
+            if ($forLoopVarNameStack[$k] === $varName) {
+                $values = $forLoopVarValuesStack[$k];
+                break;
+            }
+        }
+        if ($values === null) {
+            return null;
+        }
+
+        $lastIndex = $varIndex;
+        $suffix = '';
+        $afterVarIndex = $this->skipInsignificant($tokens, $varIndex + 1);
+        if (isset($tokens[$afterVarIndex]) && $tokens[$afterVarIndex] === '.') {
+            $suffixIndex = $this->skipInsignificant($tokens, $afterVarIndex + 1);
+            if (isset($tokens[$suffixIndex]) && is_array($tokens[$suffixIndex]) && $tokens[$suffixIndex][0] === T_CONSTANT_ENCAPSED_STRING) {
+                $suffix = $this->stripQuotes($tokens[$suffixIndex][1]);
+                $lastIndex = $suffixIndex;
+            }
+        }
+
+        $results = [];
+        foreach ($values as $value) {
+            $results[] = $prefixValue . $value . $suffix;
+        }
+
+        return [$results, $lastIndex];
     }
 
     /**

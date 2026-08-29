@@ -176,6 +176,16 @@ final class TemplateAnalyzer
                 !isset($referenced[$relativePath])
                 && !isset($referenced[$basename])
                 && !$this->isReferencedByPartialMatch($relativePath, $referenced)
+                // A slug-based loader convention (get_template_part('content', 'product') =>
+                // "content-product.php", wc_get_template_part's own identical shape) operates on
+                // the FILENAME alone, never a directory-qualified path — WP core's own hierarchy
+                // templates happen to sit at the theme root already, so $relativePath and
+                // $basename were the same thing there and this never mattered; a plugin's own
+                // bundled templates/ directory breaks that coincidence (the real slug "content"
+                // never has "templates/" prefixed onto it by the plugin's own convention, but
+                // $relativePath always does here) — confirmed real false positive this fixes:
+                // WooCommerce's content-product.php/content-single-product.php.
+                && !$this->isReferencedByPartialMatch($basename, $referenced)
             ) {
                 $findings[] = new Finding(
                     type: FindingType::UnusedTemplate,

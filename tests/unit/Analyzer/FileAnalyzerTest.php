@@ -484,6 +484,26 @@ foreach ( $files as $file ) {
         self::assertContains('orphan.php', $names);
     }
 
+    public function testDynamicMiddleSegmentRequireWithFilenamePrefixTrimsToRealDirectory(): void
+    {
+        // Real-world regression (Sydney theme): `require get_template_directory() .
+        // '/inc/dashboard/html-' . $tab_id . '.php';` — unlike Kadence's own
+        // '/inc/customizer/options/' . $key . '-options.php' (a clean directory boundary, the
+        // literal already ends in '/'), this literal mashes the real directory ("inc/dashboard/")
+        // together with a filename *prefix* ("html-") that isn't a subdirectory at all. Trusting
+        // "inc/dashboard/html-" itself as a directory can never match a real file, silently
+        // defeating the exemption entirely and false-flagging every html-*.php tab partial.
+        $bootstrap = $this->write('inc/dashboard/class-dashboard.php', '<?php
+foreach ( $tabs as $tab_id ) {
+    require get_template_directory() . "/inc/dashboard/html-" . $tab_id . ".php";
+}
+');
+        $tab = $this->write('inc/dashboard/html-general.php', '<?php // loaded by the loop above');
+
+        $names = array_column($this->analyzer->analyze([$bootstrap, $tab], $this->tmp), 'name');
+        self::assertNotContains('html-general.php', $names);
+    }
+
     public function testGetTemplatePartWithHelperFunctionArgumentResolvesLiteralReturns(): void
     {
         // Real-world finding (OceanWP theme): `get_template_part( ocean_single_post_header_
@@ -622,6 +642,54 @@ require __DIR__ . "/unrelated.php";
 
         $names = array_column($this->analyzer->analyze([$bootstrap, $orphan], $this->tmp), 'name');
         self::assertContains('alpha.php', $names);
+    }
+
+    public function testCrossFileBulkDirectoryLoaderExemptsTargetDirectory(): void
+    {
+        // Real-world finding (Flynt theme): functions.php calls FileLoader::loadPhpFiles('inc'),
+        // and loadPhpFiles() itself — declared in a completely different file — walks that
+        // directory and require_once's every PHP file it finds from inside a nested closure.
+        // Neither glob()/scandir() detection nor the dynamic-middle-segment require detection
+        // can see this: there's no glob()/scandir() call anywhere, and the literal directory
+        // name and the require that consumes it live in two separate files, connected only by
+        // an ordinary method call.
+        $bootstrap = $this->write('functions.php', '<?php
+FileLoader::loadPhpFiles( "inc" );
+');
+        $fileLoader = $this->write('lib/Utils/FileLoader.php', '<?php
+class FileLoader {
+    public static function loadPhpFiles( $dir ) {
+        static::iterateDir( $dir, function ( $file ) {
+            require_once $file;
+        } );
+    }
+}
+');
+        $included = $this->write('inc/setup.php', '<?php // loaded by FileLoader::loadPhpFiles above');
+
+        $names = array_column($this->analyzer->analyze([$bootstrap, $fileLoader, $included], $this->tmp), 'name');
+        self::assertNotContains('setup.php', $names);
+    }
+
+    public function testBulkDirectoryLoaderCallDoesNotExemptWhenCalleeHasNoInclude(): void
+    {
+        // The callee method exists and is called the same way, but its own body never contains
+        // a require/include anywhere — no real bulk-load signal, so the directory must still be
+        // scanned normally.
+        $bootstrap = $this->write('functions.php', '<?php
+FileLoader::loadPhpFiles( "inc" );
+');
+        $fileLoader = $this->write('lib/Utils/FileLoader.php', '<?php
+class FileLoader {
+    public static function loadPhpFiles( $dir ) {
+        static::logCall( $dir );
+    }
+}
+');
+        $orphan = $this->write('inc/orphan.php', '<?php // not actually bulk-loaded by anything');
+
+        $names = array_column($this->analyzer->analyze([$bootstrap, $fileLoader, $orphan], $this->tmp), 'name');
+        self::assertContains('orphan.php', $names);
     }
 
     public function testSplAutoloadRegisterExemptsCallingFilesOwnDirectoryTree(): void

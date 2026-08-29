@@ -1,0 +1,2 @@
+<?php
+// used plugin template

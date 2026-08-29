@@ -40,20 +40,21 @@ final class PluginTest extends TestCase
         self::assertStringNotContainsString('stdwp_plugin_used_func', $output);
     }
 
-    public function testTemplatesSkippedForPlugin(): void
+    public function testUnusedPluginTemplateIsDetected(): void
     {
-        // Deliberate, not a stale gap: TemplateAnalyzer's own hierarchy-exemption bug was fixed,
-        // but actually running the check for Plugin mode was tried and reverted — real plugins
-        // (confirmed: WooCommerce) commonly load their own templates/ directory through a custom
-        // wrapper function (wc_get_template()/wc_get_template_part(), not the WP-core template
-        // functions this parser tracks), so enabling the check produced more false positives than
-        // genuine catches. See TODO.md's "Template detection" section.
+        // Plugin mode runs the templates check (a real plugin's own bundled templates/
+        // directory, WooCommerce's own convention, genuinely needs it — see TODO.md's "Template
+        // detection" section for the false-positive flood found and fixed before this could be
+        // safely enabled: TemplateAnalyzer's hierarchy-exemption bug, and PhpTokenParser learning
+        // to recognize wc_get_template()/wc_get_template_part()-style loader wrappers).
         ob_start();
-        $this->app->run(['wp-specter', 'scan', $this->fixture, '--no-color', '--target=plugin']);
+        $exit = $this->app->run(['wp-specter', 'scan', $this->fixture, '--no-color', '--target=plugin', '--type=templates']);
         $output = ob_get_clean();
         self::assertIsString($output);
 
-        self::assertStringNotContainsString('Unused Templates', $output);
+        self::assertSame(1, $exit);
+        self::assertStringContainsString('orphaned-template', $output);
+        self::assertStringNotContainsString('used-template', $output);
     }
 
     public function testAutoDetectRecognisesPlugin(): void
