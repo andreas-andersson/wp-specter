@@ -864,6 +864,47 @@ not shipped bugs.
   corpus sanity pass (11 plugins + 8 themes) shows every other finding count unchanged and no
   crashes; full suite (534 tests) and phpstan both green.
 
+- [x] **A plain array of 3+ string literals had its 2nd element silently vanish, misparsed as a
+  `[$receiver, 'method']` array-callback pair.** `arrayCallbackReceiverClass()` (the mechanism
+  behind `[$this, 'method']`/`['Foo', 'method']` recognition) only ever checked *backward* from
+  a candidate "method name" string — a comma, then a plausible receiver, then the array's own
+  opening bracket — never whether that candidate was also the array's *last* element. Every one
+  of those backward checks passes just as well for the 2nd entry of `array('One', 'Two',
+  'Three')` as it would for a real 2-element callback, so `'Two'` got consumed into a fabricated
+  `ScopedMethodCall('One', 'Two')` and disappeared from both `$functionCalls` and
+  `$classReferences` entirely — invisible to every analyzer. Found by a fresh gap-hunting pass:
+  Sydney theme's `inc/abilities/class-sydney-abilities-registry.php` builds
+  `apply_filters('sydney_abilities_groups', array('Sydney_Abilities_Colors',
+  'Sydney_Abilities_Typography', 'Sydney_Abilities_Buttons', ...17 total))`, each class
+  dynamically instantiated via `new $group()` in the consuming loop — `Sydney_Abilities_
+  Typography` (array position 1) is genuinely used but false-positived as `UnusedClass` purely
+  because of its position in the list.
+
+  This is a **new-code-detection blind spot**, not a plugin-specific quirk — any project with a
+  plain list of 3+ string literals anywhere (class names, hook names, file paths, option keys)
+  has its 2nd element silently invisible. Fixed generally: new `isLastArrayElementAt()` checks
+  that the candidate method-name string is followed (past an optional trailing `. <segment>`
+  concatenation chain — `array($this, 'footer_html_' . $i)` is still exactly 2 elements — and
+  one optional trailing comma) by the array's own closing `]`/`)`; `arrayCallbackReceiverClass()`
+  now bails immediately if this fails, before any of its three receiver-shape branches run. A
+  real callback pair is never longer than 2 elements, so this closes the gap with zero cost to
+  the shapes it already recognized correctly.
+
+  Verified: 4 new `PhpTokenParserTest` cases (the exact 3-element regression, a 4-element variant
+  confirming the pattern isn't specific to exactly 3, a trailing-comma-on-a-real-2-element-
+  callback case proving the fix doesn't over-correct, plus the pre-existing concatenation-shape
+  test — `array($this, 'footer_html_' . $i)` inside a bounded loop — updated nothing since it
+  already passed once the concatenation-chain skip was added) and one new `ClassAnalyzerTest`
+  end-to-end case modeled directly on the real Sydney shape; real Sydney corpus —
+  `Sydney_Abilities_Typography` no longer flagged; full 20-target corpus sanity pass (11 plugins
+  + 9 themes, Sage newly added to the corpus) shows no crashes and several other real,
+  directionally-consistent changes elsewhere — WooCommerce alone: unused-function count dropped
+  19 (literals no longer swallowed) while unused-method count *rose* 19 (methods a fabricated
+  scoped call was wrongly crediting as "used" now correctly evaluated on their own merits;
+  spot-checked `add_payment_token` — zero real call sites anywhere in the plugin, a genuine,
+  previously-hidden true positive, not a regression); full suite (538 tests) and phpstan both
+  green.
+
 - [x] **Legacy `spl_autoload_register()` class-map callbacks — partially recognized, known
   remaining gap accepted as-is.** Pre-Composer (or hybrid) WP plugins sometimes register their
   own autoloader mapping class name → file path in code, rather than declaring `composer.json`

@@ -1365,6 +1365,60 @@ add_action("init", [$obj, "handler_method"]);
         self::assertContains('handler_method', $names);
     }
 
+    public function testPlainThreeElementStringArrayIsNotMisparsedAsACallback(): void
+    {
+        // Real-world regression (Sydney theme): apply_filters('tag', array('One', 'Two',
+        // 'Three', ...)) — an ordinary list of class names (dynamically instantiated elsewhere
+        // via `new $group()`), not a callback at all. Before this fix, the array-callback
+        // detector only ever looked *backward* from a candidate "method name" string (a comma,
+        // then a plausible receiver, then the array's own opening bracket) — every one of those
+        // checks passes just as well for 'Two' here as it would for the real
+        // array($this, 'method') shape, since it never checked whether 'Two' was also the
+        // array's *last* element. The result: 'Two' was consumed into a fabricated
+        // ScopedMethodCall('One', 'Two') and silently vanished from both $functionCalls and
+        // $classReferences — invisible to every analyzer, network-wide, for any project with a
+        // plain 3+-string-literal array anywhere.
+        $result = $this->parse('<?php
+$groups = apply_filters("x", array(
+    "One",
+    "Two",
+    "Three",
+));
+');
+        self::assertEmpty($result->scopedMethodCalls);
+        $names = array_column($result->functionCalls, 'name');
+        self::assertContains('One', $names);
+        self::assertContains('Two', $names);
+        self::assertContains('Three', $names);
+    }
+
+    public function testFourElementArrayWhereFirstTwoLookLikeACallbackIsNotMisparsed(): void
+    {
+        // Same bug, general shape confirmed beyond exactly 3 elements: $this followed by a
+        // string that looks exactly like a real array-callback method name, but a 3rd/4th
+        // element after it proves this was never a 2-element callback pair at all.
+        $result = $this->parse('<?php
+$x = array($this, "not_really_a_method", "Three", "Four");
+');
+        self::assertEmpty($result->scopedMethodCalls);
+        $names = array_column($result->functionCalls, 'name');
+        self::assertContains('not_really_a_method', $names);
+        self::assertContains('Three', $names);
+        self::assertContains('Four', $names);
+    }
+
+    public function testArrayCallbackWithTrailingCommaIsStillRecognizedAsScoped(): void
+    {
+        // A genuine 2-element callback with a trailing comma (`[$this, 'method',]`) must still
+        // be recognized — the new "is this the array's last element" check has to tolerate one
+        // optional trailing comma, not just a bare closing bracket immediately after.
+        $result = $this->parse('<?php
+add_action("init", [$this, "my_method",]);
+');
+        $names = array_column($result->functionCalls, 'name');
+        self::assertContains('my_method', $names);
+    }
+
     public function testGetHeaderWithNameBuildsCorrectPath(): void
     {
         $result = $this->parse("<?php get_header('kiosk');");

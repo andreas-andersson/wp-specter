@@ -1649,6 +1649,34 @@ class Other_Class {
         self::assertSame(13, $unusedMethods[0]->line, 'Should flag Other_Class::slot_1(), not My_Builder::slot_1()');
     }
 
+    public function testClassNameInPlainThreeElementArrayIsNotSwallowedByCallbackMisparse(): void
+    {
+        // Real-world regression (Sydney theme): a plain array of class names, each dynamically
+        // instantiated via `new $group()` in a loop — `array('One_Class', 'Two_Class',
+        // 'Three_Class')` is not a callback at all, but the array-callback detector previously
+        // misread the first two elements as a [$receiver, 'method'] pair, silently dropping the
+        // 2nd class name from $classReferences entirely.
+        $file = $this->write('<?php
+class One_Class { public function register() {} }
+class Two_Class { public function register() {} }
+class Three_Class { public function register() {} }
+
+$groups = apply_filters("groups", array(
+    "One_Class",
+    "Two_Class",
+    "Three_Class",
+));
+foreach ($groups as $group) {
+    (new $group())->register();
+}
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedClasses = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedClass), 'name');
+        self::assertNotContains('One_Class', $unusedClasses);
+        self::assertNotContains('Two_Class', $unusedClasses);
+        self::assertNotContains('Three_Class', $unusedClasses);
+    }
+
     // ── reflection-dispatched class names (WP_CLI::add_command) ────────────────────────────
 
     public function testCreditsEveryPublicMethodOfAClassRegisteredWithWpCliAddCommand(): void

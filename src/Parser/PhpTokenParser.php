@@ -3556,6 +3556,35 @@ final class PhpTokenParser
     }
 
     /**
+     * True when $i is the last element of the array/list literal it sits inside — the next
+     * meaningful token (past a possible trailing `. <segment>` concatenation chain — $i might
+     * only be the first segment of a longer expression that's still just ONE array element, e.g.
+     * `array($this, 'footer_html_' . $i)` — and then one optional trailing comma) is a closing
+     * `]`/`)`. Doesn't verify $i is inside an array at all (callers already know that from their
+     * own backward walk); only rules out "there's at least one more element after this one."
+     * Same "single segment per `.`" assumption resolveForLoopConcatenatedLiteral's own suffix
+     * handling already makes — a concatenation chain with something more complex than a bare
+     * value token per segment (a nested function call, say) isn't unwound here either.
+     *
+     * @param list<Token> $tokens
+     */
+    private function isLastArrayElementAt(array $tokens, int $i): bool
+    {
+        $j = $this->peekNextMeaningfulIndex($tokens, $i);
+        while ($j !== null && $tokens[$j] === '.') {
+            $j = $this->peekNextMeaningfulIndex($tokens, $j); // the concatenated segment itself
+            if ($j === null) {
+                return false;
+            }
+            $j = $this->peekNextMeaningfulIndex($tokens, $j); // token right after that segment
+        }
+        if ($j !== null && $tokens[$j] === ',') {
+            $j = $this->peekNextMeaningfulIndex($tokens, $j);
+        }
+        return $j !== null && ($tokens[$j] === ']' || $tokens[$j] === ')');
+    }
+
+    /**
      * Given the index of a string token that looks like a method/function name, checks whether
      * it's the second element of an array-callback literal — [receiver, 'method'] or
      * array(receiver, 'method') — with a receiver wp-specter can resolve to a concrete class:
@@ -3570,6 +3599,21 @@ final class PhpTokenParser
      */
     private function arrayCallbackReceiverClass(array $tokens, int $i, array $classNameStack, array $classParentStack, string $currentNamespace, array $useImports): ?string
     {
+        // Real-world regression (Sydney theme): a plain list of 3+ string literals —
+        // array('One', 'Two', 'Three', ...), no callback semantics at all — was misparsed the
+        // instant any two adjacent elements happened to look like a [$receiver, 'method'] pair.
+        // Checking only *backward* from $i (comma, then a plausible receiver, then the array's
+        // own opening bracket) can't tell "the real 2-element callback shape" apart from
+        // "these just happen to be the first two entries of a longer list" — 'Two' here matched
+        // every backward check and got consumed into a fabricated ScopedMethodCall('One', 'Two'),
+        // silently dropping it from $functionCalls/$classReferences entirely (any project's own
+        // Sydney_Abilities_Typography-style array of class names has its 2nd entry vanish this
+        // way). A real callback pair is never longer than 2 elements, so $i must also be the
+        // array's *last* element — checked once here, covering all three shape branches below.
+        if (!$this->isLastArrayElementAt($tokens, $i)) {
+            return null;
+        }
+
         $commaIndex = $this->peekPrevMeaningfulIndex($tokens, $i);
         if ($commaIndex === null || $tokens[$commaIndex] !== ',') {
             return null;
