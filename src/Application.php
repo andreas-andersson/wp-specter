@@ -286,17 +286,43 @@ class Application
         $parser = new PhpTokenParser();
         $findings = [];
 
+        // A single progress bar spans the whole scan (every phase, every target) instead of one
+        // per phase — a multi-target project (several plugins plus a theme) used to leave a
+        // finished bar behind for each phase/target combination, flooding the terminal with
+        // scrollback. $scanPhaseCount mirrors the exact conditions each phase below actually runs
+        // under, so $scanTotal reflects real work rather than an overestimate.
+        $scanPhaseCount = 0;
+        if ($config->wantsType('functions')) {
+            $scanPhaseCount++;
+        }
+        if ($config->wantsType('hooks')) {
+            $scanPhaseCount++;
+        }
+        if ($config->wantsType('classes')) {
+            $scanPhaseCount++;
+        }
+        foreach ($targets as $target) {
+            if ($config->wantsType('templates') && $target->mode !== null) {
+                $scanPhaseCount++;
+            }
+            if ($config->wantsType('files')) {
+                $scanPhaseCount++;
+            }
+        }
+        $scanTotal = count($allFiles) * $scanPhaseCount;
+        $scanCompleted = 0;
+
         // Functions and hooks are matched across the whole file set — a theme registering a
         // hook that its companion plugin fires (or vice versa) is a normal, correct pattern in
         // a multi-target project, not a false "unmatched".
         if ($config->wantsType('functions')) {
-            $findings = array_merge($findings, (new FunctionAnalyzer($parser))->analyze($allFiles, $this->progressCallback($reporter, 'Functions')));
-            $reporter->finishProgress();
+            $findings = array_merge($findings, (new FunctionAnalyzer($parser))->analyze($allFiles, $this->progressCallback($reporter, $scanTotal, $scanCompleted)));
+            $scanCompleted += count($allFiles);
         }
 
         if ($config->wantsType('hooks')) {
-            $findings = array_merge($findings, (new HookAnalyzer($parser))->analyze($allFiles, $this->progressCallback($reporter, 'Hooks')));
-            $reporter->finishProgress();
+            $findings = array_merge($findings, (new HookAnalyzer($parser))->analyze($allFiles, $this->progressCallback($reporter, $scanTotal, $scanCompleted)));
+            $scanCompleted += count($allFiles);
         }
 
         if ($config->wantsType('classes')) {
@@ -309,9 +335,9 @@ class Application
                 $allFiles,
                 $vendorAutoloadPaths,
                 !$config->noSuppressUnusedClassMethods,
-                $this->progressCallback($reporter, 'Classes'),
+                $this->progressCallback($reporter, $scanTotal, $scanCompleted),
             ));
-            $reporter->finishProgress();
+            $scanCompleted += count($allFiles);
         }
 
         // Templates and files need a specific root to know what's "root-level" and which mode's
@@ -328,18 +354,17 @@ class Application
             // recognize those wrapper functions and `TemplateAnalyzer`'s own partial-match
             // resolution was fixed to work against a plugin's directory-nested template files the
             // same way it already did for a theme's root-level ones.
-            $targetLabel = count($targets) > 1 ? " ({$target->name})" : '';
-
             if ($config->wantsType('templates') && $target->mode !== null) {
-                $findings = array_merge($findings, (new TemplateAnalyzer($parser, $modeDetector))->analyze($allFiles, $target->mode, $target->path, $this->progressCallback($reporter, 'Templates' . $targetLabel)));
-                $reporter->finishProgress();
+                $findings = array_merge($findings, (new TemplateAnalyzer($parser, $modeDetector))->analyze($allFiles, $target->mode, $target->path, $this->progressCallback($reporter, $scanTotal, $scanCompleted)));
+                $scanCompleted += count($allFiles);
             }
 
             if ($config->wantsType('files')) {
-                $findings = array_merge($findings, (new FileAnalyzer($parser))->analyze($allFiles, $target->path, $this->progressCallback($reporter, 'Files' . $targetLabel)));
-                $reporter->finishProgress();
+                $findings = array_merge($findings, (new FileAnalyzer($parser))->analyze($allFiles, $target->path, $this->progressCallback($reporter, $scanTotal, $scanCompleted)));
+                $scanCompleted += count($allFiles);
             }
         }
+        $reporter->finishProgress();
 
         if ($config->generateBaseline) {
             // Guaranteed non-null: the earlier "$config->generateBaseline && $projectConfig
@@ -602,10 +627,16 @@ class Application
      * classes the other doesn't. Returns an empty list when neither exists; the reflection
      * fallback is simply unavailable then, same as it always was before this existed.
      *
-    /** @return callable(int, int): void */
-    private function progressCallback(TerminalReporter $reporter, string $label): callable
+    /**
+     * $completed is the number of scan units (files × phases already finished) done before this
+     * phase started — added to the phase's own $current so the bar reflects progress across the
+     * whole scan instead of resetting to 0% at the start of every phase.
+     *
+     * @return callable(int, int): void
+     */
+    private function progressCallback(TerminalReporter $reporter, int $scanTotal, int $completed): callable
     {
-        return static fn(int $current, int $total) => $reporter->printProgress($label, $current, $total);
+        return static fn(int $current, int $_total) => $reporter->printProgress('Scanning', $completed + $current, $scanTotal);
     }
 
     /**
