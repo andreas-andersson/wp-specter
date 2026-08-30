@@ -13,6 +13,12 @@ WP Specter is a static analyser for WordPress code. It understands WordPress con
   and `block.json` render fields accounted for
 - **Orphaned files** — PHP that is never included, required or referenced
 
+---
+
+> **🤖 Note:** This project was largely created by AI agents. Parsing PHP with PHP is boring as hell, so we let the machines handle it.
+
+---
+
 **Example output:**
 
 ```
