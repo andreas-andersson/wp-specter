@@ -767,6 +767,39 @@ final class FileAnalyzer
             }
         }
 
+        // Foo::view($row_view) / Foo::view('settings/settings-' . $tab) — $row_view/$tab's
+        // resolved candidate values (see PhpTokenParser's $pendingParamSuffixCalls) each paired
+        // with Foo::view()'s own recorded `return <ignored> . $param . 'suffix';` template (see
+        // $functionParamSuffixReturns), merged across every scanned file first since the callee
+        // and its caller are routinely in different files — real-world example (wp-nested-pages):
+        // Helpers::view() lives in app/Helpers.php, called from app/Entities/Listing/Listing.php
+        // and app/Views/settings/settings.php.
+        $functionParamSuffixReturns = [];
+        foreach ($parseResults as $result) {
+            foreach ($result->functionParamSuffixReturns as $key => $suffixes) {
+                if (!isset($functionParamSuffixReturns[$key])) {
+                    $functionParamSuffixReturns[$key] = [];
+                }
+                array_push($functionParamSuffixReturns[$key], ...$suffixes);
+            }
+        }
+        foreach ($parseResults as $result) {
+            foreach ($result->pendingParamSuffixCalls as $pending) {
+                $key = $pending->receiverClass . '::' . $pending->methodName;
+                foreach ($functionParamSuffixReturns[$key] ?? [] as $suffix) {
+                    foreach ($pending->argumentCandidates as $candidate) {
+                        $normalized = $this->normalizePath($candidate . $suffix);
+                        if ($normalized === '') {
+                            continue;
+                        }
+                        $referenced[$normalized] = true;
+                        $referenced[basename($normalized)] = true;
+                        $referenced[pathinfo($normalized, PATHINFO_FILENAME)] = true;
+                    }
+                }
+            }
+        }
+
         foreach ($this->collectBlockJsonRefs($rootDir) as $ref) {
             $normalized = $this->normalizePath($ref);
             if ($normalized === '') {

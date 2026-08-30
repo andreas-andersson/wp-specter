@@ -82,9 +82,22 @@ final class ClassAnalyzer
         'flush_output', 'reset',
     ];
 
+    // WP_List_Table's override points (wp-admin/includes/class-wp-list-table.php) — an admin
+    // list-screen's column/row rendering and bulk-action pipeline. All called internally by
+    // WP_List_Table's own display()/prepare_items() machinery (and its AJAX response handler),
+    // never by a visible name reference in project code. Confirmed in the wild: Contact Form 7's
+    // WPCF7_Contact_Form_List_Table overrides get_sortable_columns()/get_bulk_actions()/
+    // column_default()/column_cb() with zero call sites anywhere in the plugin.
+    private const WP_LIST_TABLE_CONTRACT_METHODS = [
+        'get_columns', 'get_sortable_columns', 'get_bulk_actions', 'column_default', 'column_cb',
+        'prepare_items', 'no_items', 'get_views', 'extra_tablenav', 'display_rows', 'single_row',
+        'single_row_columns',
+    ];
+
     private const BASE_CLASS_CONTRACT_METHODS = [
         'WP_Widget' => ['widget', 'form', 'update'],
         'WP_REST_Controller' => ['register_routes'],
+        'WP_List_Table' => self::WP_LIST_TABLE_CONTRACT_METHODS,
         'Walker' => self::WALKER_CONTRACT_METHODS,
         // WP core's own Walker subclasses. A project class rarely extends Walker directly — it
         // extends one of these (e.g. `class My_Nav_Walker extends Walker_Nav_Menu`), which sits
@@ -494,6 +507,85 @@ final class ClassAnalyzer
                     $scopedCalled[$returnType][$call->readMethod] = true;
                 } else {
                     $called[$call->readMethod] = true;
+                }
+            }
+        }
+
+        // `$this->get_section('colors')` resolved against a same-class self-dispatch method's
+        // own recorded suffix template — see PendingSelfDispatchCall's own docblock (Sydney
+        // theme). Merged across every scanned file first, since the dispatcher method and its
+        // callers are routinely scattered across the same file, sometimes different ones. A
+        // resolved call feeds $scopedCalled directly, same as the pendingReturnTypedCalls
+        // resolution just above — every existing exemption/matching mechanism applies to it for
+        // free. When the dispatcher's own suffix never resolves (not actually this shape), this
+        // pending call simply contributes nothing — no worse than the plain "this is just an
+        // ordinary scoped call with a string argument" baseline it would've been without this
+        // mechanism.
+        $selfDispatchSuffixes = [];
+        foreach ($parseResults as $result) {
+            foreach ($result->selfDispatchSuffixes as $key => $suffixes) {
+                if (!isset($selfDispatchSuffixes[$key])) {
+                    $selfDispatchSuffixes[$key] = [];
+                }
+                array_push($selfDispatchSuffixes[$key], ...$suffixes);
+            }
+        }
+        foreach ($parseResults as $result) {
+            foreach ($result->pendingSelfDispatchCalls as $call) {
+                $key = $call->receiverClass . '::' . $call->methodName;
+                $suffixes = $selfDispatchSuffixes[$key] ?? [];
+                foreach ($suffixes as $suffix) {
+                    $scopedCalled[$call->receiverClass][$call->literalArg . $suffix] = true;
+                }
+            }
+        }
+
+        // `array($this, 'render_' . $column . '_column')`-shaped self-dispatch, resolved against
+        // the SAME class's own scattered array-key-literal assignments — see
+        // $selfDispatchPrefixSuffixTemplates' and $classArrayKeyLiterals' own docblocks
+        // (WooCommerce's `render_columns()`/`render_column()` dispatchers, whose real domain
+        // comes from `$show_columns['thumb'] = ...;`-style assignments in a completely different
+        // method, `define_columns()`). Unlike the interpolated-suffix shape above, there's no
+        // literal call-site argument driving this — the dispatcher is invoked by WP core's own
+        // list-table rendering loop, invisible to this codebase — so resolution is a direct
+        // cross-product: every [prefix, suffix] template × every literal key the SAME owner class
+        // ever assigned anywhere, each credited on $scopedCalled. Coarser than the call-site-
+        // driven mechanisms above (no per-call correlation to narrow it), but the "same class"
+        // scoping is real signal — a genuinely unrelated array key elsewhere in a large class
+        // would need to collide with `{prefix}{key}{suffix}` exactly to false-credit anything.
+        $selfDispatchPrefixSuffixTemplates = [];
+        foreach ($parseResults as $result) {
+            foreach ($result->selfDispatchPrefixSuffixTemplates as $key => $templates) {
+                if (!isset($selfDispatchPrefixSuffixTemplates[$key])) {
+                    $selfDispatchPrefixSuffixTemplates[$key] = [];
+                }
+                array_push($selfDispatchPrefixSuffixTemplates[$key], ...$templates);
+            }
+        }
+        $classArrayKeyLiterals = [];
+        foreach ($parseResults as $result) {
+            foreach ($result->classArrayKeyLiterals as $ownerClass => $keys) {
+                if (!isset($classArrayKeyLiterals[$ownerClass])) {
+                    $classArrayKeyLiterals[$ownerClass] = [];
+                }
+                array_push($classArrayKeyLiterals[$ownerClass], ...$keys);
+            }
+        }
+        // Real-world case: the dispatcher (render_columns()) is declared once on an abstract
+        // base class (WC_Admin_List_Table), but the array-key literals establishing the column
+        // domain — and the concrete render_{$column}_column methods themselves — live on each
+        // concrete subclass (WC_Admin_List_Table_Products, _Orders, _Coupons, ...), never on the
+        // abstract base itself. A same-owner-class-only cross-product would miss every one of
+        // them, so this also checks every known descendant (via $descendantsOf, already built
+        // above) and credits each resolved name on the descendant it actually came from.
+        foreach ($selfDispatchPrefixSuffixTemplates as $key => $templates) {
+            [$ownerClass] = explode('::', (string) $key, 2);
+            $candidateClasses = array_merge([$ownerClass], $descendantsOf[$ownerClass] ?? []);
+            foreach ($templates as [$prefix, $suffix]) {
+                foreach ($candidateClasses as $candidateClass) {
+                    foreach ($classArrayKeyLiterals[$candidateClass] ?? [] as $arrayKey) {
+                        $scopedCalled[$candidateClass][$prefix . $arrayKey . $suffix] = true;
+                    }
                 }
             }
         }

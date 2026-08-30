@@ -70,6 +70,10 @@ final class PhpTokenParser
     private const INCLUDE_KEYWORDS = [T_INCLUDE, T_INCLUDE_ONCE, T_REQUIRE, T_REQUIRE_ONCE];
     // T_STRING: plain `Foo`. T_NAME_QUALIFIED: `Foo\Bar`. T_NAME_FULLY_QUALIFIED: `\Foo\Bar`.
     private const CLASS_NAME_TOKENS = [T_STRING, T_NAME_QUALIFIED, T_NAME_FULLY_QUALIFIED];
+    // Method names conventionally used for a static-singleton-factory that returns an instance
+    // of whichever class it's called on via late static binding (`new static()`/
+    // `get_called_class()`) — see assignedStaticFactoryClassName().
+    private const STATIC_FACTORY_METHOD_NAMES = ['cls', 'instance', 'getInstance', 'get_instance'];
     // Built-in/pseudo types that tokenize the same as a class name (T_STRING) in a type-hint
     // position — must be excluded so e.g. `int $x` doesn't get treated as a reference to a
     // class named "int". `array` and `callable` have their own dedicated tokens (T_ARRAY,
@@ -173,6 +177,19 @@ final class PhpTokenParser
         $forLoopVarValuesStack = [];
         $pendingForLoopVarName = null;
         $pendingForLoopVarValues = null;
+        // `foreach ($conditionals as $conditional) { ... 'add_crumbs_' . substr($conditional, 3)
+        // ... }` over a plain tracked literal-string array (real-world case: WooCommerce's
+        // breadcrumb conditional dispatch, class-wc-breadcrumb.php) — the string-valued sibling
+        // of the bounded-for-loop tracking above. Same push-on-'{'/pop-on-'}' lockstep pattern,
+        // kept as separate stacks (rather than merged into the int-valued for-loop ones) since
+        // the value type differs and only a plain "as $var" form (no key=>value, no
+        // by-reference) is recognized — see parseForeachLiteralArrayLoop.
+        $expectingForeachLoopOpen = false;
+        $foreachLoopVarDepthStack = [];
+        $foreachLoopVarNameStack = [];
+        $foreachLoopVarValuesStack = [];
+        $pendingForeachLoopVarName = null;
+        $pendingForeachLoopVarValues = null;
         // CONST_NAME => trailing string literal from a `define('CONST_NAME', <expr>)` call in
         // this file — e.g. `define('ASTRA_HEADER_BUILDER_CONFIGS_DIR', ASTRA_THEME_DIR .
         // 'inc/.../configs/')` records 'inc/.../configs/'. Lets a later `scandir(CONST_NAME)`
@@ -254,6 +271,14 @@ final class PhpTokenParser
         // the T_FOREACH handling below. Flat/file-wide like $globIncludeDirs, not scoped —
         // simplicity over precision, same trade-off made throughout this parser.
         $arrayLiteralVars = [];
+        // Same shape as $arrayLiteralVars, but populated by parseAnyStringLiteralArray — which
+        // has no path-specific "must contain a '/'" gate — so a plain array of non-path string
+        // literals (e.g. WooCommerce's `$conditionals = array('is_home', 'is_404', ...)`,
+        // dispatched via a `foreach`, not a file path) is still tracked for
+        // parseForeachLiteralArrayLoop/resolveForeachConcatenatedLiteral. Kept as a separate map
+        // rather than relaxing $arrayLiteralVars' own gate, since that gate is deliberately
+        // narrow for the $phpPathStrings consumer (see parseStringLiteralArray's docblock).
+        $anyArrayLiteralVars = [];
 
         // $functionNameStack/$varLiteralAssignmentsStack run in lockstep with $functionDepthStack
         // /$varTypesStack (same push-on-'{'/pop-on-'}' pattern) — together they let a `return`
@@ -300,6 +325,39 @@ final class PhpTokenParser
         $functionLiteralReturns = [];
         /** @var list<PendingTemplateHelperCall> $pendingTemplateHelperCalls */
         $pendingTemplateHelperCalls = [];
+        // "Class::method" (or bare function name) => every literal suffix a `return <ignored> .
+        // $param . 'suffix';` statement inside its body resolved to — see
+        // resolveReturnParamSuffixTemplate's own docblock. Same flat/file-wide merge-later
+        // treatment as $functionLiteralReturns, just keyed to also cover methods (a bare function
+        // name alone can't disambiguate two unrelated classes' same-named helper).
+        $functionParamSuffixReturns = [];
+        /** @var list<PendingParamSuffixCall> $pendingParamSuffixCalls */
+        $pendingParamSuffixCalls = [];
+        // "Class::method" => every literal suffix a same-class self-dispatch
+        // (`call_user_func([$this, "{$param}_suffix"])`) inside its own body resolved to — see
+        // isThisArrayCallbackReceiverAt/extractTrailingVarSuffix. Same flat/file-wide merge-later
+        // treatment as $functionParamSuffixReturns.
+        $selfDispatchSuffixes = [];
+        /** @var list<PendingSelfDispatchCall> $pendingSelfDispatchCalls */
+        $pendingSelfDispatchCalls = [];
+        // "Class::method" => every [prefix, suffix] pair a same-class self-dispatch
+        // (`array($this, 'prefix' . $param . 'suffix')`) inside its own body resolved to — the
+        // plain-concatenation counterpart to $selfDispatchSuffixes above, which only has evidence
+        // for a suffix-only (no prefix) interpolated shape. See
+        // resolvePrefixVarSuffixSelfDispatchTemplate's own docblock. Consumed differently:
+        // there's no literal call-site argument to pair it with (WooCommerce's real dispatcher is
+        // invoked by WP core's own list-table rendering loop at runtime, never by a literal call
+        // site in the codebase) — see $classArrayKeyLiterals below for the actual domain source.
+        $selfDispatchPrefixSuffixTemplates = [];
+        // Owner class => every literal string array-key ever assigned via `$anyLocalVar['literal']
+        // = ...;` anywhere in the class's own methods — real-world shape (WooCommerce):
+        // `define_columns()` builds `$show_columns['thumb'] = ...; $show_columns['name'] = ...;`
+        // (several gated behind conditionals), later consumed by a `render_{$column}_column`-
+        // style dispatcher method elsewhere in the same class. Deliberately class-wide rather than
+        // scoped to one variable name or method — the "coarse net" trade-off this parser already
+        // makes throughout: correlating this with $selfDispatchPrefixSuffixTemplates' own owner
+        // class in ClassAnalyzer is the actual precision-narrowing step.
+        $classArrayKeyLiterals = [];
         // $var = helper_fn(); ... get_template_part( $var ); — one more level of indirection than
         // the direct `get_template_part( helper_fn() )` shape above: real-world example (OceanWP
         // theme) `$template_part = ocean_single_post_header_meta_template(); get_template_part(
@@ -358,6 +416,14 @@ final class PhpTokenParser
                         $pendingForLoopVarName = null;
                         $pendingForLoopVarValues = null;
                     }
+                    if ($expectingForeachLoopOpen) {
+                        $foreachLoopVarDepthStack[] = $braceDepth;
+                        $foreachLoopVarNameStack[] = $pendingForeachLoopVarName ?? '';
+                        $foreachLoopVarValuesStack[] = $pendingForeachLoopVarValues ?? [];
+                        $expectingForeachLoopOpen = false;
+                        $pendingForeachLoopVarName = null;
+                        $pendingForeachLoopVarValues = null;
+                    }
                 } elseif ($token === '}') {
                     if ($interpolationDepth > 0) {
                         $interpolationDepth--;
@@ -401,6 +467,11 @@ final class PhpTokenParser
                             array_pop($forLoopVarNameStack);
                             array_pop($forLoopVarValuesStack);
                         }
+                        if (!empty($foreachLoopVarDepthStack) && end($foreachLoopVarDepthStack) === $braceDepth) {
+                            array_pop($foreachLoopVarDepthStack);
+                            array_pop($foreachLoopVarNameStack);
+                            array_pop($foreachLoopVarValuesStack);
+                        }
                         $braceDepth--;
                     }
                 } elseif ($token === '&' && $skipNextString) {
@@ -426,6 +497,33 @@ final class PhpTokenParser
                             $phpPathStrings[] = $path;
                         }
                         $i = $lastInterpIndex;
+                    } else {
+                        // `call_user_func( [ $this, "{$section}_section" ] )` — a same-class
+                        // self-dispatch method whose real target name is built from its own
+                        // parameter. Real-world shape (Sydney theme): see
+                        // PendingSelfDispatchCall's own docblock. Recorded against the CURRENT
+                        // enclosing method (this string is defining the dispatcher's own
+                        // capability, not resolving a call site).
+                        $collected = $this->collectInterpolatedStringSegments($tokens, $i);
+                        if ($collected !== null) {
+                            [$segments, $closingQuoteIndex] = $collected;
+                            if ($this->isThisArrayCallbackReceiverAt($tokens, $i, $closingQuoteIndex)) {
+                                $suffix = $this->extractTrailingVarSuffix($segments);
+                                if ($suffix !== null) {
+                                    $currentDefIndex = empty($functionDefIndexForBodyStack) ? null : end($functionDefIndexForBodyStack);
+                                    if ($currentDefIndex !== null) {
+                                        $currentDef = $functionDefs[$currentDefIndex];
+                                        if ($currentDef->isMethod && $currentDef->ownerClass !== null) {
+                                            $suffixKey = $currentDef->ownerClass . '::' . $currentDef->name;
+                                            if (!isset($selfDispatchSuffixes[$suffixKey])) {
+                                                $selfDispatchSuffixes[$suffixKey] = [];
+                                            }
+                                            $selfDispatchSuffixes[$suffixKey][] = $suffix;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 continue;
@@ -582,7 +680,7 @@ final class PhpTokenParser
             }
 
             if ($type === T_NEW || $type === T_INSTANCEOF) {
-                $ref = $this->captureClassNameAfter($tokens, $i);
+                $ref = $this->captureClassNameAfter($tokens, $i, $currentNamespace, $useImports);
                 if ($ref !== null) {
                     $classReferences[] = $ref;
                     if ($type === T_NEW) {
@@ -629,6 +727,18 @@ final class PhpTokenParser
                         $phpPathStrings[] = $literal . '.php';
                     }
                 }
+
+                // foreach ($conditionals as $conditional) { ... 'add_crumbs_' . substr($conditional,
+                // 3) ... } — the plain "as $var" counterpart to the bounded for-loop tracking
+                // above, over a tracked literal-string array instead of an integer range. Only
+                // sets $expectingForeachLoopOpen (the push itself happens at the loop's own next
+                // '{', mirroring $expectingForLoopOpen) when parseForeachLiteralArrayLoop actually
+                // recognized the plain form; anything else leaves the loop variable untracked.
+                $foreachResult = $this->parseForeachLiteralArrayLoop($tokens, $i, $anyArrayLiteralVars);
+                if ($foreachResult !== null) {
+                    [$pendingForeachLoopVarName, $pendingForeachLoopVarValues] = $foreachResult;
+                    $expectingForeachLoopOpen = true;
+                }
             }
 
             // `return $template_path;` / `return apply_filters('tag', $template_path);` /
@@ -649,6 +759,28 @@ final class PhpTokenParser
                         array_push($functionLiteralReturns[$currentFunctionName], ...$literals);
                     }
                 }
+
+                // `return <ignored-prefix> . $param . 'suffix';` — e.g. wp-nested-pages'
+                // `Helpers::view($file) { return dirname(__FILE__) . '/Views/' . $file . '.php';
+                // }`. Uses $functionDefIndexForBodyStack (not $functionNameStack, which only
+                // tracks bare top-level functions) since the real-world evidence for this shape
+                // is a *method*; keyed to the owner class too so two unrelated classes' same-
+                // named helper don't collide. See resolveReturnParamSuffixTemplate's own
+                // docblock and $pendingParamSuffixCalls for the call-site half.
+                $currentDefIndex = empty($functionDefIndexForBodyStack) ? null : end($functionDefIndexForBodyStack);
+                if ($currentDefIndex !== null) {
+                    $currentDef = $functionDefs[$currentDefIndex];
+                    $suffix = $this->resolveReturnParamSuffixTemplate($tokens, $i);
+                    if ($suffix !== null) {
+                        $suffixKey = $currentDef->isMethod && $currentDef->ownerClass !== null
+                            ? $currentDef->ownerClass . '::' . $currentDef->name
+                            : $currentDef->name;
+                        if (!isset($functionParamSuffixReturns[$suffixKey])) {
+                            $functionParamSuffixReturns[$suffixKey] = [];
+                        }
+                        $functionParamSuffixReturns[$suffixKey][] = $suffix;
+                    }
+                }
             }
 
             if ($type === T_EXTENDS || $type === T_IMPLEMENTS) {
@@ -656,6 +788,31 @@ final class PhpTokenParser
                     $classReferences[] = $ref->short;
                 }
                 continue;
+            }
+
+            // `if ( $tab == 'general' ) ... if ( $tab == 'posttypes' ) ...` — a variable's own
+            // possible values, established not by assignment but by which literals it's compared
+            // against elsewhere in the same scope (real-world shape: wp-nested-pages'
+            // settings.php, feeding `include(Helpers::view('settings/settings-' . $tab))` once
+            // $tab's domain is known). Accumulated into the same $varLiteralAssignmentsStack pool
+            // as a literal assignment would be — this parser doesn't distinguish "ever assigned"
+            // from "ever tested against" for the purpose of guessing a variable's possible
+            // values, same coarse-net spirit as everywhere else here. Deliberately narrow:
+            // `$var (==|===) 'literal'` order only, not the reversed `'literal' == $var` (no
+            // evidence for it yet).
+            if ($type === T_IS_EQUAL || $type === T_IS_IDENTICAL) {
+                $prevIndex = $this->peekPrevMeaningfulIndex($tokens, $i);
+                $nextIndex = $this->peekNextMeaningfulIndex($tokens, $i);
+                if (
+                    $prevIndex !== null && $nextIndex !== null
+                    && is_array($tokens[$prevIndex]) && $tokens[$prevIndex][0] === T_VARIABLE
+                    && is_array($tokens[$nextIndex]) && $tokens[$nextIndex][0] === T_CONSTANT_ENCAPSED_STRING
+                ) {
+                    $comparedVarName = $tokens[$prevIndex][1];
+                    $comparedLiteral = $this->stripQuotes($tokens[$nextIndex][1]);
+                    $varScopeTop = count($varLiteralAssignmentsStack) - 1;
+                    $this->accumulateVarLiteral($varLiteralAssignmentsStack, $varScopeTop, $comparedVarName, $comparedLiteral);
+                }
             }
 
             if ($type === T_FUNCTION) {
@@ -728,6 +885,22 @@ final class PhpTokenParser
             if ($type === T_VARIABLE) {
                 $scopeTop = count($varTypesStack) - 1;
 
+                // $anyVar['literal'] = ...; — real-world shape (WooCommerce):
+                // `$show_columns['thumb'] = ...;` inside `define_columns()`. Applies to any
+                // variable name, including (but not limited to) $this — see
+                // $classArrayKeyLiterals' own declaration comment for why this is deliberately
+                // class-wide rather than scoped to one variable.
+                $currentArrayKeyOwnerClass = empty($classNameStack) ? null : end($classNameStack);
+                if ($currentArrayKeyOwnerClass !== null) {
+                    $arrayKeyLiteral = $this->arrayKeyLiteralAssignment($tokens, $i);
+                    if ($arrayKeyLiteral !== null) {
+                        if (!isset($classArrayKeyLiterals[$currentArrayKeyOwnerClass])) {
+                            $classArrayKeyLiterals[$currentArrayKeyOwnerClass] = [];
+                        }
+                        $classArrayKeyLiterals[$currentArrayKeyOwnerClass][] = $arrayKeyLiteral;
+                    }
+                }
+
                 if ($value === '$this') {
                     // The one case where an object's exact class is always known without any
                     // type inference: it's whichever class this code is physically inside.
@@ -751,6 +924,7 @@ final class PhpTokenParser
 
                             if ($afterPropIndex !== null && $tokens[$afterPropIndex] === '=') {
                                 $newClass = $this->assignedNewClassName($tokens, $afterPropIndex, $classNameStack, $classParentStack, $currentNamespace, $useImports)
+                                    ?? $this->assignedStaticFactoryClassName($tokens, $afterPropIndex, $classNameStack, $classParentStack, $currentNamespace, $useImports)
                                     ?? $this->assignedVariableClassName($tokens, $afterPropIndex, $varTypesStack[$scopeTop]);
                                 if ($newClass !== null) {
                                     $propertyAssignedClasses[$receiverClass][$propName] = $newClass;
@@ -774,6 +948,23 @@ final class PhpTokenParser
                             [$methodName, $methodNameIndex] = $target;
                             $scopedMethodCalls[] = new ScopedMethodCall($receiverClass, $methodName);
                             $i = $methodNameIndex;
+
+                            // $this->get_section( 'colors' ) — a scoped call with a plain
+                            // string-literal first argument. Recorded as a *candidate*
+                            // self-dispatch call regardless of what get_section() actually does
+                            // with it; resolved once every file's parse is merged, against
+                            // whether get_section() itself matches the `call_user_func([$this,
+                            // "{$param}_suffix"])` shape (see $selfDispatchSuffixes and
+                            // PendingSelfDispatchCall's own docblock — Sydney theme's
+                            // `get_section('colors')`/`('buttons')`/...).
+                            $selfDispatchArgIndex = $this->firstStringArgIndex($tokens, $methodNameIndex);
+                            if ($selfDispatchArgIndex !== null) {
+                                $pendingSelfDispatchCalls[] = new PendingSelfDispatchCall(
+                                    $receiverClass,
+                                    $methodName,
+                                    $this->stripQuotes($tokens[$selfDispatchArgIndex][1]),
+                                );
+                            }
                         }
                     }
                 } elseif (($equalsIndex = $this->peekNextMeaningfulIndex($tokens, $i)) !== null && $tokens[$equalsIndex] === '=') {
@@ -785,7 +976,8 @@ final class PhpTokenParser
                     // just tracks whichever assignment comes last in source order, not "could be
                     // either" — an approximation, same spirit as the rest of this parser, and
                     // still strictly more precise than the unscoped fallback it replaces.
-                    $newClass = $this->assignedNewClassName($tokens, $equalsIndex, $classNameStack, $classParentStack, $currentNamespace, $useImports);
+                    $newClass = $this->assignedNewClassName($tokens, $equalsIndex, $classNameStack, $classParentStack, $currentNamespace, $useImports)
+                        ?? $this->assignedStaticFactoryClassName($tokens, $equalsIndex, $classNameStack, $classParentStack, $currentNamespace, $useImports);
                     if ($newClass !== null) {
                         $varTypesStack[$scopeTop][$value] = $newClass;
                         unset($varPendingCallStack[$scopeTop][$value]);
@@ -817,6 +1009,12 @@ final class PhpTokenParser
                     } else {
                         unset($arrayLiteralVars[$value]);
                     }
+                    $anyLiteralArray = $this->parseAnyStringLiteralArray($tokens, $equalsIndex);
+                    if ($anyLiteralArray !== null) {
+                        $anyArrayLiteralVars[$value] = $anyLiteralArray;
+                    } else {
+                        unset($anyArrayLiteralVars[$value]);
+                    }
 
                     // $var = 'literal'; — accumulated (not overwritten) into the current
                     // function scope's $varLiteralAssignmentsStack entry; see its own
@@ -825,7 +1023,7 @@ final class PhpTokenParser
                     $singleLiteral = $this->singleStringLiteralRhs($tokens, $equalsIndex);
                     if ($singleLiteral !== null) {
                         $varScopeTop = count($varLiteralAssignmentsStack) - 1;
-                        $varLiteralAssignmentsStack[$varScopeTop][$value][] = $singleLiteral;
+                        $this->accumulateVarLiteral($varLiteralAssignmentsStack, $varScopeTop, $value, $singleLiteral);
                         // $hook = 'my_plugin_loaded'; do_action($hook); — last-write-wins,
                         // consulted by classifyArgTokens() below when a hook/template-part
                         // argument is a bare variable instead of a literal directly.
@@ -833,6 +1031,21 @@ final class PhpTokenParser
                     } else {
                         $varScopeTop = count($varLiteralValueStack) - 1;
                         unset($varLiteralValueStack[$varScopeTop][$value]);
+                    }
+
+                    // $var = ( <cond> ) ? 'lit1' : 'lit2'; — both ternary branches accumulated
+                    // into the same $varLiteralAssignmentsStack entry as the plain single-literal
+                    // assignment above; the condition itself is never evaluated (which branch
+                    // actually runs is exactly what can't be known statically — same "every
+                    // possibility a literal-only assignment reveals" stance the whole map already
+                    // takes). Real-world shape (wp-nested-pages): `$row_view = (
+                    // $this->post->type !== 'np-redirect' ) ? 'partials/row' :
+                    // 'partials/row-link';`.
+                    $ternaryDomain = $this->parseTernaryLiteralDomain($tokens, $equalsIndex);
+                    if ($ternaryDomain !== null) {
+                        $varScopeTop = count($varLiteralAssignmentsStack) - 1;
+                        $this->accumulateVarLiteral($varLiteralAssignmentsStack, $varScopeTop, $value, $ternaryDomain[0]);
+                        $this->accumulateVarLiteral($varLiteralAssignmentsStack, $varScopeTop, $value, $ternaryDomain[1]);
                     }
 
                     // $var = helper_fn(); — last-write-wins, same scoping as $varTypesStack. See
@@ -933,8 +1146,13 @@ final class PhpTokenParser
 
                 if ($nextNonWhitespace === '::') {
                     // Foo::method(), Foo::CONST, Foo::class, Foo::$prop — whatever comes after
-                    // the '::', "Foo" itself is a class reference either way.
-                    $classReferences[] = $name;
+                    // the '::', "Foo" itself is a class reference either way. Resolved through
+                    // any use-import alias first (`use Foo\Bar as Alias; Alias::method()`) — same
+                    // real-world shape as captureClassNameAfter()'s own fix above: previously
+                    // recorded the alias itself, never matching the aliased class's own declared
+                    // short name.
+                    $receiverClass = $this->resolveClassNameToken($name, $classNameStack, $classParentStack, $currentNamespace, $useImports);
+                    $classReferences[] = $receiverClass !== null ? $this->shortClassName($receiverClass) : $name;
 
                     // self::method()/parent::method()/Foo::method() (but not Foo::CONST,
                     // Foo::class, Foo::$prop — findScopedCallTarget only matches an actual call).
@@ -944,7 +1162,6 @@ final class PhpTokenParser
 
                         $this->recordWpCliAddCommandDispatch($name, $methodName, $tokens, $methodNameIndex, $currentNamespace, $useImports, $reflectionDispatchedClassNames);
 
-                        $receiverClass = $this->resolveClassNameToken($name, $classNameStack, $classParentStack, $currentNamespace, $useImports);
                         if ($receiverClass !== null) {
                             $scopedMethodCalls[] = new ScopedMethodCall($receiverClass, $methodName);
                             $i = $methodNameIndex;
@@ -964,6 +1181,25 @@ final class PhpTokenParser
                                     $methodName,
                                     $this->stripQuotes($tokens[$literalArgIndex][1]),
                                 );
+                            }
+
+                            // Foo::view($row_view) — a scoped call whose sole argument is a bare
+                            // tracked variable (or 'literal' . $var) rather than a literal
+                            // directly. Recorded as a *candidate* param-suffix call regardless of
+                            // what the callee actually does with it; resolved once every file's
+                            // parse is merged, against whether the callee's own body matches the
+                            // `return <ignored> . $param . 'suffix';` shape (see
+                            // $functionParamSuffixReturns and PendingParamSuffixCall's own
+                            // docblock for the real-world shape this covers — wp-nested-pages'
+                            // `Helpers::view($row_view)`/`Helpers::view('settings/settings-' .
+                            // $tab)`).
+                            $singleArgTokens = $this->argTokensAt($tokens, $methodNameIndex, 0);
+                            if ($singleArgTokens !== null && $this->argTokensAt($tokens, $methodNameIndex, 1) === null) {
+                                $argScopeTop = count($varLiteralAssignmentsStack) - 1;
+                                $candidates = $this->resolveParamSuffixCallArgumentCandidates($singleArgTokens, $varLiteralAssignmentsStack[$argScopeTop]);
+                                if ($candidates !== null) {
+                                    $pendingParamSuffixCalls[] = new PendingParamSuffixCall($receiverClass, $methodName, $candidates);
+                                }
                             }
                         }
                     }
@@ -1037,6 +1273,20 @@ final class PhpTokenParser
                             // so Elementor's own `Wp_Cli` command classes looked permanently
                             // unused regardless of the `Foo::class` second-argument fix above.
                             $this->recordWpCliAddCommandDispatch($this->shortClassName($value), $methodName, $tokens, $methodNameIndex, $currentNamespace, $useImports, $reflectionDispatchedClassNames);
+
+                            // NestedPages\Helpers::view($row_view) — the namespaced/fully-
+                            // qualified counterpart to the bare T_STRING branch's own
+                            // $pendingParamSuffixCalls handling above (see its docblock for the
+                            // real-world shape; wp-nested-pages calls Helpers::view() exactly this
+                            // way, `use`-imported and namespace-qualified rather than a bare name).
+                            $singleArgTokens = $this->argTokensAt($tokens, $methodNameIndex, 0);
+                            if ($singleArgTokens !== null && $this->argTokensAt($tokens, $methodNameIndex, 1) === null) {
+                                $argScopeTop = count($varLiteralAssignmentsStack) - 1;
+                                $candidates = $this->resolveParamSuffixCallArgumentCandidates($singleArgTokens, $varLiteralAssignmentsStack[$argScopeTop]);
+                                if ($candidates !== null) {
+                                    $pendingParamSuffixCalls[] = new PendingParamSuffixCall($receiverClass, $methodName, $candidates);
+                                }
+                            }
                         }
                     }
                     continue;
@@ -1096,14 +1346,44 @@ final class PhpTokenParser
                     continue;
                 }
                 $stringVal = $this->stripQuotes($value);
+
+                // `array( $this, 'render_' . $column . '_column' )` — the plain-concatenation
+                // counterpart to isThisArrayCallbackReceiverAt's interpolated-string shape (real-
+                // world case: WooCommerce's `render_columns()`/`render_column()` dispatchers).
+                // Recorded against the CURRENT enclosing method the same way the interpolated
+                // shape is — see $selfDispatchSuffixes' own docblock and
+                // resolvePrefixVarSuffixSelfDispatchTemplate's for why prefix and suffix are both
+                // captured here (unlike the interpolated shape, which has evidence for a suffix
+                // only).
+                $selfDispatchTemplate = $this->resolvePrefixVarSuffixSelfDispatchTemplate($tokens, $i);
+                if ($selfDispatchTemplate !== null) {
+                    $currentDefIndex = empty($functionDefIndexForBodyStack) ? null : end($functionDefIndexForBodyStack);
+                    if ($currentDefIndex !== null) {
+                        $currentDef = $functionDefs[$currentDefIndex];
+                        if ($currentDef->isMethod && $currentDef->ownerClass !== null) {
+                            $prefixSuffixKey = $currentDef->ownerClass . '::' . $currentDef->name;
+                            if (!isset($selfDispatchPrefixSuffixTemplates[$prefixSuffixKey])) {
+                                $selfDispatchPrefixSuffixTemplates[$prefixSuffixKey] = [];
+                            }
+                            $selfDispatchPrefixSuffixTemplates[$prefixSuffixKey][] = $selfDispatchTemplate;
+                        }
+                    }
+                }
+
                 // A literal directly concatenated with a currently-tracked bounded for-loop
                 // variable (`'prefix_' . $i` inside `for ($i = 1; $i < 5; $i++) { ... }`) —
                 // computed once per literal and shared by both the callback-name and file-path
                 // checks below, since exactly one of them ever consumes it for a given literal
                 // (a callback-shaped identifier can't also end in '.php' — PHP identifiers don't
                 // contain dots). See resolveForLoopConcatenatedLiteral's own docblock for the
-                // real-world shapes this covers.
-                $forLoopEnumeration = $this->resolveForLoopConcatenatedLiteral($tokens, $i, $stringVal, $forLoopVarNameStack, $forLoopVarValuesStack);
+                // real-world shapes this covers. Falls back to the foreach-over-literal-array
+                // sibling (resolveForeachConcatenatedLiteral) when the for-loop mechanism doesn't
+                // match — mutually exclusive in practice (a given variable name is tracked by at
+                // most one of the two loop kinds at once), and both return the same shape, so
+                // every consumer below treats the result identically regardless of which loop
+                // kind actually produced it.
+                $forLoopEnumeration = $this->resolveForLoopConcatenatedLiteral($tokens, $i, $stringVal, $forLoopVarNameStack, $forLoopVarValuesStack)
+                    ?? $this->resolveForeachConcatenatedLiteral($tokens, $i, $stringVal, $foreachLoopVarNameStack, $foreachLoopVarValuesStack);
                 // Namespaced/class-scoped code commonly builds a fully-qualified callback string
                 // via concatenation — `__NAMESPACE__ . '\my_callback'` or `__CLASS__ .
                 // '::my_method'` (or writes the FQ form out directly: '\My\Namespace\my_callback')
@@ -1319,6 +1599,12 @@ final class PhpTokenParser
             useImports: $useImports,
             functionLiteralReturns: $functionLiteralReturns,
             pendingTemplateHelperCalls: $pendingTemplateHelperCalls,
+            functionParamSuffixReturns: $functionParamSuffixReturns,
+            pendingParamSuffixCalls: $pendingParamSuffixCalls,
+            selfDispatchSuffixes: $selfDispatchSuffixes,
+            pendingSelfDispatchCalls: $pendingSelfDispatchCalls,
+            selfDispatchPrefixSuffixTemplates: $selfDispatchPrefixSuffixTemplates,
+            classArrayKeyLiterals: $classArrayKeyLiterals,
         );
     }
 
@@ -1458,7 +1744,7 @@ final class PhpTokenParser
                     'parent' => $ownerParent === null ? null : new ClassRef($this->shortClassName($ownerParent), $ownerParent),
                     default => in_array(strtolower($name), self::PRIMITIVE_TYPE_NAMES, true)
                         ? null
-                        : new ClassRef($this->shortClassName($name), $this->resolveFqcn($name, $currentNamespace, $useImports)),
+                        : $this->newClassRefFor($name, $currentNamespace, $useImports),
                 };
             }
 
@@ -1659,7 +1945,7 @@ final class PhpTokenParser
                     'parent' => $ownerParent === null ? null : new ClassRef($this->shortClassName($ownerParent), $ownerParent),
                     default => in_array(strtolower($name), self::PRIMITIVE_TYPE_NAMES, true)
                         ? null
-                        : new ClassRef($this->shortClassName($name), $this->resolveFqcn($name, $currentNamespace, $useImports)),
+                        : $this->newClassRefFor($name, $currentNamespace, $useImports),
                 };
                 if ($resolved !== null) {
                     $typeRefs[] = $resolved;
@@ -2428,6 +2714,42 @@ final class PhpTokenParser
     }
 
     /**
+     * Resolves a scoped call's sole already-collected argument (see argTokensAt) to candidate
+     * literal strings when it's either a bare tracked variable (`Foo::view($row_view)`) or
+     * `'literal' . $var` (`Foo::view('settings/settings-' . $tab)`) — the two real-world shapes
+     * $pendingParamSuffixCalls covers. Returns null for anything else (a transform, more than one
+     * concatenation segment, an untracked/empty-domain variable).
+     *
+     * @param list<Token> $argTokens
+     * @param array<string,list<string>> $varLiteralAssignments
+     * @return list<string>|null
+     */
+    private function resolveParamSuffixCallArgumentCandidates(array $argTokens, array $varLiteralAssignments): ?array
+    {
+        if (count($argTokens) === 1 && is_array($argTokens[0]) && $argTokens[0][0] === T_VARIABLE) {
+            $domain = $varLiteralAssignments[$argTokens[0][1]] ?? [];
+            return $domain !== [] ? $domain : null;
+        }
+
+        if (
+            count($argTokens) === 3
+            && is_array($argTokens[0]) && $argTokens[0][0] === T_CONSTANT_ENCAPSED_STRING
+            && $argTokens[1] === '.'
+            && is_array($argTokens[2]) && $argTokens[2][0] === T_VARIABLE
+        ) {
+            $domain = $varLiteralAssignments[$argTokens[2][1]] ?? [];
+            if ($domain === []) {
+                return null;
+            }
+            $prefix = $this->stripQuotes($argTokens[0][1]);
+
+            return array_map(static fn(string $v) => $prefix . $v, $domain);
+        }
+
+        return null;
+    }
+
+    /**
      * Classifies a single already-collected argument as one of three shapes:
      *  - a fully literal string, nothing else: exact tag known, not dynamic.
      *  - a string with a resolvable literal *prefix* — an interpolated double-quoted string
@@ -2685,10 +3007,15 @@ final class PhpTokenParser
     /**
      * Reads the class name following `new` or `instanceof`. Skips non-name cases such as
      * `new class {}` (anonymous — next token is T_CLASS) and `new static()` (T_STATIC, a
-     * late-static-binding placeholder, not a literal class name).
+     * late-static-binding placeholder, not a literal class name). Resolved through any
+     * use-import alias first (`use Foo\Bar as Alias; new Alias()`) — real-world case (Elementor):
+     * `use Some\Namespace\Loader as Assets_Loader; new Assets_Loader()` previously recorded the
+     * alias itself as the class reference, never matching `Loader`'s own declared short name, so
+     * the class looked permanently unused despite the real, resolvable `new` right there.
      * @param list<Token> $tokens
+     * @param array<string,string> $useImports
      */
-    private function captureClassNameAfter(array $tokens, int $i): ?string
+    private function captureClassNameAfter(array $tokens, int $i, string $currentNamespace, array $useImports): ?string
     {
         $j = $i + 1;
         while (isset($tokens[$j]) && is_array($tokens[$j]) && $tokens[$j][0] === T_WHITESPACE) {
@@ -2700,7 +3027,7 @@ final class PhpTokenParser
             return null;
         }
 
-        return $this->shortClassName($next[1]);
+        return $this->shortClassName($this->resolveFqcn($next[1], $currentNamespace, $useImports));
     }
 
     /**
@@ -2738,7 +3065,14 @@ final class PhpTokenParser
             }
 
             if (in_array($t[0], self::CLASS_NAME_TOKENS, true)) {
-                $names[] = new ClassRef($this->shortClassName($t[1]), $this->resolveFqcn($t[1], $currentNamespace, $useImports));
+                // newClassRefFor() derives $short from the resolved FQCN (not the raw token
+                // text) so an aliased reference (`use Some\Widget as Base; class Foo extends
+                // Base`) still yields "Widget" — its real declared short name — for both of
+                // $short's consumers: findUnusedClasses()'s $classReferences match and
+                // ClassAnalyzer's curated-table (BASE_CLASS_CONTRACT_METHODS/interface) lookup,
+                // which is keyed by the class's real bare name, not whatever local alias a
+                // particular file happened to import it under.
+                $names[] = $this->newClassRefFor($t[1], $currentNamespace, $useImports);
             }
 
             $j++;
@@ -2863,6 +3197,20 @@ final class PhpTokenParser
         }
 
         return $currentNamespace === '' ? $name : $currentNamespace . '\\' . $name;
+    }
+
+    /**
+     * Builds a ClassRef for a bare (non self/parent/static) class-name token, resolving through
+     * any use-import alias first so `$short` reflects the class's real declared name rather than
+     * whatever local alias it was referenced under — see ClassRef's own docblock.
+     *
+     * @param array<string,string> $useImports
+     */
+    private function newClassRefFor(string $name, string $currentNamespace, array $useImports): ClassRef
+    {
+        $fqcn = $this->resolveFqcn($name, $currentNamespace, $useImports);
+
+        return new ClassRef($this->shortClassName($fqcn), $fqcn);
     }
 
     /**
@@ -3026,43 +3374,120 @@ final class PhpTokenParser
     }
 
     /**
-     * $i points at the bare `"` token that opens a genuinely-interpolated double-quoted string
-     * (PHP tokenizes a non-interpolated one as a single T_CONSTANT_ENCAPSED_STRING instead, so
-     * reaching this bare token at all already means at least one variable is embedded). Real-
-     * world shape this covers (Astra theme): `"{$icons_dir}/icons-v6-{$i}.php"` inside
-     * `for ($i = 0; $i < 4; $i++)` — `$icons_dir` is derived from a WP-core `plugin_dir_path()`
-     * call this parser has no way to resolve (and, being an absolute filesystem path, wouldn't
-     * even be a meaningful project-relative reference if it could be). This deliberately never
-     * attempts to resolve the *whole* interpolated string: it keeps only the literal segment
-     * directly adjacent to the matched loop variable on each side ("/icons-v6-" and ".php" here)
-     * and discards anything further out (`$icons_dir` itself, and whatever came before it, if
-     * anything) — an unresolved, non-adjacent leading segment is irrelevant once matching happens
-     * by basename alone anyway (see phpPathStrings' own basename-indexing in
-     * FileAnalyzer::buildReferencedIndex()), and a leading '/' left over from the adjacent
-     * literal (as here) doesn't change what basename()/pathinfo() extract from it either.
-     *
-     * Bails (returns null) unless every segment is one of exactly two recognized shapes — a
-     * plain literal run (T_ENCAPSED_AND_WHITESPACE) or a single interpolated variable (`$var` or
-     * `{$var}`, never `$var[0]`/`$var->prop`/`{$obj->prop}`/`${expr}`) — and the LAST variable
-     * segment matches a currently-tracked bounded for-loop variable with nothing but a single
-     * trailing literal segment (ending in '.php' — the only consumption context with any
-     * real-world evidence) after it. Any other shape (two different loop variables, a variable
-     * after the last recognized one that isn't tracked, a non-'.php' suffix, ...) is left
-     * completely unresolved, same as before this mechanism existed — deliberately narrow rather
-     * than a general interpolated-string evaluator.
+     * The string-valued sibling of resolveForLoopConcatenatedLiteral just above, for a `foreach`
+     * over a tracked literal-string array (see parseForeachLiteralArrayLoop) instead of a bounded
+     * integer range. Also recognizes one additional shape the for-loop case has no evidence for:
+     * `. substr($loopVar, N)` — a fixed non-negative literal offset applied to the loop variable
+     * before concatenation. Real-world shape (WooCommerce's breadcrumb conditional dispatch,
+     * includes/class-wc-breadcrumb.php): `foreach ($conditionals as $conditional) { ...
+     * call_user_func([$this, 'add_crumbs_' . substr($conditional, 3)]); ... }` where
+     * $conditionals is a literal array of strings like 'is_404', 'is_attachment' — substr(...,3)
+     * strips the common "is_" prefix each one shares. No length argument, no non-literal offset,
+     * no other transform function — the one shape with confirmed real-world evidence; anything
+     * else (a bare, untransformed variable still goes through the normal path below; any other
+     * function call) returns null, same "don't guess" stance as everywhere else in this parser.
      *
      * @param list<Token> $tokens
-     * @param list<string> $forLoopVarNameStack
-     * @param list<list<int>> $forLoopVarValuesStack
-     * @return array{list<string>, int}|null [enumerated basenames, last consumed token index —
-     *   the closing '"']
+     * @param list<string> $foreachLoopVarNameStack
+     * @param list<list<string>> $foreachLoopVarValuesStack
+     * @return array{list<string>, int}|null [enumerated strings, last consumed token index]
      */
-    private function resolveInterpolatedLoopSuffixPath(
+    private function resolveForeachConcatenatedLiteral(
         array $tokens,
         int $i,
-        array $forLoopVarNameStack,
-        array $forLoopVarValuesStack,
+        string $prefixValue,
+        array $foreachLoopVarNameStack,
+        array $foreachLoopVarValuesStack,
     ): ?array {
+        $dotIndex = $this->skipInsignificant($tokens, $i + 1);
+        if (!isset($tokens[$dotIndex]) || $tokens[$dotIndex] !== '.') {
+            return null;
+        }
+        $exprIndex = $this->skipInsignificant($tokens, $dotIndex + 1);
+        if (!isset($tokens[$exprIndex]) || !is_array($tokens[$exprIndex])) {
+            return null;
+        }
+
+        $transformOffset = null;
+        if ($tokens[$exprIndex][0] === T_VARIABLE) {
+            $varIndex = $exprIndex;
+            $lastIndex = $exprIndex;
+        } elseif ($tokens[$exprIndex][0] === T_STRING && strtolower($tokens[$exprIndex][1]) === 'substr') {
+            $openParenIndex = $this->skipInsignificant($tokens, $exprIndex + 1);
+            if (!isset($tokens[$openParenIndex]) || $tokens[$openParenIndex] !== '(') {
+                return null;
+            }
+            $varIndex = $this->skipInsignificant($tokens, $openParenIndex + 1);
+            if (!isset($tokens[$varIndex]) || !is_array($tokens[$varIndex]) || $tokens[$varIndex][0] !== T_VARIABLE) {
+                return null;
+            }
+            $commaIndex = $this->skipInsignificant($tokens, $varIndex + 1);
+            if (!isset($tokens[$commaIndex]) || $tokens[$commaIndex] !== ',') {
+                return null;
+            }
+            $offsetIndex = $this->skipInsignificant($tokens, $commaIndex + 1);
+            if (!isset($tokens[$offsetIndex]) || !is_array($tokens[$offsetIndex]) || $tokens[$offsetIndex][0] !== T_LNUMBER) {
+                return null;
+            }
+            $closeParenIndex = $this->skipInsignificant($tokens, $offsetIndex + 1);
+            if (!isset($tokens[$closeParenIndex]) || $tokens[$closeParenIndex] !== ')') {
+                return null; // a 3rd (length) argument or anything else — not attempted
+            }
+            $transformOffset = (int) $tokens[$offsetIndex][1];
+            $lastIndex = $closeParenIndex;
+        } else {
+            return null;
+        }
+
+        $varName = $tokens[$varIndex][1];
+        $values = null;
+        for ($k = count($foreachLoopVarNameStack) - 1; $k >= 0; $k--) {
+            if ($foreachLoopVarNameStack[$k] === $varName) {
+                $values = $foreachLoopVarValuesStack[$k];
+                break;
+            }
+        }
+        if ($values === null) {
+            return null;
+        }
+
+        $suffix = '';
+        $afterIndex = $this->skipInsignificant($tokens, $lastIndex + 1);
+        if (isset($tokens[$afterIndex]) && $tokens[$afterIndex] === '.') {
+            $suffixIndex = $this->skipInsignificant($tokens, $afterIndex + 1);
+            if (isset($tokens[$suffixIndex]) && is_array($tokens[$suffixIndex]) && $tokens[$suffixIndex][0] === T_CONSTANT_ENCAPSED_STRING) {
+                $suffix = $this->stripQuotes($tokens[$suffixIndex][1]);
+                $lastIndex = $suffixIndex;
+            }
+        }
+
+        $results = [];
+        foreach ($values as $value) {
+            $transformed = $transformOffset !== null ? substr($value, $transformOffset) : $value;
+            $results[] = $prefixValue . $transformed . $suffix;
+        }
+
+        return [$results, $lastIndex];
+    }
+
+    /**
+     * $i points at the bare `"` token that opens a genuinely-interpolated double-quoted string
+     * (PHP tokenizes a non-interpolated one as a single T_CONSTANT_ENCAPSED_STRING instead, so
+     * reaching this bare token at all already means at least one variable is embedded). Walks its
+     * segments, recognizing exactly two shapes — a plain literal run
+     * (T_ENCAPSED_AND_WHITESPACE) or a single interpolated variable (`$var` or `{$var}`, never
+     * `$var[0]`/`$var->prop`/`{$obj->prop}`/`${expr}`) — bailing (null) on anything else (a
+     * genuinely dynamic sub-expression this parser can't evaluate, or a malformed/unterminated
+     * string). Shared by every consumer that needs to inspect an interpolated string's pieces
+     * without evaluating the whole thing (resolveInterpolatedLoopSuffixPath below,
+     * resolveCallUserFuncSelfDispatchSuffix).
+     *
+     * @param list<Token> $tokens
+     * @return array{list<array{string,string}>, int}|null [segments (each `['literal', text]` or
+     *   `['var', varName]`, in order), the closing '"' token's own index]
+     */
+    private function collectInterpolatedStringSegments(array $tokens, int $i): ?array
+    {
         $segments = [];
         $j = $i + 1;
 
@@ -3107,7 +3532,53 @@ final class PhpTokenParser
             // interpolation — bail rather than guess.
             return null;
         }
-        $closingQuoteIndex = $j;
+
+        return [$segments, $j];
+    }
+
+    /**
+     * $i points at the bare `"` token that opens a genuinely-interpolated double-quoted string
+     * (PHP tokenizes a non-interpolated one as a single T_CONSTANT_ENCAPSED_STRING instead, so
+     * reaching this bare token at all already means at least one variable is embedded). Real-
+     * world shape this covers (Astra theme): `"{$icons_dir}/icons-v6-{$i}.php"` inside
+     * `for ($i = 0; $i < 4; $i++)` — `$icons_dir` is derived from a WP-core `plugin_dir_path()`
+     * call this parser has no way to resolve (and, being an absolute filesystem path, wouldn't
+     * even be a meaningful project-relative reference if it could be). This deliberately never
+     * attempts to resolve the *whole* interpolated string: it keeps only the literal segment
+     * directly adjacent to the matched loop variable on each side ("/icons-v6-" and ".php" here)
+     * and discards anything further out (`$icons_dir` itself, and whatever came before it, if
+     * anything) — an unresolved, non-adjacent leading segment is irrelevant once matching happens
+     * by basename alone anyway (see phpPathStrings' own basename-indexing in
+     * FileAnalyzer::buildReferencedIndex()), and a leading '/' left over from the adjacent
+     * literal (as here) doesn't change what basename()/pathinfo() extract from it either.
+     *
+     * Bails (returns null) unless every segment is one of exactly two recognized shapes — a
+     * plain literal run (T_ENCAPSED_AND_WHITESPACE) or a single interpolated variable (`$var` or
+     * `{$var}`, never `$var[0]`/`$var->prop`/`{$obj->prop}`/`${expr}`) — and the LAST variable
+     * segment matches a currently-tracked bounded for-loop variable with nothing but a single
+     * trailing literal segment (ending in '.php' — the only consumption context with any
+     * real-world evidence) after it. Any other shape (two different loop variables, a variable
+     * after the last recognized one that isn't tracked, a non-'.php' suffix, ...) is left
+     * completely unresolved, same as before this mechanism existed — deliberately narrow rather
+     * than a general interpolated-string evaluator.
+     *
+     * @param list<Token> $tokens
+     * @param list<string> $forLoopVarNameStack
+     * @param list<list<int>> $forLoopVarValuesStack
+     * @return array{list<string>, int}|null [enumerated basenames, last consumed token index —
+     *   the closing '"']
+     */
+    private function resolveInterpolatedLoopSuffixPath(
+        array $tokens,
+        int $i,
+        array $forLoopVarNameStack,
+        array $forLoopVarValuesStack,
+    ): ?array {
+        $collected = $this->collectInterpolatedStringSegments($tokens, $i);
+        if ($collected === null) {
+            return null;
+        }
+        [$segments, $closingQuoteIndex] = $collected;
 
         $lastVarSegmentIndex = null;
         foreach ($segments as $idx => $segment) {
@@ -3162,6 +3633,161 @@ final class PhpTokenParser
     }
 
     /**
+     * Given a set of interpolated-string segments (see collectInterpolatedStringSegments),
+     * returns the literal text trailing the LAST embedded variable — nothing else about the
+     * string is resolved (whatever came before that variable, or between two variables, is
+     * discarded). Returns null when there's no variable segment at all, or when the segment
+     * right after it isn't a plain literal run (another variable — too complex to resolve), or
+     * when the trailing literal is empty (`"{$var}"` alone carries no suffix to anchor on).
+     *
+     * @param list<array{string,string}> $segments
+     */
+    private function extractTrailingVarSuffix(array $segments): ?string
+    {
+        $lastVarSegmentIndex = null;
+        foreach ($segments as $idx => $segment) {
+            if ($segment[0] === 'var') {
+                $lastVarSegmentIndex = $idx;
+            }
+        }
+        if ($lastVarSegmentIndex === null) {
+            return null;
+        }
+
+        $suffix = '';
+        for ($idx = $lastVarSegmentIndex + 1; $idx < count($segments); $idx++) {
+            if ($segments[$idx][0] !== 'literal') {
+                return null; // another variable after the last recognized one — too complex
+            }
+            $suffix .= $segments[$idx][1];
+        }
+
+        return $suffix !== '' ? $suffix : null;
+    }
+
+    /**
+     * $quoteIndex points at the interpolated string's opening `"`, $closingQuoteIndex at its
+     * closing one (see collectInterpolatedStringSegments). True when it's the second element of
+     * a `[$this, "..."]` / `array($this, "...")` array-callback literal — the one real-world
+     * shape a self-dispatch suffix template (resolveSelfDispatchSuffix's own caller) is built
+     * from. Same backward-walk idea as arrayCallbackReceiverClass, just narrowed to the `$this`
+     * receiver only (no evidence yet for `self::class`/`Foo::class`/literal-string receivers in
+     * this specific shape) and a forward check that the string is immediately followed by the
+     * array's own closing `)`/`]` (not a 3rd+ element — same false-positive risk
+     * arrayCallbackReceiverClass's own docblock describes for a plain list of unrelated strings).
+     *
+     * @param list<Token> $tokens
+     */
+    private function isThisArrayCallbackReceiverAt(array $tokens, int $quoteIndex, int $closingQuoteIndex): bool
+    {
+        $afterIndex = $this->peekNextMeaningfulIndex($tokens, $closingQuoteIndex);
+        if ($afterIndex === null || ($tokens[$afterIndex] !== ')' && $tokens[$afterIndex] !== ']')) {
+            return false;
+        }
+
+        return $this->isPrecededByThisArrayCallbackComma($tokens, $quoteIndex);
+    }
+
+    /**
+     * True when $index is immediately preceded by `$this ,` and that `,` sits right after a
+     * `[`/`array(` array-callback open — i.e. $index is the second element of `[$this, ...]` /
+     * `array($this, ...)`. The shared backward half of isThisArrayCallbackReceiverAt and
+     * resolvePrefixVarSuffixSelfDispatchTemplate, which differ only in how far forward they walk
+     * to confirm the element they found is also the array's last one.
+     *
+     * @param list<Token> $tokens
+     */
+    private function isPrecededByThisArrayCallbackComma(array $tokens, int $index): bool
+    {
+        $commaIndex = $this->peekPrevMeaningfulIndex($tokens, $index);
+        if ($commaIndex === null || $tokens[$commaIndex] !== ',') {
+            return false;
+        }
+        $thisIndex = $this->peekPrevMeaningfulIndex($tokens, $commaIndex);
+        if ($thisIndex === null || !is_array($tokens[$thisIndex]) || $tokens[$thisIndex][0] !== T_VARIABLE || $tokens[$thisIndex][1] !== '$this') {
+            return false;
+        }
+        $openIndex = $this->peekPrevMeaningfulIndex($tokens, $thisIndex);
+
+        return $openIndex !== null && $this->isArrayOpenAt($tokens, $openIndex);
+    }
+
+    /**
+     * $prefixIndex points at a T_CONSTANT_ENCAPSED_STRING token. Recognizes `array( $this,
+     * 'prefix' . $param . 'suffix' )` / `[ $this, 'prefix' . $param . 'suffix' ]` — the plain-
+     * concatenation counterpart to isThisArrayCallbackReceiverAt's interpolated-string shape.
+     * Real-world shape (WooCommerce, abstract-class-wc-admin-list-table.php /
+     * Internal/Admin/Orders/ListTable.php): `is_callable( array( $this, 'render_' . $column .
+     * '_column' ) )`. Doesn't verify $param is actually the enclosing method's own declared
+     * parameter — same small "coarse net" concession resolveReturnParamSuffixTemplate makes.
+     * Returns null for anything else (no `$this`-receiver array-callback, more than one
+     * concatenated variable, no literal suffix, not the array's last element).
+     *
+     * @param list<Token> $tokens
+     * @return array{string, string}|null [prefix, suffix]
+     */
+    private function resolvePrefixVarSuffixSelfDispatchTemplate(array $tokens, int $prefixIndex): ?array
+    {
+        if (!$this->isPrecededByThisArrayCallbackComma($tokens, $prefixIndex)) {
+            return null;
+        }
+
+        $dot1Index = $this->peekNextMeaningfulIndex($tokens, $prefixIndex);
+        if ($dot1Index === null || $tokens[$dot1Index] !== '.') {
+            return null;
+        }
+        $varIndex = $this->peekNextMeaningfulIndex($tokens, $dot1Index);
+        if ($varIndex === null || !is_array($tokens[$varIndex]) || $tokens[$varIndex][0] !== T_VARIABLE) {
+            return null;
+        }
+        $dot2Index = $this->peekNextMeaningfulIndex($tokens, $varIndex);
+        if ($dot2Index === null || $tokens[$dot2Index] !== '.') {
+            return null;
+        }
+        $suffixIndex = $this->peekNextMeaningfulIndex($tokens, $dot2Index);
+        if ($suffixIndex === null || !is_array($tokens[$suffixIndex]) || $tokens[$suffixIndex][0] !== T_CONSTANT_ENCAPSED_STRING) {
+            return null;
+        }
+        $afterIndex = $this->peekNextMeaningfulIndex($tokens, $suffixIndex);
+        if ($afterIndex === null || ($tokens[$afterIndex] !== ')' && $tokens[$afterIndex] !== ']')) {
+            return null; // not the array's last element
+        }
+
+        return [$this->stripQuotes($tokens[$prefixIndex][1]), $this->stripQuotes($tokens[$suffixIndex][1])];
+    }
+
+    /**
+     * $varIndex points at a T_VARIABLE token. Recognizes `$var['literal'] = ...;` — a literal
+     * string array-key assignment — regardless of the variable's own name (see
+     * $classArrayKeyLiterals' own declaration comment for the real-world shape this covers).
+     * Returns the literal key, or null for anything else (a non-literal/dynamic key, a
+     * comparison instead of assignment, no array access at all).
+     *
+     * @param list<Token> $tokens
+     */
+    private function arrayKeyLiteralAssignment(array $tokens, int $varIndex): ?string
+    {
+        $openIndex = $this->peekNextMeaningfulIndex($tokens, $varIndex);
+        if ($openIndex === null || $tokens[$openIndex] !== '[') {
+            return null;
+        }
+        $keyIndex = $this->peekNextMeaningfulIndex($tokens, $openIndex);
+        if ($keyIndex === null || !is_array($tokens[$keyIndex]) || $tokens[$keyIndex][0] !== T_CONSTANT_ENCAPSED_STRING) {
+            return null;
+        }
+        $closeIndex = $this->peekNextMeaningfulIndex($tokens, $keyIndex);
+        if ($closeIndex === null || $tokens[$closeIndex] !== ']') {
+            return null;
+        }
+        $eqIndex = $this->peekNextMeaningfulIndex($tokens, $closeIndex);
+        if ($eqIndex === null || $tokens[$eqIndex] !== '=') {
+            return null;
+        }
+
+        return $this->stripQuotes($tokens[$keyIndex][1]);
+    }
+
+    /**
      * $i points at T_FOREACH. Resolves `foreach ( $var as ... )`'s collection expression to
      * $var's tracked literal-array contents, or [] if it isn't a bare tracked variable (any other
      * shape — a method call, a property access, an inline array literal — falls through
@@ -3183,6 +3809,70 @@ final class PhpTokenParser
             return [];
         }
         return $arrayLiteralVars[$tokens[$j][1]] ?? [];
+    }
+
+    /**
+     * $i points at T_FOREACH. Resolves `foreach ( $arrayVar as $loopVar )` when $arrayVar is a
+     * currently-tracked plain literal-string array (see $arrayLiteralVars) and the loop uses the
+     * plain "as $var" form — not "as $k => $v", not by-reference (`as &$var`). Real-world shape
+     * this covers (WooCommerce's breadcrumb conditional dispatch,
+     * includes/class-wc-breadcrumb.php): `foreach ($conditionals as $conditional) { if
+     * (call_user_func($conditional)) { call_user_func([$this, 'add_crumbs_' .
+     * substr($conditional, 3)]); break; } }` — feeds resolveForeachConcatenatedLiteral. Any other
+     * shape returns null, same "only trust the simplest unambiguous shape" stance as
+     * resolveForeachArrayLiterals just above (which this deliberately doesn't merge with, since
+     * that one only needs the collection, not the loop variable's own name).
+     *
+     * @param list<Token> $tokens
+     * @param array<string,list<string>> $arrayLiteralVars
+     * @return array{string, list<string>}|null [loop variable name, its enumerated literal values]
+     */
+    private function parseForeachLiteralArrayLoop(array $tokens, int $i, array $arrayLiteralVars): ?array
+    {
+        $j = $this->skipInsignificant($tokens, $i + 1);
+        if (!isset($tokens[$j]) || $tokens[$j] !== '(') {
+            return null;
+        }
+        $j = $this->skipInsignificant($tokens, $j + 1);
+        if (!isset($tokens[$j]) || !is_array($tokens[$j]) || $tokens[$j][0] !== T_VARIABLE) {
+            return null;
+        }
+        $values = $arrayLiteralVars[$tokens[$j][1]] ?? null;
+        if ($values === null) {
+            return null;
+        }
+
+        $j = $this->skipInsignificant($tokens, $j + 1);
+        if (!isset($tokens[$j]) || !is_array($tokens[$j]) || $tokens[$j][0] !== T_AS) {
+            return null;
+        }
+        $j = $this->skipInsignificant($tokens, $j + 1);
+        if (!isset($tokens[$j]) || !is_array($tokens[$j]) || $tokens[$j][0] !== T_VARIABLE) {
+            return null; // by-reference (&$var) or key=>value form — not attempted
+        }
+        $loopVarName = $tokens[$j][1];
+
+        $j = $this->skipInsignificant($tokens, $j + 1);
+        if (!isset($tokens[$j]) || $tokens[$j] !== ')') {
+            return null; // "as $k => $v" or anything else after the loop variable
+        }
+
+        return [$loopVarName, $values];
+    }
+
+    /**
+     * The single write path for $varLiteralAssignmentsStack, used by every population site
+     * (plain `$var = 'literal';`, a ternary's two branches, a sibling equality-comparison) —
+     * routing every append through one textual `[]=` site, rather than each caller appending
+     * inline, is what lets PHPStan keep proving the accumulated value stays a `list<string>`;
+     * multiple independent inline `[]=` sites against the same nested array confused that
+     * inference even though each one is individually the same shape.
+     *
+     * @param list<array<string,list<string>>> $varLiteralAssignmentsStack
+     */
+    private function accumulateVarLiteral(array &$varLiteralAssignmentsStack, int $scopeTop, string $varName, string $literal): void
+    {
+        $varLiteralAssignmentsStack[$scopeTop][$varName][] = $literal;
     }
 
     /**
@@ -3234,6 +3924,64 @@ final class PhpTokenParser
     }
 
     /**
+     * $i points at T_RETURN. Recognizes the narrow shape `return <anything> . $param .
+     * 'suffix';` — the trailing `. $param . 'literal-suffix'` immediately before the statement's
+     * own terminating `;`, with everything before that pair left completely unresolved/ignored,
+     * the same "keep only the segment directly adjacent to the tracked value" stance
+     * resolveInterpolatedLoopSuffixPath already takes for interpolated strings, just for plain
+     * concatenation instead. Real-world shape (wp-nested-pages' Helpers::view()): `return
+     * dirname(__FILE__) . '/Views/' . $file . '.php';` — the unresolvable `dirname(__FILE__)`
+     * prefix is never looked at; only the "$file . '.php'" tail matters, since FileAnalyzer's own
+     * referenced-index matches by basename anyway. Doesn't verify the variable is actually the
+     * function's own declared parameter (a small "coarse net" concession, same trade-off the
+     * rest of this parser makes elsewhere) — a small helper's own return statement is virtually
+     * always built from its own parameter in real code. Returns null for any other shape — no
+     * trailing literal, no variable directly before it, or the terminating `;` can't be found (an
+     * unbalanced/malformed statement).
+     *
+     * @param list<Token> $tokens
+     */
+    private function resolveReturnParamSuffixTemplate(array $tokens, int $i): ?string
+    {
+        $depth = 0;
+        $j = $i + 1;
+        $semicolonIndex = null;
+        while (isset($tokens[$j])) {
+            $t = $tokens[$j];
+            if ($t === '(' || $t === '[' || $t === '{') {
+                $depth++;
+            } elseif ($t === ')' || $t === ']' || $t === '}') {
+                if ($depth === 0) {
+                    return null; // unbalanced — bail rather than guess
+                }
+                $depth--;
+            } elseif ($depth === 0 && $t === ';') {
+                $semicolonIndex = $j;
+                break;
+            }
+            $j++;
+        }
+        if ($semicolonIndex === null) {
+            return null;
+        }
+
+        $suffixIndex = $this->peekPrevMeaningfulIndex($tokens, $semicolonIndex);
+        if ($suffixIndex === null || !is_array($tokens[$suffixIndex]) || $tokens[$suffixIndex][0] !== T_CONSTANT_ENCAPSED_STRING) {
+            return null;
+        }
+        $dotIndex = $this->peekPrevMeaningfulIndex($tokens, $suffixIndex);
+        if ($dotIndex === null || $tokens[$dotIndex] !== '.') {
+            return null;
+        }
+        $varIndex = $this->peekPrevMeaningfulIndex($tokens, $dotIndex);
+        if ($varIndex === null || !is_array($tokens[$varIndex]) || $tokens[$varIndex][0] !== T_VARIABLE) {
+            return null;
+        }
+
+        return $this->stripQuotes($tokens[$suffixIndex][1]);
+    }
+
+    /**
      * $equalsIndex points at the `=` of `$var = 'literal';`. Returns the literal only when the
      * entire RHS is that one string token — nothing else, no concatenation — bailing (null)
      * otherwise; a concatenated/dynamic RHS carries no single resolvable literal worth
@@ -3255,6 +4003,52 @@ final class PhpTokenParser
         }
 
         return $literal;
+    }
+
+    /**
+     * $equalsIndex points at the `=` of `$var = ( <cond> ) ? 'lit1' : 'lit2';`. Requires the
+     * condition to be wrapped in explicit parens (matching the one real-world shape this has
+     * evidence for — wp-nested-pages' `( $this->post->type !== 'np-redirect' ) ? 'partials/row' :
+     * 'partials/row-link'`) rather than trying to find the ternary's top-level `?` in an
+     * unparenthesized condition, which would need real operator-precedence handling to do safely.
+     * Bails (null) for anything else — a non-literal branch, a nested ternary, no parens.
+     *
+     * @param list<Token> $tokens
+     * @return array{string, string}|null [true-branch literal, false-branch literal]
+     */
+    private function parseTernaryLiteralDomain(array $tokens, int $equalsIndex): ?array
+    {
+        $j = $this->skipInsignificant($tokens, $equalsIndex + 1);
+        if (!isset($tokens[$j]) || $tokens[$j] !== '(') {
+            return null;
+        }
+        $closeParenIndex = $this->findMatchingCloseParen($tokens, $j);
+        if ($closeParenIndex === null) {
+            return null;
+        }
+
+        $questionIndex = $this->skipInsignificant($tokens, $closeParenIndex + 1);
+        if (!isset($tokens[$questionIndex]) || $tokens[$questionIndex] !== '?') {
+            return null;
+        }
+        $trueIndex = $this->skipInsignificant($tokens, $questionIndex + 1);
+        if (!isset($tokens[$trueIndex]) || !is_array($tokens[$trueIndex]) || $tokens[$trueIndex][0] !== T_CONSTANT_ENCAPSED_STRING) {
+            return null;
+        }
+        $colonIndex = $this->skipInsignificant($tokens, $trueIndex + 1);
+        if (!isset($tokens[$colonIndex]) || $tokens[$colonIndex] !== ':') {
+            return null;
+        }
+        $falseIndex = $this->skipInsignificant($tokens, $colonIndex + 1);
+        if (!isset($tokens[$falseIndex]) || !is_array($tokens[$falseIndex]) || $tokens[$falseIndex][0] !== T_CONSTANT_ENCAPSED_STRING) {
+            return null;
+        }
+        $afterIndex = $this->skipInsignificant($tokens, $falseIndex + 1);
+        if (!isset($tokens[$afterIndex]) || $tokens[$afterIndex] !== ';') {
+            return null;
+        }
+
+        return [$this->stripQuotes($tokens[$trueIndex][1]), $this->stripQuotes($tokens[$falseIndex][1])];
     }
 
     /**
@@ -3290,18 +4084,43 @@ final class PhpTokenParser
     }
 
     /**
-     * $equalsIndex points at the `=` of `$var = array(...)` / `$var = [...]`. Returns the
-     * elements in order when every one is a plain string literal (no keys, no concatenation, no
-     * nested arrays/calls/variables) — bailing (null) the moment anything else appears, same
-     * "bail rather than guess" stance parseUseImports takes on group-use syntax. Also bails (to
-     * avoid matching an unrelated short-string/single-word array by coincidence) unless there are
-     * at least two elements and at least one contains a "/" — the two `str_contains` calls a
-     * genuine bulk-include path list will always pass and an arbitrary config array often won't.
+     * $equalsIndex points at the `=` of `$var = array(...)` / `$var = [...]`. Same shape as
+     * parseAnyStringLiteralArray just below, plus one extra gate to avoid matching an unrelated
+     * short-string/single-word array by coincidence: at least one element must contain a "/" —
+     * something a genuine bulk-include path list will always have and an arbitrary config array
+     * often won't. Feeds the file-path-specific consumers ($phpPathStrings); a plain array of
+     * non-path string literals (dispatched some other way) is invisible here by design — see
+     * parseAnyStringLiteralArray for that case.
      *
      * @param list<Token> $tokens
      * @return list<string>|null
      */
     private function parseStringLiteralArray(array $tokens, int $equalsIndex): ?array
+    {
+        $values = $this->parseAnyStringLiteralArray($tokens, $equalsIndex);
+        if ($values === null) {
+            return null;
+        }
+        foreach ($values as $v) {
+            if (str_contains($v, '/')) {
+                return $values;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * $equalsIndex points at the `=` of `$var = array(...)` / `$var = [...]`. Returns the
+     * elements in order when every one is a plain string literal (no keys, no concatenation, no
+     * nested arrays/calls/variables) — bailing (null) the moment anything else appears, same
+     * "bail rather than guess" stance parseUseImports takes on group-use syntax. Also bails
+     * unless there are at least two elements, to avoid matching an unrelated single-element array
+     * by coincidence.
+     *
+     * @param list<Token> $tokens
+     * @return list<string>|null
+     */
+    private function parseAnyStringLiteralArray(array $tokens, int $equalsIndex): ?array
     {
         $j = $this->skipInsignificant($tokens, $equalsIndex + 1);
         if (!isset($tokens[$j])) {
@@ -3332,15 +4151,7 @@ final class PhpTokenParser
             $t = $tokens[$j];
 
             if ($t === $close) {
-                if (count($values) < 2) {
-                    return null;
-                }
-                foreach ($values as $v) {
-                    if (str_contains($v, '/')) {
-                        return $values;
-                    }
-                }
-                return null;
+                return count($values) < 2 ? null : $values;
             }
 
             if (!$expectingValue) {
@@ -3568,6 +4379,58 @@ final class PhpTokenParser
     }
 
     /**
+     * `$var = ClassName::cls()` / `::instance()` / `::getInstance()` / `::get_instance()` — a
+     * common WP-plugin static-singleton-factory convention: the factory method (declared once on
+     * a shared base class) uses late static binding (`new static()`/`get_called_class()`), so
+     * calling it on a specific subclass always returns an instance of that subclass, regardless
+     * of the factory method's own declared or inferred return type — the same reasoning
+     * `PendingReturnTypedCall` can't apply here since these methods typically have no declared
+     * return type to resolve against. Curated method-name list, same spirit as
+     * TEMPLATE_FUNCS/BASE_CLASS_CONTRACT_METHODS — a real, reusable convention, not a
+     * plugin-specific hack. Confirmed in the wild: LiteSpeed Cache's `Base::cls()`
+     * (`get_called_class()`-based, e.g. `$this->cloud = Cloud::cls();`) and Jetpack's
+     * `WPCOM_JSON_API_Links::getInstance()`.
+     *
+     * @param list<Token> $tokens
+     * @param list<?string> $classNameStack
+     * @param list<?string> $classParentStack
+     * @param array<string,string> $useImports
+     */
+    private function assignedStaticFactoryClassName(array $tokens, int $equalsIndex, array $classNameStack, array $classParentStack, string $currentNamespace, array $useImports): ?string
+    {
+        $nameIndex = $this->peekNextMeaningfulIndex($tokens, $equalsIndex);
+        if ($nameIndex === null || !is_array($tokens[$nameIndex])) {
+            return null;
+        }
+        $nameToken = $tokens[$nameIndex];
+        if (!in_array($nameToken[0], self::CLASS_NAME_TOKENS, true) && $nameToken[0] !== T_STATIC) {
+            return null;
+        }
+
+        $doubleColonIndex = $this->peekNextMeaningfulIndex($tokens, $nameIndex);
+        if ($doubleColonIndex === null || $this->peekNextMeaningful($tokens, $nameIndex) !== '::') {
+            return null;
+        }
+
+        $methodIndex = $this->peekNextMeaningfulIndex($tokens, $doubleColonIndex);
+        if (
+            $methodIndex === null || !is_array($tokens[$methodIndex]) || $tokens[$methodIndex][0] !== T_STRING
+            || !in_array($tokens[$methodIndex][1], self::STATIC_FACTORY_METHOD_NAMES, true)
+        ) {
+            return null;
+        }
+
+        $openParenIndex = $this->peekNextMeaningfulIndex($tokens, $methodIndex);
+        if ($openParenIndex === null || $tokens[$openParenIndex] !== '(') {
+            return null;
+        }
+
+        $name = $nameToken[0] === T_STATIC ? 'static' : $nameToken[1];
+
+        return $this->resolveClassNameToken($name, $classNameStack, $classParentStack, $currentNamespace, $useImports);
+    }
+
+    /**
      * `( new ClassName(...) )->method(...)` — the inline, parenthesized-`new` counterpart to
      * `$var = new ClassName(); $var->method();` (assignedNewClassName above). Requires `new` to
      * be immediately preceded by `(` — the wrapping group PHP has required for this exact
@@ -3665,9 +4528,12 @@ final class PhpTokenParser
      * `array($this, 'footer_html_' . $i)` — and then one optional trailing comma) is a closing
      * `]`/`)`. Doesn't verify $i is inside an array at all (callers already know that from their
      * own backward walk); only rules out "there's at least one more element after this one."
-     * Same "single segment per `.`" assumption resolveForLoopConcatenatedLiteral's own suffix
-     * handling already makes — a concatenation chain with something more complex than a bare
-     * value token per segment (a nested function call, say) isn't unwound here either.
+     * A concatenated segment is usually a single value token (a bare variable, a literal), but a
+     * single-call-expression segment (`substr($var, N)` — real-world shape: WooCommerce's
+     * breadcrumb dispatch) is also unwound, by skipping to its matching close paren instead of
+     * just one token, so the walk doesn't mistake the call's own opening paren for the whole
+     * array's closing one; anything more complex than that (a nested function call as an
+     * argument, a chained call) still isn't attempted.
      *
      * @param list<Token> $tokens
      */
@@ -3678,6 +4544,15 @@ final class PhpTokenParser
             $j = $this->peekNextMeaningfulIndex($tokens, $j); // the concatenated segment itself
             if ($j === null) {
                 return false;
+            }
+            $afterSegmentStart = $this->peekNextMeaningfulIndex($tokens, $j);
+            if ($afterSegmentStart !== null && is_array($tokens[$j]) && $tokens[$j][0] === T_STRING && $tokens[$afterSegmentStart] === '(') {
+                $closeParenIndex = $this->findMatchingCloseParen($tokens, $afterSegmentStart);
+                if ($closeParenIndex === null) {
+                    return false;
+                }
+                $j = $this->peekNextMeaningfulIndex($tokens, $closeParenIndex); // token right after the call
+                continue;
             }
             $j = $this->peekNextMeaningfulIndex($tokens, $j); // token right after that segment
         }

@@ -636,6 +636,34 @@ class My_Widget extends WP_Widget {
         self::assertContains('truly_unused', $unusedMethods);
     }
 
+    public function testExcludesWpListTableContractMethods(): void
+    {
+        // Real-world finding from Contact Form 7's WPCF7_Contact_Form_List_Table: WP core's own
+        // list-table rendering/AJAX pipeline calls get_sortable_columns()/get_bulk_actions()/
+        // column_default()/column_cb() by name convention on any WP_List_Table subclass — never
+        // by a visible name reference in project code.
+        $file = $this->write('<?php
+class My_List_Table extends WP_List_Table {
+    public function get_columns() { return []; }
+    public function get_sortable_columns() { return []; }
+    public function get_bulk_actions() { return []; }
+    public function column_default($item, $column_name) {}
+    public function column_cb($item) {}
+    public function prepare_items() {}
+    public function truly_unused() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('get_columns', $unusedMethods);
+        self::assertNotContains('get_sortable_columns', $unusedMethods);
+        self::assertNotContains('get_bulk_actions', $unusedMethods);
+        self::assertNotContains('column_default', $unusedMethods);
+        self::assertNotContains('column_cb', $unusedMethods);
+        self::assertNotContains('prepare_items', $unusedMethods);
+        self::assertContains('truly_unused', $unusedMethods);
+    }
+
     public function testExcludesWalkerNavMenuContractMethodsThroughCoreSubclass(): void
     {
         // WP core dispatches start_lvl/end_lvl/start_el/end_el by calling them on the object
@@ -1192,6 +1220,70 @@ class My_Controller {
         $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
         $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
         self::assertNotContains('render', $unusedMethods);
+        self::assertContains('truly_unused', $unusedMethods);
+    }
+
+    public function testCreditsSelfDispatchTargetMethodFromScatteredLiteralArgumentCallSites(): void
+    {
+        // Real-world shape (Sydney theme): `get_section($section) { call_user_func([$this,
+        // "{$section}_section"]); }`, called from several scattered call sites each with a
+        // literal argument (`$this->get_section('colors')`, `('buttons')`, ...) — every real
+        // target method (colors_section, buttons_section, ...) is only visible once the
+        // dispatcher's own suffix template is resolved against each call site's literal.
+        $file = $this->write('<?php
+class Style_Book {
+    public function get_section( $section ) {
+        call_user_func( array( $this, "{$section}_section" ) );
+    }
+    public function colors_section() {}
+    public function buttons_section() {}
+    public function truly_unused() {}
+    public function render() {
+        $this->get_section( "colors" );
+        $this->get_section( "buttons" );
+    }
+}
+(new Style_Book())->render();
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('colors_section', $unusedMethods);
+        self::assertNotContains('buttons_section', $unusedMethods);
+        self::assertContains('truly_unused', $unusedMethods);
+    }
+
+    public function testCreditsPrefixVarSuffixSelfDispatchTargetFromDescendantsOwnArrayKeyLiterals(): void
+    {
+        // Real-world shape (WooCommerce): the dispatcher (render_columns()) is declared once on
+        // an abstract base class, but the array-key literals establishing the column domain — and
+        // the concrete render_{$column}_column methods themselves — live on a concrete subclass.
+        // Neither the dispatcher's own template nor the subclass's own array keys alone are
+        // enough; crediting requires correlating the base class's template against every known
+        // descendant's own key pool, not just the base class's own (empty) one.
+        $file = $this->write('<?php
+abstract class WC_Admin_List_Table {
+    public function render_columns( $column, $post_id ) {
+        if ( is_callable( array( $this, "render_" . $column . "_column" ) ) ) {
+            $this->{"render_{$column}_column"}();
+        }
+    }
+}
+class WC_Admin_List_Table_Products extends WC_Admin_List_Table {
+    public function define_columns( $columns ) {
+        $show_columns = array();
+        $show_columns["thumb"] = "Image";
+        $show_columns["name"] = "Name";
+        return $show_columns;
+    }
+    public function render_thumb_column() {}
+    public function render_name_column() {}
+    public function truly_unused() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('render_thumb_column', $unusedMethods);
+        self::assertNotContains('render_name_column', $unusedMethods);
         self::assertContains('truly_unused', $unusedMethods);
     }
 

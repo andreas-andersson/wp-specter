@@ -98,6 +98,41 @@ final class ParseResult
      *                                           $pendingTemplateHelperCalls) resolve to every
      *                                           literal path that function might hand back.
      * @param list<PendingTemplateHelperCall> $pendingTemplateHelperCalls
+     * @param array<string,list<string>> $functionParamSuffixReturns Function/method key
+     *                                           ("Class::method" for a method, bare name for a
+     *                                           top-level function) => every literal suffix a
+     *                                           `return <ignored> . $param . 'suffix';` statement
+     *                                           inside its body resolved to (see
+     *                                           PhpTokenParser::resolveReturnParamSuffixTemplate).
+     *                                           Lets a $pendingParamSuffixCalls entry resolve each
+     *                                           of its argument candidates to a concrete path once
+     *                                           every file's parse is merged.
+     * @param list<PendingParamSuffixCall> $pendingParamSuffixCalls
+     * @param array<string,list<string>> $selfDispatchSuffixes Method key ("Class::method") =>
+     *                                           every literal suffix a `call_user_func([$this,
+     *                                           "{$param}_suffix"])`-shaped self-dispatch inside
+     *                                           its own body resolved to (see
+     *                                           PhpTokenParser::isThisArrayCallbackReceiverAt /
+     *                                           extractTrailingVarSuffix). Lets a
+     *                                           $pendingSelfDispatchCalls entry resolve its
+     *                                           literal argument to the real target method name
+     *                                           once every file's parse is merged.
+     * @param list<PendingSelfDispatchCall> $pendingSelfDispatchCalls
+     * @param array<string,list<array{string,string}>> $selfDispatchPrefixSuffixTemplates Method
+     *                                           key ("Class::method") => every [prefix, suffix]
+     *                                           pair a `array($this, 'prefix' . $param .
+     *                                           'suffix')`-shaped self-dispatch inside its own
+     *                                           body resolved to (see
+     *                                           PhpTokenParser::resolvePrefixVarSuffixSelfDispatchTemplate).
+     *                                           Cross-referenced against $classArrayKeyLiterals
+     *                                           (same owner class) once every file's parse is
+     *                                           merged — there's no literal call-site argument to
+     *                                           pair this with, unlike $pendingSelfDispatchCalls.
+     * @param array<string,list<string>> $classArrayKeyLiterals Owner class => every literal
+     *                                           string array key assigned via
+     *                                           `$anyLocalVar['literal'] = ...;` anywhere in the
+     *                                           class's own methods (see
+     *                                           PhpTokenParser::arrayKeyLiteralAssignment).
      */
     public function __construct(
         public readonly string $file,
@@ -123,6 +158,12 @@ final class ParseResult
         public readonly array $useImports = [],
         public readonly array $functionLiteralReturns = [],
         public readonly array $pendingTemplateHelperCalls = [],
+        public readonly array $functionParamSuffixReturns = [],
+        public readonly array $pendingParamSuffixCalls = [],
+        public readonly array $selfDispatchSuffixes = [],
+        public readonly array $pendingSelfDispatchCalls = [],
+        public readonly array $selfDispatchPrefixSuffixTemplates = [],
+        public readonly array $classArrayKeyLiterals = [],
         public readonly ?string $error = null,
     ) {}
 }

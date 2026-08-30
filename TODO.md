@@ -215,6 +215,34 @@ scope limit that trades recall or precision for staying a single-pass, no-depend
     for the follow-up that fixed it properly, modeling PHP's real fallback-to-global-namespace
     call-resolution rule instead of just reapplying the class-name scheme.
 
+- [x] **`use Foo\Bar as Alias;` import aliasing was resolved for scoped-method-call receivers but
+  not for the plain class-reference tracking that feeds unused-class detection.** Real-world
+  finding (Elementor): `use Some\Namespace\Trigger_Value as TriggerValueValidator; ...
+  TriggerValueValidator::is_valid();` (also confirmed via `new Assets_Loader()` and `extends
+  Aliased_Base` shapes) recorded the *alias* itself as the class reference, which never matched
+  `Trigger_Value`'s (or `Loader`'s/`Base`'s) own declared short name, so the class looked
+  permanently unused despite a real, resolvable reference right there — while the identical
+  method-*call* resolution (`resolveClassNameToken`) already handled the alias correctly, since
+  that path was fixed independently. Reproduced in isolation before touching real code. 5
+  confirmed real instances in Elementor alone (`String_Value`/`Trigger_Value`/`Breakpoints_Value`
+  via `Validator::is_valid()`, `CSS_Renderer` via `new Variables_CSS_Renderer(...)`, `Loader` via
+  `new Assets_Loader()`) — Elementor has 462 aliased `use` statements total, so the real footprint
+  is broader than these 5. Fixed: 3 capture sites recorded the raw alias text instead of the
+  resolved class's real short name —
+  - `PhpTokenParser`'s `T_STRING` `::` branch (`Foo::method()`/`Foo::class`) now resolves through
+    `resolveClassNameToken` before pushing to `$classReferences`.
+  - `captureClassNameAfter()` (the `new`/`instanceof` path) gained `$currentNamespace`/
+    `$useImports` params and now resolves through `resolveFqcn` too.
+  - `ClassRef`'s `$short` field (feeding `extends`/`implements`/trait-`use`/return-type/param-hint
+    references) is now derived from the resolved `$fqcn` instead of the raw token text — a new
+    shared `newClassRefFor()` helper centralizes this for all 4 construction sites, which
+    incidentally also fixes the same alias blind spot for `ClassAnalyzer`'s curated-table
+    (`BASE_CLASS_CONTRACT_METHODS`/interface) matching on an aliased base class, not just
+    `$classReferences`.
+  Verified: Elementor's unused-class count drops 96 → 87, WooCommerce's drops 167 → 142 (aliasing
+  turns out to be common there too, not Elementor-specific), no regressions and no crashes across
+  the full corpus.
+
 ## Method detection
 
 - [x] **Contract-method exemption (`ClassAnalyzer::isContractMethod`) only checks the declaring
@@ -513,6 +541,137 @@ scope limit that trades recall or precision for staying a single-pass, no-depend
     real, non-empty findings summary (previously silent/incomplete only for WooCommerce, since
     it's the only one of the seven whose vendor tree happens to be reachable from an
     extends/implements chain wp-specter's own scan actually walks).
+
+- [x] **`WP_List_Table` was missing from `BASE_CLASS_CONTRACT_METHODS`.** Real-world finding
+  (Contact Form 7): `WPCF7_Contact_Form_List_Table extends WP_List_Table` had
+  `get_sortable_columns()`, `get_bulk_actions()`, `column_default()`, `column_cb()`, and others
+  flagged `UnusedMethod` — all called internally by WP core's own list-table rendering/AJAX
+  pipeline (`display()`/`prepare_items()`/the AJAX response handler), never by a visible name
+  reference in project code. Second corpus instance: Botiga's bundled
+  `ActionScheduler_Abstract_ListTable` also extends it, same shape. Fixed: added
+  `WP_LIST_TABLE_CONTRACT_METHODS` (`get_columns`, `get_sortable_columns`, `get_bulk_actions`,
+  `column_default`, `column_cb`, `prepare_items`, `no_items`, `get_views`, `extra_tablenav`,
+  `display_rows`, `single_row`, `single_row_columns`) to the curated list, same class as the
+  existing `WP_Widget`/`WP_REST_Controller` entries. Verified: Contact Form 7's unused-method
+  count drops 23 → 19, no regressions across the full corpus (no crashes).
+
+- [x] **A property (or local variable) assigned from a static-singleton-factory call —
+  `$this->prop = ClassName::cls()` / `::instance()` / `::getInstance()` / `::get_instance()` —
+  wasn't type-tracked**, unlike `new ClassName()`. Real-world finding (LiteSpeed Cache): every
+  module extends a shared `Base` class whose `cls()` factory method uses late static binding
+  (`get_called_class()`), so `Cloud::cls()` always returns a `Cloud` instance regardless of
+  `cls()`'s own (undeclared) return type — `PendingReturnTypedCall`'s existing return-type
+  resolution doesn't apply since there's no declared type to resolve against. 8 confirmed
+  instances in LiteSpeed Cache alone (`cli/online.cls.php:34`, `database.cls.php:42`,
+  `object-cache-wp.cls.php:148`, `debug.cls.php:34`, `presets.cls.php:34`, `image.cls.php:36`,
+  `avatar.cls.php:58`), plus one in Jetpack (`class.json-api-endpoints.php:436`,
+  `WPCOM_JSON_API_Links::getInstance()`). Fixed: `assignedStaticFactoryClassName()`
+  (`PhpTokenParser`) recognizes `ClassName::factoryMethod()` where `factoryMethod` is one of a
+  curated `STATIC_FACTORY_METHOD_NAMES` list (`cls`, `instance`, `getInstance`, `get_instance` —
+  same spirit as `TEMPLATE_FUNCS`/`BASE_CLASS_CONTRACT_METHODS`, a real reusable convention, not
+  plugin-specific) and resolves it to the receiver class name directly; wired in as a fallback
+  alongside `assignedNewClassName()` for both property assignment and local-variable tracking.
+  Verified: LiteSpeed Cache's unused-method count drops 54 → 49, Jetpack's drops 321 → 314, no
+  regressions across the full corpus (no crashes).
+
+- [x] **A dynamic array-callback method name built from `'prefix_' . <expr>` inside a `foreach`
+  over a tracked literal-string array wasn't resolved**, unlike the existing bounded-`for`-loop
+  enumeration — and even a bare loop variable in this shape had its receiver-class detection
+  break the moment the concatenated expression was a function call rather than a single token.
+  Real-world finding (WooCommerce, `includes/class-wc-breadcrumb.php:79-81`):
+  ```php
+  foreach ( $conditionals as $conditional ) {   // literal array: 'is_home', 'is_404', ...
+      if ( call_user_func( $conditional ) ) {
+          call_user_func( array( $this, 'add_crumbs_' . substr( $conditional, 3 ) ) );
+          break;
+      }
+  }
+  ```
+  13 confirmed unused-method false positives (`add_crumbs_home`, `add_crumbs_404`,
+  `add_crumbs_attachment`, ...). Two independent gaps here, both fixed:
+  - No mechanism tracked a `foreach`-over-literal-array loop variable's enumerated values at all
+    for callback-name construction (only a bounded `for` loop's integer range fed
+    `resolveForLoopConcatenatedLiteral`) — fixed with a string-valued sibling stack
+    (`$foreachLoopVarNameStack`/`$foreachLoopVarValuesStack`, populated by the new
+    `parseForeachLiteralArrayLoop()`) and a matching `resolveForeachConcatenatedLiteral()`, which
+    also recognizes one additional shape the `for`-loop case has no evidence for: `.
+    substr($loopVar, N)` with N a fixed literal offset — the one transform with confirmed
+    real-world use. `$anyArrayLiteralVars` (via new `parseAnyStringLiteralArray()`) tracks a
+    literal array regardless of whether any element contains a `/`, since the existing
+    `$arrayLiteralVars`/`parseStringLiteralArray()` deliberately gates on that as a
+    path-list-vs-arbitrary-array signal — kept as a separate pool rather than relaxing that gate.
+  - Independently, `isLastArrayElementAt()` — which confirms a concatenated literal is genuinely
+    the callback array's last element before trusting its receiver — only knew how to skip a
+    single-token concatenated segment (a bare `$var` or literal) per `.`, so `.
+    substr($conditional, 3)` (a multi-token call expression) made it stop one token early at
+    `substr`'s own opening paren and misread it as "not the array's last element," silently
+    falling back to the unscoped `$functionCalls` pool even after the enumeration above correctly
+    produced the real method names. Fixed by skipping to the matching close paren for a
+    call-shaped segment instead of just one token.
+  Verified: WooCommerce's unused-method count drops (contributing to the combined 945 → 914 drop
+  alongside the alias fix above), no regressions and no crashes across the full corpus.
+
+- [x] **A same-class self-dispatch method — `call_user_func([$this, "{$param}_suffix"])` inside a
+  dispatcher, called from multiple scattered call sites each with a literal argument — left every
+  real target method invisible.** Real-world finding (Sydney theme,
+  `inc/customizer/style-book/class-sydney-style-book.php`): `get_section($section) { if (
+  method_exists( $this, "{$section}_section" ) ) { call_user_func( array( $this,
+  "{$section}_section" ) ); } }`, called 8 times with literal strings — `$this->get_section(
+  'colors' )`, `('buttons')`, `('typography')`, `('media')`, `('forms')`, `('lists')`,
+  `('tables')`, `('quotes')`. All 8 real target methods (`colors_section`, `buttons_section`,
+  etc.) were flagged `UnusedMethod`. Different collection shape from the loop-bounded
+  mechanisms above — the literal values come from **discrete call sites scattered through the
+  file** (or project), not a bounded loop's own known range. Fixed, two cooperating pieces:
+  - `collectInterpolatedStringSegments()` extracted as the shared segment-walker
+    `resolveInterpolatedLoopSuffixPath` already had inline, now reused by a new
+    `isThisArrayCallbackReceiverAt()` (confirms an interpolated string is the second element of
+    a `[$this, "..."]`/`array($this, "...")` array-callback) and `extractTrailingVarSuffix()`
+    (the literal text trailing the last embedded variable, discarding everything before it).
+    Together they recognize a method's own self-dispatch shape and record its suffix (`"_section"`
+    here) keyed by `Class::method`, merged across files into `$selfDispatchSuffixes` the same way
+    `$functionParamSuffixReturns` already is.
+  - `PendingSelfDispatchCall` (new, mirrors `PendingDirectoryLoaderCall`'s shape) records every
+    `$this->method('literal')` scoped call's literal first argument against its receiver/method,
+    resolved in `ClassAnalyzer::findUnusedMethods()` once every file's parse is merged: each
+    collected literal gets the dispatcher's own suffix appended and credited on `$scopedCalled`
+    directly, so every existing exemption/matching mechanism applies to it for free.
+  Verified: Sydney's unused-method count drops 26 → 18 (all 8 targeted findings gone), no
+  regressions and no crashes across the full corpus.
+
+- [x] **A `array($this, 'prefix' . $param . 'suffix')`-shaped self-dispatch, whose column/target
+  domain comes from literal array-key assignments scattered through a *different* method (and
+  often a *different* class in the inheritance chain) than the dispatcher itself — a genuinely
+  different collection shape from the call-site-literal-argument case just above.** Real-world
+  finding (WooCommerce): `render_columns( $column, $post_id ) { if ( is_callable( array( $this,
+  'render_' . $column . '_column' ) ) ) { $this->{"render_{$column}_column"}(); } }`
+  (`includes/admin/list-tables/abstract-class-wc-admin-list-table.php:264`, declared once on the
+  abstract `WC_Admin_List_Table` base) and the equivalent `render_column()`/`call_user_func(...)`
+  form (`src/Internal/Admin/Orders/ListTable.php:175`). The column domain isn't a call-site
+  literal or a bounded loop at all — it's established by `$show_columns['thumb'] = ...;`-style
+  assignments to a plain local variable inside `define_columns()`, a *different* method, declared
+  on a *different* (concrete subclass) class than the dispatcher. 25 confirmed instances across 2
+  files/dispatchers. Fixed, three cooperating pieces:
+  - `resolvePrefixVarSuffixSelfDispatchTemplate()` — the plain-concatenation counterpart to the
+    Sydney fix's interpolated-string shape, sharing its backward `$this`-receiver check via a new
+    `isPrecededByThisArrayCallbackComma()` — recognizes `array($this, 'prefix' . $param .
+    'suffix')` and records `[prefix, suffix]` against the dispatcher's own `Class::method` key
+    (`$selfDispatchPrefixSuffixTemplates`, merged across files).
+  - `arrayKeyLiteralAssignment()` recognizes `$anyVar['literal'] = ...;` for *any* variable name
+    (not scoped to one method or property) and accumulates every literal key seen anywhere in a
+    class's own methods into `$classArrayKeyLiterals[ownerClass]` — deliberately class-wide
+    rather than call-site-driven, since there's no call site here at all (WP core's own list-table
+    rendering loop invokes the dispatcher at runtime with a real column ID, invisible to this
+    codebase).
+  - Resolution in `ClassAnalyzer::findUnusedMethods()` cross-products each dispatcher template
+    against its owner class's key pool — but the column keys and the dispatcher template turned
+    out to live on *different* classes in the real case (base class dispatcher, subclass keys),
+    so the cross-product also walks every known descendant via the already-built `$descendantsOf`
+    map and credits `{prefix}{key}{suffix}` on whichever descendant the keys actually came from,
+    not just the dispatcher's own declaring class.
+  Verified: WooCommerce's unused-method count drops 914 → 890 (24 of the 25 confirmed instances
+  gone — the 25th, `render_usage_limit_column`, turned out to be genuine dead code on closer
+  inspection: the real column key is `usage`, not `usage_limit`, an orphaned method from an
+  apparent rename, not a tool gap), no regressions and no crashes across the full corpus.
 
 ## Reporting
 
@@ -1209,6 +1368,50 @@ not shipped bugs.
   Confirms the original scope call above rather than superseding it: reverted back to the
   directory-scoped blanket exemption.
 
+- [x] **A scoped call's sole argument reaching `include`/`require` (via a callee that builds its
+  return path from its own parameter) was only resolved when that argument was a literal
+  directly — a local variable whose own possible values were knowable from context (a ternary's
+  two branches, or sibling equality-comparisons against it) wasn't.** Real-world finding
+  (wp-nested-pages), two independent shapes in one plugin:
+  - `app/Entities/Listing/Listing.php:451,474`: `$row_view = ( $this->post->type !==
+    'np-redirect' ) ? 'partials/row' : 'partials/row-link'; ... include( Helpers::view($row_view)
+    );` — `$row_view`'s domain comes from a ternary assignment.
+  - `app/Views/settings/settings.php:20`: `if ( $tab == 'general' ) ...; if ( $tab == 'posttypes'
+    ) ...; include(NestedPages\Helpers::view('settings/settings-' . $tab));` — `$tab`'s domain
+    comes from being tested against literals in sibling `if` conditions, not from assignment.
+
+  Both route through `Helpers::view($file) { return dirname(__FILE__) . '/Views/' . $file .
+  '.php'; }` — a scoped method (not the bare-top-level-function-only shape
+  `$functionLiteralReturns`/`$pendingTemplateHelperCalls` already handled), so `partials/row.php`,
+  `partials/row-link.php`, `settings-general.php`, `settings-posttypes.php`, and
+  `settings-admincustom.php` were all flagged `UnusedFile`. Fixed, three cooperating pieces:
+  - `PhpTokenParser::accumulateVarLiteral()` is now the single write path for
+    `$varLiteralAssignmentsStack` (previously only fed by a plain `$var = 'literal';`) — routing
+    every append through one textual call site turned out to be load-bearing for PHPStan's own
+    `list<string>` inference, not just a style choice: multiple independent inline `[]=` append
+    sites against the same nested array broke that inference even though each site was
+    individually the same proven-safe shape.
+  - Two new population sites feed it: `parseTernaryLiteralDomain()` (`$var = ( <cond> ) ?
+    'lit1' : 'lit2';`, condition required to be parenthesized — the one real-world shape, not
+    general operator-precedence handling) and a new `T_IS_EQUAL`/`T_IS_IDENTICAL` check
+    (`$var == 'literal'` anywhere, order-sensitive — no evidence yet for the reversed `'literal'
+    == $var`). Deliberately doesn't distinguish "ever assigned" from "ever tested against" when
+    guessing a variable's possible values — same coarse-net spirit as the rest of this parser.
+  - `resolveReturnParamSuffixTemplate()` recognizes a callee's own `return <ignored> . $param .
+    'suffix';` shape (doesn't verify the variable is actually the declared parameter — a small
+    concession, since a small helper's return is virtually always built from its own parameter in
+    real code) — keyed by `functionDefIndexForBodyStack` rather than the bare-function-only
+    `$functionNameStack`, so it covers methods too. Merged across files into
+    `$functionParamSuffixReturns` the same way `$functionLiteralReturns` already is.
+    `PendingParamSuffixCall` (new, mirrors `PendingTemplateHelperCall`) records a scoped call's
+    resolved argument candidates (bare tracked variable, or `'literal' . $var`) against its
+    receiver/method, resolved once every file's parse is merged, in both the bare-`T_STRING` and
+    the namespaced/fully-qualified (`T_NAME_QUALIFIED`/`T_NAME_FULLY_QUALIFIED`) scoped-call
+    branches — wp-nested-pages' own `NestedPages\Helpers::view(...)` call site is namespace-
+    qualified, so only wiring the bare-name branch would have missed half the evidence.
+  Verified: wp-nested-pages' unused-file count drops 30 → 25 (all 5 targeted findings gone), no
+  regressions and no crashes across the full corpus.
+
 # Function, Hook & Template Detection — Open Issues
 
 Known gaps in `FunctionAnalyzer`, `HookAnalyzer`, and `TemplateAnalyzer` — the `functions`,
@@ -1637,24 +1840,109 @@ either back up; don't re-discover the same evidence from scratch.
   suggest it recurs, but not yet enough evidence (or a low-risk enough design) to justify the
   effort over the many bounded, low-risk fixes this session found instead.
 
-- [ ] **A dynamic-dispatch pattern — `call_user_func(array($this, "{$param}_suffix"))` inside a
-  dispatcher method, called from multiple call sites each with a literal argument — leaves every
-  real target method invisible.** Real-world finding (Sydney theme,
-  `inc/customizer/style-book/class-sydney-style-book.php`): `get_section($section)` (line 298)
-  does `call_user_func(array($this, "{$section}_section"))`; called 8 times with literal strings
-  at lines 138-145 — `$this->get_section('colors')`, `('buttons')`, `('typography')`, `('media')`,
-  `('forms')`, `('lists')`, `('tables')`, `('quotes')`. All 8 real target methods
-  (`colors_section`, `buttons_section`, etc.) are flagged `UnusedMethod`.
+- [ ] **A literal reaching a recognized sink (`TEMPLATE_FUNCS`, an `include`, a dynamic function
+  call) two or more function-call hops away isn't resolved — only a direct literal argument at
+  the sink itself is.** Real-world finding (wpforms-lite): `wpforms_render('admin/challenge/
+  embed', [...])` (`src/Admin/Challenge.php:625`) → body is `return Templates::get_html(...)` →
+  `Templates::include_html()` → `Templates::locate()` builds the path → `require $located` /
+  `load_template()`. The literal first arg is right there at the outermost call, but two
+  function-call hops removed from the actual `TEMPLATE_FUNCS` sink — accounts for a large chunk
+  of wpforms-lite's 118 `UnusedTemplate` findings (`admin/challenge/embed.php`,
+  `admin/challenge/modal.php`, `admin/challenge/welcome.php`, `admin/components/chart.php`, all
+  confirmed live via `wpforms_render()`). Same family as the WooCommerce hook-name-through-a-
+  wrapper-parameter item above — confirms the pattern also applies to file/template sinks, not
+  just hooks/methods. If a shared interprocedural-constant-propagation mechanism ever gets built
+  for those, design it to cover include/template sinks too, not just hook-firing and method-
+  dispatch calls.
 
-  Conceptually close to the bounded-for-loop enumeration fixed earlier this session
-  (`resolveForLoopConcatenatedLiteral`/`resolveInterpolatedLoopSuffixPath`) — same "enumerate a
-  dynamic segment's concrete values instead of leaving it unresolved" idea — but the literal
-  values come from **discrete call sites scattered through the file**, not a bounded loop's own
-  known range, which is a different (and less contained) collection problem: recognize the
-  `call_user_func(array($this, "{$param}_suffix"))` shape inside a method body, then collect
-  every literal argument that method is ever called with anywhere in the file (or project) to
-  enumerate real target method names. Only one confirmed instance (no second theme/plugin in the
-  corpus shows the same shape yet) — real and would generalize correctly if built, but thinner
-  evidence than this session's other fixes and a more open-ended "search everywhere for call
-  sites" implementation shape than the loop-bounded case that motivated the similar-looking
-  mechanism above.
+  Related, same file, but turns out to be a *fourth*, deeper shape on investigation (re-read this
+  before attempting it — see the Group 2 gap-hunt session that also fixed the Sydney/WooCommerce
+  dispatch items above): `includes/admin/settings-api.php:22`, `$callback = 'wpforms_settings_' .
+  $args['type'] . '_callback'; ... $callback( $args );` — a dynamic BARE FUNCTION name built from
+  a prefix/suffix around `$args['type']`, called via a local variable holding the built name
+  (`$callback($args)`, a variable-as-function call). The literal `'type' => 'checkbox'`-style
+  values aren't passed directly to a call anywhere — they're buried as entries inside a giant
+  static nested config array (`includes/admin/class-settings.php`'s `$settings` return array,
+  hundreds of lines), which some other code later iterates and passes per-field to
+  `wpforms_settings_output_field()`. Neither a scattered-call-site-literal-collection shape (like
+  Sydney's, fixed) nor a scattered-array-key-assignment shape (like WooCommerce's, fixed) — it's
+  "extract a specific key's literal value from deeply-nested array-literal entries scattered
+  through one big static config array," a distinct and less contained collection problem. Thinner
+  tractability than the other three items in this family; not attempted when Sydney/WooCommerce
+  were fixed.
+
+- [ ] **A scoped call's literal argument reaches an `include`/`require` only after the callee's
+  own body wraps the parameter in a transform function (`basename($param)`) before concatenating
+  a fixed prefix/suffix around it — the existing bulk-directory-loader mechanism
+  (`PendingDirectoryLoaderCall`) is the wrong shape for this and can't be patched into fitting.**
+  Real-world finding (Akismet): `Akismet::view($name)` (`class.akismet.php:2078-2088`) does
+  `$file = AKISMET__PLUGIN_DIR . 'views/' . basename( $name ) . '.php'; ... include $file;`,
+  called throughout as `Akismet::view('activate')`, `Akismet::view('notice', ...)`, etc. — a
+  textbook scoped-call-with-literal-first-arg-reaching-an-include, except **100% of Akismet's 14
+  `UnusedFile` findings** (`activate.php`, `notice.php`, `start.php`, ... every file under
+  `views/`) are still flagged. Root cause isn't really the `basename()` wrapper specifically —
+  even without it, `PendingDirectoryLoaderCall` treats the literal argument (`'activate'`) as a
+  *directory name* to exempt wholesale (the shape that fits `Foo::bulkLoad('inc')`: exempt the
+  whole `inc/` tree), not as a filename to resolve to one specific file via a prefix/suffix
+  template the callee's body reveals. A real fix means extracting the callee's own path-template
+  shape (fixed prefix + parameter + fixed suffix, tolerant of a small curated set of safe
+  wrapper transforms like `basename()`) once per method, then applying it to every caller's
+  literal argument to resolve one specific file — genuinely new interprocedural
+  constant-propagation capability, not a bulk-directory tweak. Same family as the two-hop
+  wrapper-to-`include`/template-sink items above (WooCommerce hook-wrapper, Sydney dispatch,
+  wpforms two-hop, Blocksy two-hop below) — if a shared mechanism ever gets built for that family,
+  this is the "single specific file via a parameter-derived filename" variant of it, distinct from
+  the "whole subtree via a directory-name argument" case `PendingDirectoryLoaderCall` already
+  handles.
+
+- [ ] **WooCommerce's PayPal IPN handler dispatches via `payment_status_{$posted['payment_status']}`**
+  (`class-wc-gateway-paypal-ipn-handler.php:76`) — genuinely unenumerable from static code alone
+  (the dynamic segment comes from external HTTP request data). Not a tractable gap; listed here
+  only so a future pass doesn't re-investigate it from scratch. (The sibling
+  `render_{$column}_column` dispatch found alongside this is now fixed — see the Method detection
+  section above.)
+
+- [ ] **A literal argument reaching `include`/`require` two hops through wrapper functions, at
+  far larger real-world scale than any prior instance of this family.** Real-world finding
+  (Blocksy theme): `blocksy_get_options('general/buttons')` → body does `$path =
+  get_template_directory() . '/inc/options/' . $arg . '.php'` → `blocksy_get_variables_from_file(
+  $path, ...)` → that function's body does `require $file_path`. A second, keyed-array-argument
+  variant: `blocksy_theme_get_dynamic_styles(['name' => 'global-inline', ...])` → body builds
+  `'/inc/dynamic-styles/' . $args['name'] . '.php'` → same `require`-via-wrapper. **Accounts for
+  essentially all 77 of Blocksy's `UnusedFile` findings** (its entire `inc/options/`+
+  `inc/dynamic-styles/` tree) — by far the largest confirmed real-world cost of this whole
+  deferred family (WooCommerce hook-wrapper, Sydney dispatch, wpforms two-hop template, Akismet's
+  single-file variant above). General shape: a two-hop call chain — outer call has a literal
+  (positional or array-key) argument; the immediate callee concatenates a fixed prefix/suffix
+  around that argument into a path (stored in a local variable); a second callee (reached by
+  passing that variable) does the actual `require`/`include`. If a shared interprocedural
+  mechanism is ever built for this family, this instance alone likely justifies it on cost/benefit
+  grounds — re-read this entry first rather than re-deriving the evidence.
+
+- [ ] **A class-property array of literal-string entries, iterated by a shared trait/base method
+  that registers `[$this, transform(literal)]` as an `add_action`/`add_filter` callback where
+  `transform` is a known string function (`str_replace()`) applied to the literal, isn't
+  resolved.** Real-world finding (Blocksy theme, `inc/classes/trait-wordpress-actions-manager.php`,
+  used by 5 classes): `ArchiveLogic` declares `$actions = [['action' => 'blocksy:loop:before'],
+  ['action' => 'blocksy:loop:after']]`; the trait's `attach_hooks()` does
+  `add_filter($action['action'], [$this, str_replace([':','-'], '_', $action['action'])], ...)`,
+  resolving to methods `blocksy_loop_before`/`blocksy_loop_after` — both flagged `UnusedMethod`. A
+  second call site (`add-to-cart.php:317`) confirms the trait is the recurring cause, not a
+  one-off. Harder to generalize than a simple concatenation (needs to model `str_replace`'s actual
+  character-mapping semantics, or accept a curated list of recognized transform-function shapes)
+  — cleanly bounded to one trait/pattern, but no second unrelated project confirms it recurs
+  outside Blocksy yet.
+
+- [ ] **A `get_template_part()`-style call built from a runtime-configurable option value (not a
+  static array/loop/property) isn't enumerable at all, and shouldn't be guessed at.** Real-world
+  finding (Kadence theme, `custom_header/component.php:211`): `foreach ($elements[$row][...] as
+  $item) { get_template_part('template-parts/header/' . $item, ...); }` where `$item` comes from
+  `kadence()->option('header_desktop_items')`, a customizer-configurable value — 8+ template-part
+  files flagged unused. A literal catalog of valid values does exist elsewhere
+  (`header_desktop_available_items` in `header-builder-options.php`, a customizer-control
+  "available items" palette array) but it's UI metadata one more indirection away from the actual
+  data flow (option storage → foreach → path), not a source of truth safely treated as
+  authoritative. Listed here as evidence a future pass might reference, not as a proposed
+  mechanism — this is a genuinely dynamic (user-configurable at runtime) value, structurally
+  different from every other item in this section, which are all resolvable from static code
+  alone.

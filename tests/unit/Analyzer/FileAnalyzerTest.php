@@ -629,6 +629,61 @@ function ocean_single_post_header_meta_template() {
         self::assertNotContains('meta-2.php', $names);
     }
 
+    public function testScopedCallWithTernaryTrackedVariableArgumentResolvesParamSuffixTemplate(): void
+    {
+        // Real-world finding (wp-nested-pages): `$row_view = ( $cond ) ? 'partials/row' :
+        // 'partials/row-link'; include( Helpers::view( $row_view ) );` where Helpers::view()
+        // (defined in a different file) builds its return path from an unresolvable prefix
+        // followed by its own parameter and a literal suffix.
+        $caller = $this->write('app/Entities/Listing.php', '<?php
+class Listing {
+    public function render() {
+        $row_view = ( $this->cond ) ? "partials/row" : "partials/row-link";
+        include( Helpers::view( $row_view ) );
+    }
+}
+');
+        $helper = $this->write('app/Helpers.php', '<?php
+class Helpers {
+    public static function view( $file ) {
+        return dirname( __FILE__ ) . "/Views/" . $file . ".php";
+    }
+}
+');
+        $row = $this->write('Views/partials/row.php', '<?php // reachable via Helpers::view()');
+        $rowLink = $this->write('Views/partials/row-link.php', '<?php // reachable via Helpers::view()');
+
+        $names = array_column($this->analyzer->analyze([$caller, $helper, $row, $rowLink], $this->tmp), 'name');
+        self::assertNotContains('row.php', $names);
+        self::assertNotContains('row-link.php', $names);
+    }
+
+    public function testScopedCallWithSiblingComparisonTrackedVariableConcatenatedIntoArgumentResolves(): void
+    {
+        // Real-world finding (wp-nested-pages): `if ( $tab == 'general' ) ...; if ( $tab ==
+        // 'posttypes' ) ...; include( NestedPages\Helpers::view( 'settings/settings-' . $tab ) );`
+        // — $tab's domain comes from being tested against literals in sibling `if` conditions.
+        $caller = $this->write('app/Views/settings/settings.php', '<?php
+if ( $tab == "general" ) { echo 1; }
+if ( $tab == "posttypes" ) { echo 2; }
+include( NestedPages\Helpers::view( "settings/settings-" . $tab ) );
+');
+        $helper = $this->write('app/Helpers.php', '<?php
+namespace NestedPages;
+class Helpers {
+    public static function view( $file ) {
+        return dirname( __FILE__ ) . "/Views/" . $file . ".php";
+    }
+}
+');
+        $general = $this->write('Views/settings/settings-general.php', '<?php // reachable via Helpers::view()');
+        $posttypes = $this->write('Views/settings/settings-posttypes.php', '<?php // reachable via Helpers::view()');
+
+        $names = array_column($this->analyzer->analyze([$caller, $helper, $general, $posttypes], $this->tmp), 'name');
+        self::assertNotContains('settings-general.php', $names);
+        self::assertNotContains('settings-posttypes.php', $names);
+    }
+
     public function testArrayOfLiteralsForeachLoopExemptsListedFiles(): void
     {
         // Real-world finding (Astra theme): a plain array of relative path fragments (no glob(),

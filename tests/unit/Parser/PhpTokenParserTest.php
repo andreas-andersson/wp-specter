@@ -674,6 +674,36 @@ $x->used();
         self::assertNotEmpty($result->scopedMethodCalls);
     }
 
+    public function testAliasedUseImportIsResolvedToItsRealNameInClassReferences(): void
+    {
+        // Real-world shape (Elementor): `use Some\Namespace\Trigger_Value as TriggerValueValidator;`
+        // then referencing the class only via its alias (`new`, `Alias::method()`, `extends
+        // Alias`) — findUnusedClasses() matches $classReferences against each class's own
+        // declared short name, so a reference recorded under the alias itself never matched the
+        // real "Trigger_Value"/"Loader"/"Base" declaration and looked permanently unused despite
+        // being genuinely referenced. Covers all three capture sites: captureClassNameAfter()
+        // (`new`), the T_STRING `::` branch, and captureClassNameList() (`extends`).
+        $result = $this->parse('<?php
+namespace App;
+use Some\Namespace\Trigger_Value as TriggerValueValidator;
+use Some\Namespace\Loader as Assets_Loader;
+use Some\Namespace\Base as Aliased_Base;
+class Consumer {
+    public function boot() {
+        $x = new Assets_Loader();
+        TriggerValueValidator::is_valid();
+    }
+}
+class Child extends Aliased_Base {}
+');
+        self::assertContains('Trigger_Value', $result->classReferences);
+        self::assertContains('Loader', $result->classReferences);
+        self::assertContains('Base', $result->classReferences);
+        self::assertNotContains('TriggerValueValidator', $result->classReferences);
+        self::assertNotContains('Assets_Loader', $result->classReferences);
+        self::assertNotContains('Aliased_Base', $result->classReferences);
+    }
+
     public function testStandaloneFunctionHasNoOwnerClass(): void
     {
         $result = $this->parse('<?php function standalone() {}');
@@ -865,6 +895,107 @@ class My_Builder {
             'My_Builder::footer_html_3',
             'My_Builder::footer_html_4',
         ], $calls);
+    }
+
+    public function testConcatenatedArrayCallbackMethodNameEnumeratesExactCallsAcrossForeachLiteralArray(): void
+    {
+        // Real-world finding (WooCommerce): includes/class-wc-breadcrumb.php's
+        // `foreach ($conditionals as $conditional) { if (call_user_func($conditional)) {
+        // call_user_func([$this, 'add_crumbs_' . substr($conditional, 3)]); break; } }` where
+        // $conditionals is a plain literal array ('is_home', 'is_404', ...). The foreach-over-
+        // literal-array sibling of the bounded for-loop mechanism above, plus the one additional
+        // transform it has evidence for: substr($var, N) with a fixed literal offset (here
+        // stripping the shared "is_" prefix) applied before concatenation.
+        $result = $this->parse('<?php
+class WC_Breadcrumb {
+    public function wire() {
+        $conditionals = array("is_home", "is_404");
+        foreach ($conditionals as $conditional) {
+            call_user_func(array($this, "add_crumbs_" . substr($conditional, 3)));
+        }
+    }
+    public function add_crumbs_home() {}
+    public function add_crumbs_404() {}
+}
+');
+        $calls = array_map(
+            fn($c) => $c->receiverClass . '::' . $c->method,
+            $result->scopedMethodCalls,
+        );
+        self::assertContains('WC_Breadcrumb::add_crumbs_home', $calls);
+        self::assertContains('WC_Breadcrumb::add_crumbs_404', $calls);
+    }
+
+    public function testSelfDispatchMethodRecordsSuffixTemplate(): void
+    {
+        // Real-world shape (Sydney theme): `get_section($section) { call_user_func([$this,
+        // "{$section}_section"]); }` — a same-class self-dispatch built from the method's own
+        // parameter.
+        $result = $this->parse('<?php
+class Style_Book {
+    public function get_section( $section ) {
+        call_user_func( array( $this, "{$section}_section" ) );
+    }
+}
+');
+        self::assertSame(['_section'], $result->selfDispatchSuffixes['Style_Book::get_section'] ?? null);
+    }
+
+    public function testScopedCallWithLiteralArgToSelfDispatchMethodRecordsPendingCall(): void
+    {
+        $result = $this->parse('<?php
+class Style_Book {
+    public function render() {
+        $this->get_section( "colors" );
+    }
+}
+');
+        self::assertCount(1, $result->pendingSelfDispatchCalls);
+        self::assertSame('Style_Book', $result->pendingSelfDispatchCalls[0]->receiverClass);
+        self::assertSame('get_section', $result->pendingSelfDispatchCalls[0]->methodName);
+        self::assertSame('colors', $result->pendingSelfDispatchCalls[0]->literalArg);
+    }
+
+    public function testPrefixVarSuffixSelfDispatchMethodRecordsTemplate(): void
+    {
+        // Real-world shape (WooCommerce): `render_columns( $column, $post_id ) { if (
+        // is_callable( array( $this, 'render_' . $column . '_column' ) ) ) { $this->{"render_
+        // {$column}_column"}(); } }` — the plain-concatenation counterpart to
+        // testSelfDispatchMethodRecordsSuffixTemplate above, with both a prefix and a suffix.
+        $result = $this->parse('<?php
+class WC_Admin_List_Table {
+    public function render_columns( $column, $post_id ) {
+        if ( is_callable( array( $this, "render_" . $column . "_column" ) ) ) {
+            echo 1;
+        }
+    }
+}
+');
+        self::assertSame(
+            [['render_', '_column']],
+            $result->selfDispatchPrefixSuffixTemplates['WC_Admin_List_Table::render_columns'] ?? null,
+        );
+    }
+
+    public function testArrayKeyLiteralAssignmentIsTrackedPerOwnerClass(): void
+    {
+        // Real-world shape (WooCommerce): `define_columns()` builds `$show_columns['thumb'] =
+        // ...; $show_columns['name'] = ...;` — a local variable, unrelated to the dispatcher
+        // method that later consumes the domain these keys establish.
+        $result = $this->parse('<?php
+class WC_Admin_List_Table_Products {
+    public function define_columns( $columns ) {
+        $show_columns = array();
+        $show_columns["thumb"] = "Image";
+        $show_columns["name"] = "Name";
+        return $show_columns;
+    }
+}
+');
+        self::assertSame(
+            ['thumb', 'name'],
+            $result->classArrayKeyLiterals['WC_Admin_List_Table_Products'] ?? null,
+        );
     }
 
     public function testConcatenatedArrayCallbackMethodNameRegistersAScopedPrefixWhenLoopBoundIsNotLiteral(): void
@@ -1070,6 +1201,50 @@ class My_Controller {
         self::assertSame('My_Controller', $result->propertyMethodCalls[0]->ownerClass);
         self::assertSame('service', $result->propertyMethodCalls[0]->property);
         self::assertSame('render', $result->propertyMethodCalls[0]->method);
+    }
+
+    public function testPropertyAssignedFromAStaticFactoryCallIsTracked(): void
+    {
+        // Real-world shape (LiteSpeed Cache): a shared base class's `cls()` factory method uses
+        // late static binding (`get_called_class()`), so `Cloud::cls()` always returns a `Cloud`
+        // instance regardless of `cls()`'s own (undeclared) return type. Previously invisible to
+        // $propertyAssignedClasses, so $this->cloud->init_qc_cdn_cli() always fell back to the
+        // unscoped pool.
+        $result = $this->parse('<?php
+class Report {
+    private $cloud;
+    public function __construct() {
+        $this->cloud = Cloud::cls();
+    }
+    public function send() {
+        $this->cloud->init_qc_cdn_cli();
+    }
+}
+');
+        self::assertSame(
+            ['Report' => ['cloud' => 'Cloud']],
+            $result->propertyAssignedClasses,
+        );
+        self::assertCount(1, $result->propertyMethodCalls);
+        self::assertSame('init_qc_cdn_cli', $result->propertyMethodCalls[0]->method);
+    }
+
+    public function testLocalVariableAssignedFromAStaticFactoryCallIsTracked(): void
+    {
+        // Same static-factory convention as testPropertyAssignedFromAStaticFactoryCallIsTracked
+        // above, but for a plain local variable (the $varTypesStack counterpart) rather than a
+        // property — e.g. `WPCOM_JSON_API_Links::getInstance()` (Jetpack).
+        $result = $this->parse('<?php
+function boot() {
+    $links = WPCOM_JSON_API_Links::getInstance();
+    $links->wpcom_link_for(1);
+}
+');
+        // Two calls recorded: WPCOM_JSON_API_Links::getInstance() itself (an ordinary scoped
+        // static call, unrelated to this fix) and $links->wpcom_link_for() — resolved only
+        // because assignedStaticFactoryClassName tracked $links as a WPCOM_JSON_API_Links.
+        $methods = array_map(static fn($c) => [$c->receiverClass, $c->method], $result->scopedMethodCalls);
+        self::assertContains(['WPCOM_JSON_API_Links', 'wpcom_link_for'], $methods);
     }
 
     public function testPropertyAssignedFromATypedParameterIsTracked(): void
@@ -1302,6 +1477,55 @@ File_Loader::loadPhpFiles( "inc" );
         self::assertSame('File_Loader', $result->pendingDirectoryLoaderCalls[0]->receiverClass);
         self::assertSame('loadPhpFiles', $result->pendingDirectoryLoaderCalls[0]->methodName);
         self::assertSame('inc', $result->pendingDirectoryLoaderCalls[0]->literalArg);
+    }
+
+    public function testTernaryAssignedVariablePassedToParamSuffixMethodRecordsPendingCall(): void
+    {
+        // Real-world shape (wp-nested-pages): `$row_view = ( $this->post->type !== 'np-redirect'
+        // ) ? 'partials/row' : 'partials/row-link'; include( Helpers::view($row_view) );` where
+        // `Helpers::view($file) { return dirname(__FILE__) . '/Views/' . $file . '.php'; }`.
+        $result = $this->parse('<?php
+$row_view = ( $cond !== "x" ) ? "partials/row" : "partials/row-link";
+include( Helpers::view( $row_view ) );
+');
+        self::assertCount(1, $result->pendingParamSuffixCalls);
+        self::assertSame('Helpers', $result->pendingParamSuffixCalls[0]->receiverClass);
+        self::assertSame('view', $result->pendingParamSuffixCalls[0]->methodName);
+        self::assertSame(['partials/row', 'partials/row-link'], $result->pendingParamSuffixCalls[0]->argumentCandidates);
+    }
+
+    public function testSiblingComparisonEstablishedVariableConcatenatedIntoParamSuffixCallArgument(): void
+    {
+        // Real-world shape (wp-nested-pages): `if ( $tab == 'general' ) ...; if ( $tab ==
+        // 'posttypes' ) ...; include(NestedPages\Helpers::view('settings/settings-' . $tab));` —
+        // $tab's domain comes from being tested against literals in sibling `if` conditions, not
+        // from being assigned one.
+        $result = $this->parse('<?php
+if ( $tab == "general" ) { echo 1; }
+if ( $tab == "posttypes" ) { echo 2; }
+include( NestedPages\Helpers::view( "settings/settings-" . $tab ) );
+');
+        self::assertCount(1, $result->pendingParamSuffixCalls);
+        self::assertSame('NestedPages\Helpers', $result->pendingParamSuffixCalls[0]->receiverClass);
+        self::assertSame('view', $result->pendingParamSuffixCalls[0]->methodName);
+        self::assertSame(
+            ['settings/settings-general', 'settings/settings-posttypes'],
+            $result->pendingParamSuffixCalls[0]->argumentCandidates,
+        );
+    }
+
+    public function testReturnConcatenationWithOwnParamAndTrailingLiteralRecordsSuffixTemplate(): void
+    {
+        // Helpers::view()'s own body — see resolveReturnParamSuffixTemplate's own docblock. The
+        // unresolvable `dirname(__FILE__)` prefix is simply never looked at.
+        $result = $this->parse('<?php
+class Helpers {
+    public static function view($file) {
+        return dirname(__FILE__) . "/Views/" . $file . ".php";
+    }
+}
+');
+        self::assertSame(['.php'], $result->functionParamSuffixReturns['Helpers::view'] ?? null);
     }
 
     public function testLocalVariableTypeDoesNotLeakAcrossFunctions(): void
