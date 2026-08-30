@@ -147,7 +147,7 @@ Create `.wp-specter.config.json` in your project root:
     "targets": ["web/app/themes/sage", "web/app/plugins/my-plugin"],
     "stubsFrom": ["web/app/plugins", "web/app/mu-plugins"],
     "stubs": ".wp-specter.stubs.json",
-    "exclude": ["tests"]
+    "exclude": ["tests", "vendors"]
 }
 ```
 
