@@ -39,6 +39,26 @@ final class ClassAnalyzerTest extends TestCase
         self::assertSame(FindingCertainty::Error, $findings[0]->certainty);
     }
 
+    public function testClassReferenceIsMatchedCaseInsensitively(): void
+    {
+        // PHP's own class-name resolution is case-insensitive — a reference under different
+        // casing than the declaration still refers to the exact same class at runtime. Real-
+        // world case (Elementor): `WP_CLI::class` referencing its own locally-declared
+        // `class Wp_Cli extends \WP_CLI_Command` (deliberately mimicking the real vendor class's
+        // name, just not its exact casing). Exercised here via a plain `new` reference —
+        // independent of the WP_CLI-specific mechanism — since the fix is in the general
+        // class-reference matching both findUnusedClasses and the reflection-dispatch exemption
+        // share, not something scoped to WP-CLI itself.
+        $file = $this->write('<?php
+class My_Service {}
+function boot() {
+    return new MY_SERVICE();
+}
+');
+        $findings = $this->analyzer->analyze([$file]);
+        self::assertEmpty(array_filter($findings, fn($f) => $f->type === FindingType::UnusedClass));
+    }
+
     public function testDoesNotReportClassPassedAsStringToCustomizerRegisterType(): void
     {
         // Real-world finding (Astra theme): WP_Customize_Manager::register_panel_type()/
@@ -1786,6 +1806,38 @@ class Not_A_Cli_Command {
         $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
         $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
         self::assertContains('enable', $unusedMethods);
+    }
+
+    public function testWpCliAddCommandViaClassConstantAndFullyQualifiedCallCreditsTheRealClass(): void
+    {
+        // Real-world finding (Elementor): `\WP_CLI::add_command('elementor experiments',
+        // WP_CLI::class)` — a fully-qualified call (opting out of the file's own namespace),
+        // with the registered class referenced via `WP_CLI::class` rather than a plain string
+        // literal, AND under different casing than its own declaration (`class Wp_Cli extends
+        // \WP_CLI_Command` — PHP class-name resolution is case-insensitive, and Elementor's own
+        // code deliberately mimics the real vendor class's name without matching its casing
+        // exactly). All three of these needed fixing together for this real case to resolve:
+        // Foo::class as add_command()'s 2nd argument, WP_CLI detection reaching the qualified/
+        // fully-qualified call branch (not just the bare T_STRING one), and case-insensitive
+        // class-name matching in both the whole-class and per-method exemption checks.
+        $file = $this->write('<?php
+namespace Elementor\Core\Experiments;
+
+class Wp_Cli extends \WP_CLI_Command {
+    public function run($args, $assoc_args) {}
+}
+
+class Manager {
+    public function register_cli() {
+        \WP_CLI::add_command( "elementor experiments", WP_CLI::class );
+    }
+}
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedClasses = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedClass), 'name');
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('Wp_Cli', $unusedClasses);
+        self::assertNotContains('run', $unusedMethods);
     }
 
     // ── property-type tracking ──────────────────────────────────────────────────────────────

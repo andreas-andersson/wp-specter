@@ -1022,6 +1022,31 @@ WP_CLI::add_command( "astra abilities", "Astra_Abilities_CLI" );
         self::assertContains('Astra_Abilities_CLI', $result->reflectionDispatchedClassNames);
     }
 
+    public function testWpCliAddCommandAcceptsClassConstantAsSecondArgument(): void
+    {
+        // Real-world shape (Elementor): WP_CLI::add_command('elementor experiments',
+        // WP_CLI::class) — the idiomatic modern-PHP way to reference a class by name, instead
+        // of a plain string literal.
+        $result = $this->parse('<?php
+namespace Elementor\Core\Experiments;
+WP_CLI::add_command( "elementor experiments", WP_CLI::class );
+');
+        self::assertContains('Elementor\Core\Experiments\WP_CLI', $result->reflectionDispatchedClassNames);
+    }
+
+    public function testWpCliAddCommandIsRecognizedViaAFullyQualifiedCall(): void
+    {
+        // Real-world shape (Elementor): `\WP_CLI::add_command('elementor kit', WP_CLI::class)`,
+        // explicitly opting out of the file's own namespace for the real global WP_CLI class —
+        // tokenizes as T_NAME_FULLY_QUALIFIED, not T_STRING, a completely different dispatch
+        // branch that previously had no equivalent WP_CLI-specific check at all.
+        $result = $this->parse('<?php
+namespace Elementor\Core\Experiments;
+\WP_CLI::add_command( "elementor kit", WP_CLI::class );
+');
+        self::assertContains('Elementor\Core\Experiments\WP_CLI', $result->reflectionDispatchedClassNames);
+    }
+
     public function testPropertyAssignedNewClassIsTrackedAndConsultedFromAnotherMethod(): void
     {
         // $this->service = new My_Service() in the constructor, read via $this->service->render()

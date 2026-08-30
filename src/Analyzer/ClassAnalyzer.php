@@ -243,10 +243,16 @@ final class ClassAnalyzer
      */
     private function findUnusedClasses(array $parseResults, array $classDefsByName, array &$unusedFqcns = []): array
     {
+        // Lowercased keys — PHP's own class-name resolution is case-insensitive, and real
+        // projects occasionally reference a class under different casing than its own
+        // declaration (real-world case: Elementor's `WP_CLI::class` referencing its own
+        // locally-declared `class Wp_Cli extends \WP_CLI_Command` — deliberately mimicking the
+        // real vendor class's name, just not its exact casing). A case-sensitive match here
+        // would silently treat that as a completely different, unreferenced class.
         $referenced = [];
         foreach ($parseResults as $result) {
             foreach ($result->classReferences as $ref) {
-                $referenced[$ref] = true;
+                $referenced[strtolower($ref)] = true;
             }
         }
 
@@ -270,13 +276,14 @@ final class ClassAnalyzer
         $calledNames = [];
         foreach ($parseResults as $result) {
             foreach ($result->functionCalls as $call) {
-                $calledNames[$call->name] = true;
+                $calledNames[strtolower($call->name)] = true;
             }
         }
 
         $findings = [];
         foreach ($classDefsByName as $fqcn => $def) {
-            if (!isset($referenced[$def->name]) && !isset($calledNames[$def->name])) {
+            $lowerName = strtolower($def->name);
+            if (!isset($referenced[$lowerName]) && !isset($calledNames[$lowerName])) {
                 if (self::isFullyExemptClass($fqcn, $classDefsByName)) {
                     continue;
                 }
@@ -512,10 +519,14 @@ final class ClassAnalyzer
         // BASE_CLASS_CONTRACT_METHODS does, so every method on the class is exempt, the same
         // whole-class effect as isFullyExemptClass() but triggered by a call site instead of an
         // extends/implements clause.
+        // Lowercased keys for the same reason findUnusedClasses' own $referenced/$calledNames
+        // are — PHP class-name resolution is case-insensitive (real case: Elementor's
+        // `WP_CLI::add_command($hook, WP_CLI::class)` referencing its own `Wp_Cli`, different
+        // casing than the declaration).
         $reflectionDispatchedClassNames = [];
         foreach ($parseResults as $result) {
             foreach ($result->reflectionDispatchedClassNames as $name) {
-                $reflectionDispatchedClassNames[$name] = true;
+                $reflectionDispatchedClassNames[strtolower($name)] = true;
             }
         }
 
@@ -540,7 +551,7 @@ final class ClassAnalyzer
                     || isset($unusedClassNames[$def->ownerClass ?? ''])
                     || isset($called[$def->name])
                     || isset($scopedCalled[$def->ownerClass ?? ''][$def->name])
-                    || isset($reflectionDispatchedClassNames[$def->ownerClass ?? ''])
+                    || isset($reflectionDispatchedClassNames[strtolower($def->ownerClass ?? '')])
                     || $this->matchesAnyPrefix($def->name, $scopedCalledPrefixes[$def->ownerClass ?? ''] ?? [])
                     || self::isFullyExemptClass($def->ownerClass, $classDefsByName)
                     || $this->isContractMethod($def->name, $def->ownerClass, $classDefsByName, $reflector)

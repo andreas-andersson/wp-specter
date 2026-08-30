@@ -942,18 +942,7 @@ final class PhpTokenParser
                     if ($target !== null) {
                         [$methodName, $methodNameIndex] = $target;
 
-                        // WP_CLI::add_command('astra abilities', 'Astra_Abilities_CLI') — WP-CLI
-                        // reflects over *every* public method of the given class and dispatches
-                        // whichever one matches the subcommand typed, not a fixed method name a
-                        // curated contract-method list could name up front (unlike WP_Widget's
-                        // widget()/form()/update()). The class name is this call's own second
-                        // argument, not a receiver this parser is already resolving here.
-                        if ($name === 'WP_CLI' && $methodName === 'add_command') {
-                            $commandClass = $this->secondArgStringLiteral($tokens, $methodNameIndex);
-                            if ($commandClass !== null) {
-                                $reflectionDispatchedClassNames[] = $this->resolveFqcn($commandClass, $currentNamespace, $useImports);
-                            }
-                        }
+                        $this->recordWpCliAddCommandDispatch($name, $methodName, $tokens, $methodNameIndex, $currentNamespace, $useImports, $reflectionDispatchedClassNames);
 
                         $receiverClass = $this->resolveClassNameToken($name, $classNameStack, $classParentStack, $currentNamespace, $useImports);
                         if ($receiverClass !== null) {
@@ -1037,6 +1026,17 @@ final class PhpTokenParser
                             [$methodName, $methodNameIndex] = $target;
                             $scopedMethodCalls[] = new ScopedMethodCall($receiverClass, $methodName);
                             $i = $methodNameIndex;
+
+                            // \WP_CLI::add_command(...) — the exact same reflection-dispatch
+                            // shape the bare T_STRING branch above already recognizes, just
+                            // reached via a fully-qualified/namespaced call instead. Real-world
+                            // shape (Elementor): `\WP_CLI::add_command('elementor experiments',
+                            // WP_CLI::class)`, explicitly opting out of the file's own namespace
+                            // for the real global WP_CLI class — this whole branch previously had
+                            // no equivalent to the T_STRING branch's WP_CLI-specific check at all,
+                            // so Elementor's own `Wp_Cli` command classes looked permanently
+                            // unused regardless of the `Foo::class` second-argument fix above.
+                            $this->recordWpCliAddCommandDispatch($this->shortClassName($value), $methodName, $tokens, $methodNameIndex, $currentNamespace, $useImports, $reflectionDispatchedClassNames);
                         }
                     }
                     continue;
@@ -2107,13 +2107,40 @@ final class PhpTokenParser
     }
 
     /**
+     * $receiverName/$methodName are the already-resolved bare names of a scoped call this parser
+     * just recognized (`Receiver::method(...)`), reached from either the bare-T_STRING branch or
+     * the qualified/fully-qualified one — both funnel through here so the check only needs to
+     * exist once. `WP_CLI::add_command('astra abilities', 'Astra_Abilities_CLI')` — WP-CLI
+     * reflects over *every* public method of the given class and dispatches whichever one
+     * matches the subcommand typed, not a fixed method name a curated contract-method list could
+     * name up front (unlike WP_Widget's widget()/form()/update()). The class name is this call's
+     * own second argument, not the receiver already being resolved at the call site.
+     *
+     * @param list<Token> $tokens
+     * @param array<string,string> $useImports
+     * @param list<string> $reflectionDispatchedClassNames
+     */
+    private function recordWpCliAddCommandDispatch(string $receiverName, string $methodName, array $tokens, int $methodNameIndex, string $currentNamespace, array $useImports, array &$reflectionDispatchedClassNames): void
+    {
+        if ($receiverName !== 'WP_CLI' || $methodName !== 'add_command') {
+            return;
+        }
+        $commandClass = $this->secondArgStringLiteral($tokens, $methodNameIndex);
+        if ($commandClass !== null) {
+            $reflectionDispatchedClassNames[] = $this->resolveFqcn($commandClass, $currentNamespace, $useImports);
+        }
+    }
+
+    /**
      * $nameIndex points at a T_STRING call name (e.g. 'add_command'), already confirmed followed
-     * by '('. Returns its second argument's string literal value when the call's first two
-     * arguments are both plain string literals — `add_command('astra abilities',
-     * 'Astra_Abilities_CLI')` — or null for anything else (fewer than two arguments, a
-     * non-literal first or second argument). Same "only trust the simplest literal shape" stance
-     * as firstStringArgIndex — a concatenated or variable class name is left unresolved rather
-     * than guessed at.
+     * by '('. Returns its second argument's class name when the call's first argument is a plain
+     * string literal and its second is either also a plain string literal —
+     * `add_command('astra abilities', 'Astra_Abilities_CLI')` — or the idiomatic modern-PHP
+     * `Foo::class` form — `add_command('elementor experiments', WP_CLI::class)` (real-world
+     * shape, Elementor). Null for anything else (fewer than two arguments, a non-literal first
+     * argument, or a second argument that's neither shape). Same "only trust the simplest literal
+     * shape" stance as firstStringArgIndex — a concatenated or variable class name is left
+     * unresolved rather than guessed at.
      *
      * @param list<Token> $tokens
      */
@@ -2132,7 +2159,32 @@ final class PhpTokenParser
             return null;
         }
         $j = $this->skipInsignificant($tokens, $j + 1);
-        if (!isset($tokens[$j]) || !is_array($tokens[$j]) || $tokens[$j][0] !== T_CONSTANT_ENCAPSED_STRING) {
+        if (!isset($tokens[$j])) {
+            return null;
+        }
+
+        // Foo::class instead of a plain string literal — the idiomatic modern-PHP way to
+        // reference a class by name. Real-world shape (Elementor):
+        // `\WP_CLI::add_command('elementor experiments', WP_CLI::class)` — WP_CLI (no leading
+        // backslash) resolves via the file's own namespace to a locally-declared `Wp_Cli`
+        // class, not the real global `\WP_CLI` — the caller's own resolveFqcn() call handles
+        // this exactly the same way it already does for a plain string literal, since the raw
+        // class-name token text is returned unresolved either way. Returned as-is (not stripped
+        // of quotes — there are none here), same contract as the string-literal branch below.
+        if (is_array($tokens[$j]) && in_array($tokens[$j][0], self::CLASS_NAME_TOKENS, true)) {
+            $classNameToken = $tokens[$j][1];
+            $k = $this->skipInsignificant($tokens, $j + 1);
+            if (!isset($tokens[$k]) || !is_array($tokens[$k]) || $tokens[$k][0] !== T_DOUBLE_COLON) {
+                return null;
+            }
+            $k = $this->skipInsignificant($tokens, $k + 1);
+            if (!isset($tokens[$k]) || !is_array($tokens[$k]) || $tokens[$k][0] !== T_STRING || $tokens[$k][1] !== 'class') {
+                return null;
+            }
+            return $classNameToken;
+        }
+
+        if (!is_array($tokens[$j]) || $tokens[$j][0] !== T_CONSTANT_ENCAPSED_STRING) {
             return null;
         }
         return $this->stripQuotes($tokens[$j][1]);

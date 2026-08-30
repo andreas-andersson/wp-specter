@@ -1078,6 +1078,62 @@ not shipped bugs.
   previously-unreachable true resolutions, not over-broad suppressions) and no crashes anywhere;
   full suite (550 tests) and phpstan both green.
 
+- [x] **`WP_CLI::add_command()`'s class-name second argument was invisible in three real,
+  independent ways at once, discovered layer by layer while chasing down a single piece of
+  real-world evidence to an actual fix.** Found by a fresh gap-hunting pass: Elementor's
+  `core/experiments/manager.php:941` — `\WP_CLI::add_command('elementor experiments',
+  WP_CLI::class);` — and two more identical-shape call sites elsewhere in the plugin. All three
+  of Elementor's own `Wp_Cli`-named command classes (and their public methods) were flagged
+  `UnusedClass`/`UnusedMethod`.
+
+  Three separate, compounding gaps, each confirmed necessary by testing against the real file
+  after each fix and finding it *still* broken:
+  1. **`secondArgStringLiteral()` only accepted a plain string literal as the second argument.**
+     `WP_CLI::class` — the idiomatic modern-PHP way to reference a class by name — was never
+     recognized at all. Fixed: it now also accepts a class-name token immediately followed by
+     `::class`, returning the raw class-name text exactly as the string-literal branch already
+     did, so the caller's existing `resolveFqcn()` handles both uniformly.
+  2. **The `WP_CLI::add_command()` reflection-dispatch check only ever lived in the bare-`T_STRING`
+     call-dispatch branch.** Elementor's real call is fully qualified —
+     `\WP_CLI::add_command(...)`, explicitly opting out of the file's own namespace for the real
+     global `WP_CLI` class, tokenizing as `T_NAME_QUALIFIED`/`T_NAME_FULLY_QUALIFIED` instead of
+     `T_STRING` — a completely different dispatch branch with no equivalent check at all. Fixed
+     by extracting the check into a new shared `recordWpCliAddCommandDispatch()`, called from
+     both branches — the same "shared helper, not duplicated logic" shape already used for
+     `dispatchBareFunctionCall()` earlier in the project's history for the analogous bare-vs-
+     qualified function-call gap.
+  3. **Class-name matching was case-sensitive everywhere, but PHP's own class-name resolution
+     is case-insensitive.** Elementor's own class is declared `class Wp_Cli extends
+     \WP_CLI_Command` — deliberately mimicking the real vendor class's name, just not its exact
+     casing — so even with both fixes above, `WP_CLI` (from `WP_CLI::class`) never matched
+     `Wp_Cli` (the real declaration) in any of this project's own short-name-keyed maps. Fixed by
+     lowercasing both sides of the three specific comparisons this blocked:
+     `ClassAnalyzer::findUnusedClasses()`'s `$referenced`/`$calledNames` maps (whole-class
+     usage) and `findUnusedMethods()`'s `$reflectionDispatchedClassNames` map (per-method
+     exemption) — not a global case-insensitivity overhaul of every map in the codebase, just
+     the specific comparisons genuinely blocking this evidence.
+
+     This third fix independently generalized far beyond Elementor: re-running the full corpus
+     surfaced a **second, unrelated real-world instance** confirming it's a genuine, recurring
+     class of bug, not something invented to fit one plugin — Hestia theme's own hand-rolled
+     autoloader (`inc/core/class-hestia-autoloader.php`) maps the string key
+     `'Hestia_Wpbakery_Compatibility'` to a file declaring `class Hestia_WPBakery_Compatibility`
+     — a casing mismatch in Hestia's *own* code, nothing to do with WP-CLI at all, resolved by
+     the exact same fix.
+
+  Verified: 3 new `PhpTokenParserTest` cases (the `Foo::class` second-argument shape, the fully-
+  qualified-call dispatch shape, both modeled on the real Elementor call) and 2 new
+  `ClassAnalyzerTest` cases (an end-to-end case combining all three fixes exactly as Elementor's
+  real code does, and a standalone case-insensitivity case using a plain `new` reference,
+  independent of WP-CLI, proving the fix is general); real corpus — all three Elementor `Wp_Cli`
+  findings gone (unused-class count 101 → 96, unused-method count 520 → 502 — more than the 3
+  directly-traced instances, confirming further un-traced case-mismatches elsewhere in Elementor
+  also resolved), Hestia's `Hestia_WPBakery_Compatibility` also resolved (1 → 0 unused classes,
+  confirmed via direct trace, not just count-watching); full sanity pass across the now-expanded
+  28-target corpus (13 plugins + 15 themes) shows several further plausible wins from the same
+  case-insensitivity fix (WooCommerce -5 classes, wpforms-lite -3, Jetpack -2 classes) and no
+  crashes anywhere; full suite (554 tests) and phpstan both green.
+
 - [x] **Legacy `spl_autoload_register()` class-map callbacks — partially recognized, known
   remaining gap accepted as-is.** Pre-Composer (or hybrid) WP plugins sometimes register their
   own autoloader mapping class name → file path in code, rather than declaring `composer.json`
@@ -1509,3 +1565,58 @@ way the class/method/file gaps above were found; nothing here has been fixed yet
     directory before a dynamic filename), but a *suffix*-only template slug (dynamic first,
     literal last) isn't an idiomatic WP naming shape the TODO item or any real example called for,
     so no matching change was made there.
+
+# Open — found, deliberately not fixed yet (higher effort than typical, thinner evidence)
+
+Confirmed real gaps from a fresh gap-hunting pass, explicitly deferred by user decision rather
+than fixed on the spot — each would need a genuinely new capability, not a small extension of an
+existing mechanism, and each has only 1-2 confirmed real-world instances so far (this project's
+own bar for "worth building" is usually cleared at 2+ independent instances plus a bounded,
+low-risk implementation path — neither item here clears both). Re-read this entry before picking
+either back up; don't re-discover the same evidence from scratch.
+
+- [ ] **A hook/action name passed as a literal argument to a private wrapper function or closure,
+  which internally calls an already-recognized hook-firing function using that parameter, isn't
+  resolved.** Confirmed **twice** in WooCommerce alone:
+  - `includes/class-wc-post-data.php`: `self::schedule_variation_summary_regeneration(
+    'wc_regenerate_attribute_variation_summaries', ...)` / `('wc_regenerate_product_variation_
+    summaries', ...)` — the private static method's own body does
+    `as_schedule_single_action($timestamp, $action_name, $args, $group)` using its own
+    `$action_name` parameter.
+  - `includes/wc-product-functions.php:610-611`: a local closure assigned to `$schedule`, called
+    as `$schedule($date, 'wc_product_start_scheduled_sale')` /
+    `('wc_product_end_scheduled_sale')`, whose body does `as_schedule_single_action($timestamp,
+    $hook, $args, 'woocommerce-sales')` using its own `$hook` parameter.
+
+  Both hooks are real, `add_action()`-registered, and genuinely fire — but show as
+  `UnmatchedHook`, since nothing here is a *direct* literal argument to a recognized hook-firing
+  function; the literal only reaches one via an intermediate parameter one call away. Fixing this
+  generally means a real (if narrow) form of interprocedural constant propagation: correlate a
+  literal argument at a call site with the callee's own parameter, then treat that parameter's use
+  inside a `CRON_SCHEDULE_FUNCS`/`HOOK_INVOKE_FUNCS` call as if the literal were passed directly.
+  Meaningfully harder than anything else fixed this session (a new analysis capability, not a
+  list addition or a token-shape extension) — two independent real occurrences in one plugin
+  suggest it recurs, but not yet enough evidence (or a low-risk enough design) to justify the
+  effort over the many bounded, low-risk fixes this session found instead.
+
+- [ ] **A dynamic-dispatch pattern — `call_user_func(array($this, "{$param}_suffix"))` inside a
+  dispatcher method, called from multiple call sites each with a literal argument — leaves every
+  real target method invisible.** Real-world finding (Sydney theme,
+  `inc/customizer/style-book/class-sydney-style-book.php`): `get_section($section)` (line 298)
+  does `call_user_func(array($this, "{$section}_section"))`; called 8 times with literal strings
+  at lines 138-145 — `$this->get_section('colors')`, `('buttons')`, `('typography')`, `('media')`,
+  `('forms')`, `('lists')`, `('tables')`, `('quotes')`. All 8 real target methods
+  (`colors_section`, `buttons_section`, etc.) are flagged `UnusedMethod`.
+
+  Conceptually close to the bounded-for-loop enumeration fixed earlier this session
+  (`resolveForLoopConcatenatedLiteral`/`resolveInterpolatedLoopSuffixPath`) — same "enumerate a
+  dynamic segment's concrete values instead of leaving it unresolved" idea — but the literal
+  values come from **discrete call sites scattered through the file**, not a bounded loop's own
+  known range, which is a different (and less contained) collection problem: recognize the
+  `call_user_func(array($this, "{$param}_suffix"))` shape inside a method body, then collect
+  every literal argument that method is ever called with anywhere in the file (or project) to
+  enumerate real target method names. Only one confirmed instance (no second theme/plugin in the
+  corpus shows the same shape yet) — real and would generalize correctly if built, but thinner
+  evidence than this session's other fixes and a more open-ended "search everywhere for call
+  sites" implementation shape than the loop-bounded case that motivated the similar-looking
+  mechanism above.
