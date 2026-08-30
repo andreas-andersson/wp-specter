@@ -168,6 +168,20 @@ final class ClassAnalyzer
         // the view's requested variable name at render time — never a literal call anywhere in
         // project code.
         'Composer' => 'Roots\Acorn\View\Composer',
+        // PHPUnit/WP-test-suite test case classes: every test* method (plus setUp/tearDown/...)
+        // is discovered and called by the test runner via reflection over the class itself, never
+        // a literal call anywhere in project code. Confirmed independently in two real-world
+        // projects: WP Rig theme's own test suite (tests/phpunit/..., a chain of intermediate
+        // project-own base classes eventually reaching either PHPUnit\Framework\TestCase or
+        // WP_UnitTestCase — the existing extends-chain walk this list already does handles that
+        // multi-level case for free) and wp-smushit's bundled wpmudev-analytics test
+        // (`class Test_WPMUDEV_Analytics extends WP_UnitTestCase`). WP_UnitTestCase itself has no
+        // namespace to import — it's a global class the WP test suite (or WP-core's own PHPUnit
+        // bootstrap) defines — so its own entry's value is just its own bare name; the existing
+        // "$ref->fqcn === $ref->short" leniency already handles an un-namespaced extends
+        // correctly without needing an actual `use` import to match against.
+        'TestCase' => 'PHPUnit\Framework\TestCase',
+        'WP_UnitTestCase' => 'WP_UnitTestCase',
     ];
 
     // Bounds the extends-chain walk in isContractMethod() so a cyclic or malformed extends
@@ -263,7 +277,7 @@ final class ClassAnalyzer
         $findings = [];
         foreach ($classDefsByName as $fqcn => $def) {
             if (!isset($referenced[$def->name]) && !isset($calledNames[$def->name])) {
-                if ($this->isFullyExemptClass($fqcn, $classDefsByName)) {
+                if (self::isFullyExemptClass($fqcn, $classDefsByName)) {
                     continue;
                 }
                 $unusedFqcns[$fqcn] = true;
@@ -390,6 +404,31 @@ final class ClassAnalyzer
                     }
                 }
 
+                // Real-world gap (Wordfence's bundled Diff library): a property assigned
+                // *externally*, against the exact declared type of a typed parameter
+                // (`$renderer->diff = $this;` inside `Diff::render(Diff_Renderer_Abstract
+                // $renderer)`), is read back inside a *subclass* of that declared type
+                // (`Diff_Renderer_Html_Array::render()` calling `$this->diff->getA()`) — the
+                // mirror direction of the Yoast SEO case just above: there the assignment
+                // happened in a descendant and the read in the base; here the assignment happens
+                // at the base type and the read is in a descendant. Walks $call->ownerClass's own
+                // extends chain upward looking for the first ancestor the property was actually
+                // assigned against.
+                if ($trackedClass === null) {
+                    $className = $call->ownerClass;
+                    for ($depth = 0; $depth < self::MAX_INHERITANCE_DEPTH; $depth++) {
+                        $baseRef = ($classDefsByName[$className] ?? null)?->extends[0] ?? null;
+                        if ($baseRef === null) {
+                            break;
+                        }
+                        if (isset($propertyAssignedClasses[$baseRef->fqcn][$call->property])) {
+                            $trackedClass = $propertyAssignedClasses[$baseRef->fqcn][$call->property];
+                            break;
+                        }
+                        $className = $baseRef->fqcn;
+                    }
+                }
+
                 if ($trackedClass !== null) {
                     $scopedCalled[$trackedClass][$call->method] = true;
                 }
@@ -503,7 +542,7 @@ final class ClassAnalyzer
                     || isset($scopedCalled[$def->ownerClass ?? ''][$def->name])
                     || isset($reflectionDispatchedClassNames[$def->ownerClass ?? ''])
                     || $this->matchesAnyPrefix($def->name, $scopedCalledPrefixes[$def->ownerClass ?? ''] ?? [])
-                    || $this->isFullyExemptClass($def->ownerClass, $classDefsByName)
+                    || self::isFullyExemptClass($def->ownerClass, $classDefsByName)
                     || $this->isContractMethod($def->name, $def->ownerClass, $classDefsByName, $reflector)
                     || $this->isUsedByTraitConsumer($def->ownerClass, $def->name, $classDefsByName, $traitUsers, $scopedCalled)
                     || $this->isUsedByPolymorphicCall($def->ownerClass, $def->name, $classDefsByName, $scopedCalled)
@@ -591,7 +630,11 @@ final class ClassAnalyzer
      * Walks the extends chain the same way isContractMethod() does, checking each base short
      * name against FULLY_EXEMPT_BASE_CLASSES rather than a per-method list. $className is either
      * a class's own name (whole-class check from findUnusedClasses) or a method's owner class
-     * (findUnusedMethods).
+     * (findUnusedMethods). Public/static so FileAnalyzer can reuse the exact same exemption for
+     * its own "is this file used" question — a file whose only class is one of these (Sage
+     * theme's own View\Composers\*.php, discovered by Acorn's own filesystem convention, never
+     * referenced by name anywhere in the theme) is exactly as unreferenceable-by-name as the
+     * class itself already is, and previously had no equivalent file-level exemption at all.
      *
      * Exempting an entire class is a much bigger effect than the per-method curated lists above,
      * so a bare short-name match isn't good enough on its own: a project with its own unrelated
@@ -607,7 +650,7 @@ final class ClassAnalyzer
      *
      * @param array<string,ClassDef> $classDefsByName Keyed by FQCN.
      */
-    private function isFullyExemptClass(?string $className, array $classDefsByName): bool
+    public static function isFullyExemptClass(?string $className, array $classDefsByName): bool
     {
         if ($className === null) {
             return false;

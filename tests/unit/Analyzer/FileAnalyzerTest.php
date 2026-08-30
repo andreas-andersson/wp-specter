@@ -512,6 +512,46 @@ function astra_get_logo_svg_icons_array() {
         self::assertContains('icons-v6-4.php', $names);
     }
 
+    public function testFileContainingOnlyAFullyExemptBaseClassIsNotFlaggedUnused(): void
+    {
+        // Real-world finding (Sage theme, a Roots Acorn theme): app/View/Composers/*.php each
+        // declare a single `class X extends Composer` (Roots\Acorn\View\Composer — already
+        // whole-class-exempted by ClassAnalyzer::isFullyExemptClass, discovered by Acorn's own
+        // filesystem convention, never referenced by name anywhere in the theme). --type=classes
+        // already correctly showed these as used, but --type=files had no equivalent exemption
+        // at all and still flagged the file itself as unused — the class-level exemption and the
+        // file-level check had zero cross-talk.
+        $file = $this->write('inc/app.php', '<?php
+use Roots\Acorn\View\Composer;
+
+class App extends Composer {
+    public function siteName() {}
+}
+');
+        $names = array_column($this->analyzer->analyze([$file], $this->tmp), 'name');
+        self::assertNotContains('app.php', $names);
+    }
+
+    public function testFileMixingAFullyExemptClassWithAnUnrelatedClassIsNotExempted(): void
+    {
+        // A file isn't safe to exempt wholesale just because ONE of its classes is fully
+        // exempt — if it also declares something else, that something else might genuinely need
+        // a real usage reference, so the file itself still needs to be checked normally.
+        $file = $this->write('inc/app.php', '<?php
+use Roots\Acorn\View\Composer;
+
+class App extends Composer {
+    public function siteName() {}
+}
+
+class Not_Actually_Exempt {
+    public function init() {}
+}
+');
+        $names = array_column($this->analyzer->analyze([$file], $this->tmp), 'name');
+        self::assertContains('app.php', $names);
+    }
+
     public function testDynamicMiddleSegmentRequireWithFilenamePrefixTrimsToRealDirectory(): void
     {
         // Real-world regression (Sydney theme): `require get_template_directory() .

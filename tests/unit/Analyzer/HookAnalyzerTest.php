@@ -177,6 +177,48 @@ wp_schedule_single_event( time(), 'one_off_cron' );
         self::assertEmpty($this->analyzer->analyze([$file]));
     }
 
+    // ── Action Scheduler (widely-bundled standalone library — WooCommerce, wpforms-lite, ...) ──
+
+    public function testAsEnqueueAsyncActionCountsAsFiring(): void
+    {
+        $file = $this->write("<?php
+add_action( 'my_async_task', 'handler' );
+as_enqueue_async_action( 'my_async_task', array(), 'my-group' );
+");
+        self::assertEmpty($this->analyzer->analyze([$file]));
+    }
+
+    public function testAsScheduleSingleActionCountsAsFiring(): void
+    {
+        // Real-world shape (WooCommerce): as_schedule_single_action(time()+10,
+        // 'generate_category_lookup_table_wrapper', ...) — hook is the 2nd argument, not the 1st.
+        $file = $this->write("<?php
+add_action( 'generate_category_lookup_table_wrapper', 'handler' );
+as_schedule_single_action( time() + 10, 'generate_category_lookup_table_wrapper' );
+");
+        self::assertEmpty($this->analyzer->analyze([$file]));
+    }
+
+    public function testAsScheduleRecurringActionCountsAsFiring(): void
+    {
+        // Real-world shape (WooCommerce): as_schedule_recurring_action($tomorrow_3am,
+        // DAY_IN_SECONDS, 'wc_admin_daily_wrapper', ...) — hook is the 3rd argument.
+        $file = $this->write("<?php
+add_action( 'wc_admin_daily_wrapper', 'handler' );
+as_schedule_recurring_action( time(), DAY_IN_SECONDS, 'wc_admin_daily_wrapper', array(), 'woocommerce', true );
+");
+        self::assertEmpty($this->analyzer->analyze([$file]));
+    }
+
+    public function testAsScheduleCronActionCountsAsFiring(): void
+    {
+        $file = $this->write("<?php
+add_action( 'my_cron_task', 'handler' );
+as_schedule_cron_action( time(), '*/5 * * * *', 'my_cron_task' );
+");
+        self::assertEmpty($this->analyzer->analyze([$file]));
+    }
+
     // ── WP core stub suppression ───────────────────────────────────────────
 
     public function testWpCoreHooksSilentlyIgnored(): void

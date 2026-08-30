@@ -1073,6 +1073,42 @@ class Base_Route {
         self::assertSame('get_permission_callback', $result->propertyMethodCalls[0]->method);
     }
 
+    public function testExternalPropertyAssignmentOfThisOntoATypedParameterIsTracked(): void
+    {
+        // Real-world shape (Wordfence's bundled Diff library): `function render(Diff_Renderer_
+        // Abstract $renderer) { $renderer->diff = $this; return $renderer->render(); }` — the
+        // exact inverse of testPropertyAssignedFromATypedParameterIsTracked above: here the
+        // assignment TARGET is the external typed parameter, and the VALUE is the current
+        // instance. Written into the same $propertyAssignedClasses map, keyed by the parameter's
+        // own declared type rather than the current class.
+        $result = $this->parse('<?php
+class Diff {
+    public function render(Diff_Renderer_Abstract $renderer) {
+        $renderer->diff = $this;
+        return $renderer->render();
+    }
+}
+');
+        self::assertSame(
+            ['Diff_Renderer_Abstract' => ['diff' => 'Diff']],
+            $result->propertyAssignedClasses,
+        );
+    }
+
+    public function testExternalPropertyAssignmentOfAnythingOtherThanThisIsNotTracked(): void
+    {
+        // Only $this (a variable/property gaining the *current* instance) is evidenced — an
+        // ordinary $renderer->diff = $some_other_var; must not be misread as this shape.
+        $result = $this->parse('<?php
+class Diff {
+    public function render(Diff_Renderer_Abstract $renderer) {
+        $renderer->diff = $some_other_var;
+    }
+}
+');
+        self::assertSame([], $result->propertyAssignedClasses);
+    }
+
     public function testPropertyAssignedFromAnUntypedParameterIsNotTracked(): void
     {
         // No type hint at all -- nothing for $varTypesStack to have recorded, so there's no

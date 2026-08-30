@@ -14,8 +14,25 @@ final class PhpTokenParser
     private const HOOK_REGISTER_FUNCS = ['add_action', 'add_filter'];
     private const HOOK_INVOKE_FUNCS = ['do_action', 'apply_filters', 'do_action_ref_array', 'apply_filters_ref_array'];
     // Hook tag argument position (0-indexed) for WP-Cron scheduling calls — the hook itself
-    // fires later inside WP-Cron core, not via a visible do_action() in project code.
-    private const CRON_SCHEDULE_FUNCS = ['wp_schedule_event' => 2, 'wp_schedule_single_event' => 1];
+    // fires later inside WP-Cron core, not via a visible do_action() in project code. The
+    // as_*_action() entries are Action Scheduler's own equivalent — a widely-bundled standalone
+    // library (WooCommerce, wpforms-lite, and many other plugins each ship their own copy)
+    // providing the exact same "schedule a hook name, it fires later via a cron-like runner"
+    // shape, just a different function family this dispatch was blind to entirely. Confirmed
+    // real-world (WooCommerce): `as_schedule_recurring_action($time, DAY_IN_SECONDS,
+    // 'wc_admin_daily_wrapper', ...)`/`as_schedule_single_action($time,
+    // 'generate_category_lookup_table_wrapper', ...)` — both real add_action()-registered hooks,
+    // flagged UnmatchedHook purely because Action Scheduler's own scheduling call was invisible.
+    // Argument positions taken directly from Action Scheduler's own published function
+    // signatures (function-scheduler.php in the library itself).
+    private const CRON_SCHEDULE_FUNCS = [
+        'wp_schedule_event' => 2,
+        'wp_schedule_single_event' => 1,
+        'as_enqueue_async_action' => 0,
+        'as_schedule_single_action' => 1,
+        'as_schedule_recurring_action' => 2,
+        'as_schedule_cron_action' => 2,
+    ];
     // get_header()/get_footer()/get_sidebar() are WP core's own three template-hierarchy loader
     // functions — each gets its own filename-stem prefix rewrite in parseTemplateRef() (arg 0
     // 'kiosk' => 'header-kiosk.php'), a WP-core-specific convention no third-party wrapper
@@ -836,6 +853,40 @@ final class PhpTokenParser
                             [$methodName, $methodNameIndex] = $target;
                             $scopedMethodCalls[] = new ScopedMethodCall($trackedClass, $methodName);
                             $i = $methodNameIndex;
+                        } else {
+                            // $typedParam->prop = $this; — the exact inverse of $this->prop =
+                            // new X() above: here the assignment TARGET is an external, type-
+                            // hinted variable, and the VALUE stored is the current instance.
+                            // Real-world shape (Wordfence's bundled Diff library):
+                            // `function render(Diff_Renderer_Abstract $renderer) {
+                            // $renderer->diff = $this; return $renderer->render(); }` — read back
+                            // later inside a *subclass* of Diff_Renderer_Abstract as
+                            // `$this->diff->getA()`, resolved by ClassAnalyzer's own ancestor-
+                            // chain fallback (the mirror direction of its existing descendant
+                            // fallback, since here the property is assigned against the exact
+                            // declared type while the read happens in a concrete subclass of it).
+                            // Written into the SAME $propertyAssignedClasses map the $this->prop
+                            // branch above already populates, just keyed by the target's own
+                            // tracked type instead of the current class — no separate merge step
+                            // needed anywhere downstream.
+                            $propTarget = $this->propertyAccessTarget($tokens, $i);
+                            if ($propTarget !== null) {
+                                [$propName, $propNameIndex] = $propTarget;
+                                $afterPropIndex = $this->peekNextMeaningfulIndex($tokens, $propNameIndex);
+                                if ($afterPropIndex !== null && $tokens[$afterPropIndex] === '=') {
+                                    $rhsIndex = $this->peekNextMeaningfulIndex($tokens, $afterPropIndex);
+                                    $afterRhsIndex = $rhsIndex !== null ? $this->peekNextMeaningfulIndex($tokens, $rhsIndex) : null;
+                                    if (
+                                        $rhsIndex !== null && is_array($tokens[$rhsIndex]) && $tokens[$rhsIndex][0] === T_VARIABLE && $tokens[$rhsIndex][1] === '$this'
+                                        && $afterRhsIndex !== null && $tokens[$afterRhsIndex] === ';'
+                                    ) {
+                                        $currentClassFqcn = empty($classNameStack) ? null : end($classNameStack);
+                                        if ($currentClassFqcn !== null) {
+                                            $propertyAssignedClasses[$trackedClass][$propName] = $currentClassFqcn;
+                                        }
+                                    }
+                                }
+                            }
                         }
                     } else {
                         $pendingCall = $varPendingCallStack[$scopeTop][$value] ?? null;

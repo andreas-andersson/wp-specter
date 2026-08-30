@@ -942,6 +942,142 @@ not shipped bugs.
   shows every other finding count unchanged and no crashes; full suite (539 tests) and phpstan
   both green.
 
+- [x] **`ClassAnalyzer`'s whole-class exemption (`FULLY_EXEMPT_BASE_CLASSES` — e.g. Roots Acorn's
+  `View\Composer`) had no equivalent at the file level.** `--type=classes` already correctly
+  showed an exempt-base-class subclass as used (`isFullyExemptClass()`), but `FileAnalyzer` had
+  zero cross-talk with that decision — a file containing nothing but one of these classes was
+  still flagged `UnusedFile`. Found by a fresh gap-hunting pass, first time the newly-added Sage
+  theme (a real Roots Acorn theme) got any attention: `app/View/Composers/{App,Comments,
+  Post}.php` each declare a single `class X extends Composer`, discovered entirely by Acorn's
+  own filesystem convention and never referenced by name anywhere in the theme — `--type=classes`
+  showed "✓ All clear" while `--type=files` still flagged all three.
+
+  Fixed by sharing the exact same decision instead of duplicating or approximating it:
+  `ClassAnalyzer::isFullyExemptClass()` is now `public static` (it never used instance state to
+  begin with) so `FileAnalyzer` can call it directly. New `FileAnalyzer::loadFullyExemptFiles()`
+  builds a file => bool map: a file is exempt only when *every* class it declares is fully
+  exempt — a file mixing an exempt class with something else (another class, a helper function)
+  isn't safe to exempt wholesale, since whatever else lives there might still need a real usage
+  reference. Any current or future `FULLY_EXEMPT_BASE_CLASSES` entry gets this same file-level
+  treatment automatically, for free — not something scoped to Acorn/Sage specifically.
+
+  Verified: 2 new `FileAnalyzerTest` cases (the real Sage shape, and a mixed-file case confirming
+  the fix doesn't over-correct) plus the existing `ClassAnalyzerTest` coverage for
+  `isFullyExemptClass()` itself, unchanged; real Sage corpus — all three `View\Composers\*.php`
+  files no longer flagged, theme's unused-file count dropped from 4 to 1 (the one remaining find,
+  `app/filters.php`, is a separate, unrelated gap — `locate_template()` isn't yet a recognized
+  template-loading call — left undone since the real shape there, an array iterated via a Laravel
+  collection's `->each()` closure rather than a plain `foreach`, is a harder pattern to generalize
+  than this fix and has only this one data point so far); full 20-target corpus sanity pass shows
+  every other finding count unchanged and no crashes; full suite (541 tests) and phpstan both
+  green.
+
+- [x] **Action Scheduler's own scheduling functions weren't recognized as firing a hook, the
+  exact same shape `wp_schedule_event`/`wp_schedule_single_event` already were.** Action
+  Scheduler is a widely-bundled standalone library — WooCommerce, wpforms-lite, and many other
+  plugins each ship their own copy — providing `as_enqueue_async_action()`/
+  `as_schedule_single_action()`/`as_schedule_recurring_action()`/`as_schedule_cron_action()`,
+  each scheduling a hook name that fires later via the library's own cron-like runner rather
+  than a visible `do_action()` in project code. `CRON_SCHEDULE_FUNCS` (the function-name =>
+  hook-argument-position map already driving `wp_schedule_event`'s own recognition) simply
+  didn't list any of these four. Found by a fresh gap-hunting pass: WooCommerce's
+  `includes/class-woocommerce.php` calls `as_schedule_recurring_action($tomorrow_3am,
+  DAY_IN_SECONDS, 'wc_admin_daily_wrapper', ...)` and `as_schedule_single_action(time() + 10,
+  'generate_category_lookup_table_wrapper', ...)` — both real, `add_action()`-registered hooks,
+  flagged `UnmatchedHook` purely because the scheduling call itself was invisible; confirmed
+  independently in wpforms-lite's `src/Tasks/Task.php` calling the same two functions.
+
+  Fixed by simply adding the four function names to the existing map — no new mechanism needed,
+  `parseCronScheduleHook()` was already fully generic over argument position. Argument positions
+  taken from, and confirmed directly against, Action Scheduler's own real bundled source
+  (`packages/action-scheduler/functions.php`) rather than assumed from documentation alone: hook
+  is argument 0 for `as_enqueue_async_action`, 1 for `as_schedule_single_action`, and 2 for both
+  `as_schedule_recurring_action` and `as_schedule_cron_action`.
+
+  Verified: 4 new `HookAnalyzerTest` cases (one per function, two modeled directly on the real
+  WooCommerce call sites above); real WooCommerce corpus — both named hooks no longer flagged,
+  plugin's unmatched-hook count dropped from 63 to 51; full 20-target corpus sanity pass shows
+  every other finding count unchanged and no crashes; full suite (545 tests) and phpstan both
+  green.
+
+- [x] **PHPUnit/WP-test-suite test case classes weren't recognized as a reflection-discovered
+  base class, the same category `FULLY_EXEMPT_BASE_CLASSES` already covers for Roots Acorn's
+  `View\Composer`.** A `TestCase`/`WP_UnitTestCase` subclass's `test*` methods (plus
+  `setUp`/`tearDown`/...) are discovered and called by the test runner via reflection over the
+  class itself — never a literal call anywhere in project code — so every test class in a
+  project's own bundled test suite looked like dead code. Found by a fresh gap-hunting pass,
+  confirmed independently in **two** real-world projects: WP Rig theme's own test suite
+  (`tests/phpunit/...`, chaining through an intermediate project-own base class,
+  `Component_Test extends Unit_Test_Case extends TestCase`, before finally reaching
+  `PHPUnit\Framework\TestCase`) and wp-smushit's bundled `wpmudev-analytics` test
+  (`class Test_WPMUDEV_Analytics extends WP_UnitTestCase`).
+
+  Fixed by adding two entries to the existing `FULLY_EXEMPT_BASE_CLASSES` list — no new mechanism
+  needed, the existing multi-level extends-chain walk (built for cases like
+  `Walker_Nav_Menu -> Walker`) already handles WP Rig's intermediate-base-class shape for free:
+  `'TestCase' => 'PHPUnit\Framework\TestCase'` and `'WP_UnitTestCase' => 'WP_UnitTestCase'`
+  (itself with no namespace to import — a WP-core-test-suite global class — so its own entry
+  relies on the existing "`$ref->fqcn === $ref->short`" leniency for an un-namespaced extends,
+  already built for exactly this kind of case). As a side effect of the earlier
+  `FULLY_EXEMPT_BASE_CLASSES`/`FileAnalyzer` cross-talk fix (see above), this same exemption now
+  also correctly applies at the file level automatically, with no extra work.
+
+  Verified: 2 new `ClassAnalyzerTest` cases (the `WP_UnitTestCase` shape with no import, and the
+  multi-level `TestCase` chain); real corpus — wp-smushit's `Test_WPMUDEV_Analytics` no longer
+  flagged (unused-class count 10 → 9), WP Rig's entire test suite no longer flagged (unused-class
+  count 7 → 0, unused-method count 9 → 7); full 20-target corpus sanity pass shows every other
+  finding count unchanged and no crashes; full suite (547 tests) and phpstan both green.
+
+- [x] **A property assigned *externally*, against the exact declared type of a typed parameter
+  or property, was invisible to `$propertyAssignedClasses` entirely — the exact inverse of the
+  already-tracked `$this->prop = new X()`/`$this->prop = $typedParam` shapes, where `$this` is
+  always the *receiver* of the assignment, never the *value* being stored into someone else's
+  property.** Found by a fresh gap-hunting pass: Wordfence's bundled `lib/Diff.php` —
+  `function render(Diff_Renderer_Abstract $renderer) { $renderer->diff = $this; return
+  $renderer->render(); }` — populates a *different* object's property with the current instance.
+  The real read site, `$this->diff->getA()`/`getB()`/`getGroupedOpcodes()`, lives inside
+  `Diff_Renderer_Html_Array extends Diff_Renderer_Abstract` — a second, independent gap once the
+  assignment itself became visible: the property is assigned against the exact *declared* type
+  (`Diff_Renderer_Abstract`), but read from a *concrete subclass* of it, the mirror direction of
+  the Yoast SEO base-class-property case (there, assignment happened in a descendant and the read
+  in the base; here, assignment happens at the base type and the read is in a descendant).
+
+  Fixed in two matching parts:
+  1. `PhpTokenParser` now recognizes `$typedVar->prop = $this;` (the general, non-`$this` variable
+     branch already tracking `$var = new ClassName()`/`$var->method()` gained a new case: when
+     the variable isn't being reassigned or called on, check whether it's `->prop = $this;`
+     instead) and writes into the *same* `$propertyAssignedClasses` map the existing `$this->prop
+     = ...` tracking already populates — just keyed by the variable's own tracked declared type
+     rather than the current class. No new `ParseResult` field or merge step needed anywhere
+     downstream; every existing consumer of that map benefits for free.
+  2. `ClassAnalyzer`'s `propertyMethodCalls` resolution gained a new **ancestor**-chain fallback
+     (alongside the existing Yoast SEO **descendant**-chain one) — when a property read's direct
+     lookup misses, walk `$call->ownerClass`'s own `extends` chain upward looking for the first
+     ancestor the property was actually assigned against.
+
+  The ancestor-chain fallback turned out to generalize well beyond the case that motivated it:
+  it also fixes the much more common classic OOP shape it had no connection to originally — a
+  property assigned via a completely ordinary `$this->prop = $typedParam;` in a **base class's
+  own constructor**, then read via ordinary inherited `$this->prop->method()` access from a
+  method declared directly on a **subclass**. Confirmed real and unrelated to the Wordfence
+  Diff-specific parser addition: WordPress SEO's `Abstract_Aioseo_Importing_Action::__construct`
+  assigns `$this->import_cursor = $import_cursor;` (a plain typed constructor parameter, same
+  shape the Yoast SEO fix earlier this session already handles) — but the actual
+  `$this->import_cursor->get_cursor()`/`set_cursor()` reads happen in
+  `Abstract_Aioseo_Settings_Importing_Action extends Abstract_Aioseo_Importing_Action`'s own
+  methods, a shape neither the direct lookup nor the existing descendant fallback could ever
+  reach.
+
+  Verified: 2 new `PhpTokenParserTest` cases (the real Wordfence shape, and a negative case
+  confirming only `$this` specifically triggers this — an ordinary `$var->prop = $other_var;`
+  must not be misread) and 1 new `ClassAnalyzerTest` end-to-end case modeled on the real Wordfence
+  shape; real Wordfence corpus — `getA`/`getB`/`getGroupedOpcodes` no longer flagged; full
+  20-target corpus sanity pass shows the ancestor-fallback's broader value directly: Wordfence
+  -3 unused methods, but also Elementor -12, WooCommerce -9, WordPress SEO -9, wp-smushit -2,
+  wpforms-lite -3 (all spot-checked via WordPress SEO's `import_cursor` case above — genuine,
+  previously-unreachable true resolutions, not over-broad suppressions) and no crashes anywhere;
+  full suite (550 tests) and phpstan both green.
+
 - [x] **Legacy `spl_autoload_register()` class-map callbacks — partially recognized, known
   remaining gap accepted as-is.** Pre-Composer (or hybrid) WP plugins sometimes register their
   own autoloader mapping class name → file path in code, rather than declaring `composer.json`

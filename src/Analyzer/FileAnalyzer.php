@@ -81,6 +81,16 @@ final class FileAnalyzer
      *   isProjectAutoloadedClassUsed) doesn't hold for a hand-rolled autoloader in general.
      */
     private array $autoloadRegisterExemptDirs = [];
+    /**
+     * @var array<string,true> Absolute file => true, for a file whose every top-level class is
+     *   already exempted whole-cloth by ClassAnalyzer::isFullyExemptClass() (e.g. Roots Acorn's
+     *   View\Composer — discovered by Acorn's own filesystem convention, never referenced by
+     *   name anywhere in project code). ClassAnalyzer already gets this exactly right at the
+     *   class level; this analyzer previously had no equivalent at the file level, so a file
+     *   containing nothing but one of these classes was still flagged UnusedFile even when
+     *   `--type=classes` correctly showed it as used. See loadFullyExemptFiles().
+     */
+    private array $fullyExemptFiles = [];
 
     public function __construct(private readonly PhpTokenParser $parser) {}
 
@@ -99,10 +109,11 @@ final class FileAnalyzer
         $this->loadComposerAutoloadPaths($rootDir);
         $this->loadDynamicLoadExemptDirs($parseResults, $rootDir);
         $this->loadReferencedClassNames($parseResults);
+        $this->loadFullyExemptFiles($parseResults);
         $findings = [];
 
         foreach ($files as $file) {
-            if (!$this->isCandidate($file, $rootDir)) {
+            if (!$this->isCandidate($file, $rootDir) || isset($this->fullyExemptFiles[$file])) {
                 continue;
             }
 
@@ -527,6 +538,40 @@ final class FileAnalyzer
             // whether or not that particular literal was ever meant as a class reference.
             foreach ($result->functionCalls as $call) {
                 $this->referencedClassNames[$call->name] = true;
+            }
+        }
+    }
+
+    /**
+     * @param list<\WpSpecter\Parser\ParseResult> $parseResults
+     */
+    private function loadFullyExemptFiles(array $parseResults): void
+    {
+        $this->fullyExemptFiles = [];
+
+        $classDefsByName = [];
+        $classesByFile = [];
+        foreach ($parseResults as $result) {
+            foreach ($result->classDefs as $def) {
+                $classDefsByName[$def->fqcn] = $def;
+                $classesByFile[$def->file][] = $def;
+            }
+        }
+
+        foreach ($classesByFile as $file => $defs) {
+            // A file mixing an exempt class with something else (another class, a plain
+            // function) isn't safe to exempt wholesale — only when EVERY class it declares is
+            // one ClassAnalyzer would already treat as fully exempt does the file itself carry
+            // no name a real usage reference could ever point at.
+            $allExempt = true;
+            foreach ($defs as $def) {
+                if (!ClassAnalyzer::isFullyExemptClass($def->fqcn, $classDefsByName)) {
+                    $allExempt = false;
+                    break;
+                }
+            }
+            if ($allExempt) {
+                $this->fullyExemptFiles[$file] = true;
             }
         }
     }

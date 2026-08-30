@@ -1024,6 +1024,40 @@ class Concrete_Repository extends Abstract_Repository {
         self::assertContains('truly_unused', $unusedMethods);
     }
 
+    public function testCreditsMethodOnAPropertyAssignedExternallyOntoATypedParameter(): void
+    {
+        // Real-world finding (Wordfence's bundled Diff library): the mirror direction of the
+        // Yoast SEO case just above. Diff::render(Diff_Renderer_Abstract $renderer) assigns
+        // `$renderer->diff = $this;` — the property is populated externally, against the exact
+        // declared parameter type, by a completely different class (Diff). The actual read,
+        // `$this->diff->getA()`, happens inside a *concrete subclass* of Diff_Renderer_Abstract
+        // — the base class's own extends chain must be walked upward from the subclass to find
+        // where the property was assigned, the opposite direction from the descendant fallback
+        // the Yoast SEO case needed.
+        $file = $this->write('<?php
+class Diff {
+    public function getA() {}
+    public function truly_unused() {}
+    public function render(Diff_Renderer_Abstract $renderer) {
+        $renderer->diff = $this;
+        return $renderer->render();
+    }
+}
+abstract class Diff_Renderer_Abstract {
+    public $diff;
+}
+class Diff_Renderer_Html_Array extends Diff_Renderer_Abstract {
+    public function render() {
+        return $this->diff->getA();
+    }
+}
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('getA', $unusedMethods);
+        self::assertContains('truly_unused', $unusedMethods);
+    }
+
     public function testExcludesInterfaceContractMethods(): void
     {
         $file = $this->write('<?php
@@ -1316,6 +1350,46 @@ class Not_A_Composer {
         $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
         $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
         self::assertContains('siteName', $unusedMethods);
+    }
+
+    public function testExcludesWpUnitTestCaseSubclassFromUnusedClasses(): void
+    {
+        // Real-world finding (wp-smushit): class Test_WPMUDEV_Analytics extends
+        // WP_UnitTestCase — every test* method (plus setUp/tearDown) is discovered and called by
+        // the PHPUnit/WP test runner via reflection over the class itself, never a literal call
+        // anywhere in project code. WP_UnitTestCase has no namespace to import, so this also
+        // exercises the "$ref->fqcn === $ref->short" leniency path with no `use` import at all.
+        $file = $this->write('<?php
+class Test_My_Feature extends WP_UnitTestCase {
+    public function test_it_works() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        self::assertEmpty(array_filter($findings, fn($f) => $f->type === FindingType::UnusedClass));
+        self::assertEmpty(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod));
+    }
+
+    public function testExcludesPhpunitTestCaseSubclassThroughMultiLevelExtendsChain(): void
+    {
+        // Real-world finding (WP Rig theme): its own test suite chains through an
+        // intermediate, project-own base class before finally reaching PHPUnit\Framework\
+        // TestCase — Component_Test extends Unit_Test_Case extends TestCase. The existing
+        // extends-chain walk this list already does for other entries (Walker_Nav_Menu -> Walker,
+        // etc.) handles this multi-level case for free, with no special-casing needed.
+        $file = $this->write('<?php
+use PHPUnit\Framework\TestCase;
+
+abstract class Unit_Test_Case extends TestCase {}
+
+class Component_Test extends Unit_Test_Case {
+    public function test_component_registers() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedClasses = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedClass), 'name');
+        self::assertNotContains('Component_Test', $unusedClasses);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('test_component_registers', $unusedMethods);
     }
 
     public function testFullyExemptBaseClassStillAppliesWhenImportResolvesToTheRealFqcn(): void
