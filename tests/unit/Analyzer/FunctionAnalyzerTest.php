@@ -386,6 +386,24 @@ class My_Controller {
         self::assertEmpty($this->analyzer->analyze([$file]));
     }
 
+    public function testAnalyzeForwardsProgressCallbackToParseAll(): void
+    {
+        // Every analyzer's analyze() just delegates its own parsing to PhpTokenParser::
+        // parseAll() (see that method's own test coverage for the throttling/reporting logic
+        // itself) — this only confirms the callback actually reaches it end to end, using
+        // FunctionAnalyzer as the representative case since all 5 analyzers share the identical
+        // one-line plumbing.
+        $fileA = $this->write('<?php function a() {}');
+        $fileB = $this->write('<?php function b() {}');
+
+        $calls = [];
+        $this->analyzer->analyze([$fileA, $fileB], function (int $current, int $total) use (&$calls) {
+            $calls[] = [$current, $total];
+        });
+
+        self::assertSame([[1, 2], [2, 2]], $calls);
+    }
+
     private function write(string $code): string
     {
         $file = $this->tmp . '/test_' . uniqid() . '.php';

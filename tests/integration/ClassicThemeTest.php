@@ -80,6 +80,22 @@ final class ClassicThemeTest extends TestCase
         self::assertStringNotContainsString("\e[", $output);
     }
 
+    public function testNoProgressbarFlagIsAcceptedAndDoesNotChangeFindings(): void
+    {
+        // The flag's actual effect (forcing the progress bar off even in a real interactive
+        // terminal) isn't observable from an in-process test — stdout is never a real TTY while
+        // PHPUnit captures output regardless of this flag (see WP_SPECTER_NO_PROGRESS in
+        // phpunit.xml, which already suppresses it for every test the same way). This only
+        // confirms the flag parses as a recognized option and leaves the actual scan unaffected.
+        ob_start();
+        $exit = $this->app->run(['wp-specter', 'scan', $this->fixture, '--no-color', '--no-progressbar']);
+        $output = ob_get_clean();
+        self::assertIsString($output);
+
+        self::assertSame(1, $exit);
+        self::assertStringContainsString('classic_orphaned_helper', $output);
+    }
+
     public function testColorOutputContainsAnsiCodes(): void
     {
         ob_start();

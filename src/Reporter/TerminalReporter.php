@@ -12,7 +12,69 @@ use WpSpecter\Scan\ScanTarget;
 
 final class TerminalReporter
 {
-    public function __construct(private readonly bool $noColor = false) {}
+    private bool $progressActive = false;
+    // Last whole percentage actually drawn, or null at the start of a fresh phase (reset by
+    // finishProgress()) — throttles redraws to at most one per percentage point instead of one
+    // per file. A multi-thousand-file scan calls this once per file; redrawing the terminal that
+    // often buys nothing visually (a human can't perceive it) and costs a real, avoidable syscall
+    // per file.
+    private ?int $lastRenderedPercent = null;
+
+    /**
+     * @param ?bool $forceTty Overrides the real stream_isatty(STDOUT) auto-detection used to
+     *   decide whether printProgress() renders anything — null (default) means "detect for
+     *   real." Exists only so a test can exercise the actual rendering/throttling logic: real
+     *   stdout is never a TTY while PHPUnit captures output, so there'd otherwise be no way to
+     *   observe anything printProgress() does.
+     */
+    public function __construct(private readonly bool $noColor = false, private readonly ?bool $forceTty = null) {}
+
+    /**
+     * Renders/updates a single in-place progress bar via `\r` — meant to be passed straight as
+     * an analyzer's $onProgress callback (see PhpTokenParser::parseAll()). A no-op whenever
+     * stdout isn't a real terminal (piped output, a redirected log file, CI, the test suite's own
+     * captured output) — `\r`-driven redraws only make sense in an interactive terminal, and
+     * would otherwise just litter a log file with carriage returns.
+     */
+    public function printProgress(string $label, int $current, int $total): void
+    {
+        if (!$this->supportsProgress()) {
+            return;
+        }
+        $ratio = $total > 0 ? $current / $total : 1.0;
+        $pct = (int) floor($ratio * 100);
+        // Always draw the very first call of a phase (so the bar appears immediately rather than
+        // waiting for the percentage to first tick over) and the very last (so it visibly
+        // reaches 100% instead of freezing one tick early) — otherwise skip a redraw that
+        // wouldn't change what's on screen.
+        if ($current !== 1 && $current !== $total && $pct === $this->lastRenderedPercent) {
+            return;
+        }
+        $this->lastRenderedPercent = $pct;
+
+        $width = 24;
+        $filled = (int) floor($width * $ratio);
+        $bar = str_repeat('█', $filled) . str_repeat('░', $width - $filled);
+        // \033[K clears the rest of the line first, so a shorter render (e.g. a smaller total on
+        // the next analyzer stage) never leaves stray characters from a longer previous one.
+        echo "\r\033[K" . sprintf('  %-11s [%s] %3d%% (%d/%d)', $label, $bar, $pct, $current, $total);
+        $this->progressActive = true;
+    }
+
+    /** Moves past an in-place progress bar so subsequent normal output starts on its own line. */
+    public function finishProgress(): void
+    {
+        if ($this->progressActive) {
+            echo PHP_EOL;
+            $this->progressActive = false;
+        }
+        $this->lastRenderedPercent = null;
+    }
+
+    private function supportsProgress(): bool
+    {
+        return $this->forceTty ?? (\defined('STDOUT') && @stream_isatty(STDOUT));
+    }
 
     public function printHeader(string $path, ?WpMode $mode, int $fileCount): void
     {

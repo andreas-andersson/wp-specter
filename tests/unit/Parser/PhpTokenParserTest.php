@@ -1888,6 +1888,41 @@ helper();
         self::assertSame('Vendor\Pkg\helper', $result->functionCalls[0]->extraCandidateFqcn);
     }
 
+    public function testParseAllParsesEveryFileInOrderAndReportsProgress(): void
+    {
+        $fileA = $this->tmp . '/a.php';
+        $fileB = $this->tmp . '/b.php';
+        $fileC = $this->tmp . '/c.php';
+        file_put_contents($fileA, '<?php function a_func() {}');
+        file_put_contents($fileB, '<?php function b_func() {}');
+        file_put_contents($fileC, '<?php function c_func() {}');
+
+        $progressCalls = [];
+        $results = $this->parser->parseAll(
+            [$fileA, $fileB, $fileC],
+            function (int $current, int $total) use (&$progressCalls) {
+                $progressCalls[] = [$current, $total];
+            },
+        );
+
+        self::assertSame(['a_func', 'b_func', 'c_func'], array_map(
+            fn($r) => $r->functionDefs[0]->name,
+            $results,
+        ));
+        self::assertSame([[1, 3], [2, 3], [3, 3]], $progressCalls);
+    }
+
+    public function testParseAllNeverCallsProgressForAnEmptyFileList(): void
+    {
+        $called = false;
+        $results = $this->parser->parseAll([], function () use (&$called) {
+            $called = true;
+        });
+
+        self::assertSame([], $results);
+        self::assertFalse($called);
+    }
+
     private function parse(string $code): \WpSpecter\Parser\ParseResult
     {
         $file = $this->tmp . '/test_' . uniqid() . '.php';

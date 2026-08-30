@@ -22,6 +22,7 @@ final class Config
         public readonly bool $generateBaseline = false,
         public readonly bool $noVendorReflection = false,
         public readonly bool $noSuppressUnusedClassMethods = false,
+        public readonly bool $noProgressbar = false,
     ) {}
 
     public function wantsType(string $type): bool

@@ -185,11 +185,12 @@ final class ClassAnalyzer
      *   the class finding already says nothing in it is reachable, so the method finding adds
      *   no new information. Pass false to report both regardless (see --no-suppress-unused-
      *   class-methods).
+     * @param (callable(int, int): void)|null $onProgress See PhpTokenParser::parseAll().
      * @return list<Finding>
      */
-    public function analyze(array $files, array $vendorAutoloadPaths = [], bool $suppressUnusedClassMethods = true): array
+    public function analyze(array $files, array $vendorAutoloadPaths = [], bool $suppressUnusedClassMethods = true, ?callable $onProgress = null): array
     {
-        $parseResults = array_map(fn(string $f) => $this->parser->parse($f), $files);
+        $parseResults = $this->parser->parseAll($files, $onProgress);
 
         // Keyed by FQCN, not short name — two unrelated classes sharing a short name across
         // different namespaces (real-world case: Elementor's two distinct `Base_Route` classes)

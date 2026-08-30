@@ -14,4 +14,11 @@
             <directory>tests/integration</directory>
         </testsuite>
     </testsuites>
+    <php>
+        <!-- Integration tests drive Application::run() in-process (no subprocess boundary to
+             hide a real terminal behind), so the progress bar's own TTY auto-detection would
+             otherwise make captured output depend on whether the suite happens to be run from an
+             interactive terminal or a piped/CI context. See Application::parseArgs(). -->
+        <env name="WP_SPECTER_NO_PROGRESS" value="1"/>
+    </php>
 </phpunit>

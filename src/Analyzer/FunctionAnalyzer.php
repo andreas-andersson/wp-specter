@@ -29,11 +29,12 @@ final class FunctionAnalyzer
      * the same conservative bias this analyzer already takes everywhere else.
      *
      * @param list<string> $files
+     * @param (callable(int, int): void)|null $onProgress See PhpTokenParser::parseAll().
      * @return list<Finding>
      */
-    public function analyze(array $files): array
+    public function analyze(array $files, ?callable $onProgress = null): array
     {
-        $parseResults = array_map(fn(string $f) => $this->parser->parse($f), $files);
+        $parseResults = $this->parser->parseAll($files, $onProgress);
 
         // Pass 1: collect all definitions (skip class methods, magic methods, and real
         // function_exists()-guarded polyfills — see isExcluded()'s own docblock)

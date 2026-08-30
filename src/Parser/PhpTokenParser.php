@@ -63,6 +63,31 @@ final class PhpTokenParser
         'mixed', 'void', 'never', 'null', 'false', 'true',
     ];
 
+    /**
+     * Parses every file in order, reporting progress as it goes — the shared entry point every
+     * analyzer's own `analyze()` uses instead of its own `array_map(fn($f) => $this->parser->
+     * parse($f), $files)`, so a single change here (or a single progress-reporting mechanism)
+     * covers all of them instead of five independent copies.
+     *
+     * @param list<string> $files
+     * @param (callable(int, int): void)|null $onProgress Called after each file with (files
+     *   parsed so far, total files) — e.g. to drive a progress bar. Never called when $files is
+     *   empty.
+     * @return list<ParseResult>
+     */
+    public function parseAll(array $files, ?callable $onProgress = null): array
+    {
+        $total = count($files);
+        $results = [];
+        foreach ($files as $index => $file) {
+            $results[] = $this->parse($file);
+            if ($onProgress !== null) {
+                $onProgress($index + 1, $total);
+            }
+        }
+        return $results;
+    }
+
     public function parse(string $file): ParseResult
     {
         $code = file_get_contents($file);

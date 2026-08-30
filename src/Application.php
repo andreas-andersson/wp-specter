@@ -85,6 +85,10 @@ class Application
                                   reported as an unused class is dropped from the unused-method
                                   findings (redundant — the class finding already covers it).
                                   Pass this flag to report both.
+          --no-progressbar       Disable the in-place progress bar shown per analysis phase.
+                                  It already auto-hides for piped/redirected output; pass this to
+                                  also suppress it in an interactive terminal (also settable via
+                                  the WP_SPECTER_NO_PROGRESS env var).
 
         Generate-stubs options:
           --output=<file>        Output path for the stubs file (default: .wp-specter.stubs.json)
@@ -272,7 +276,7 @@ class Application
             $allFiles = array_merge($allFiles, $scanResult->files);
         }
 
-        $reporter = new TerminalReporter($config->noColor);
+        $reporter = new TerminalReporter($config->noColor, forceTty: $config->noProgressbar ? false : null);
         if ($projectInfo !== null) {
             $reporter->printProjectHeader($projectInfo->root, $targets, count($allFiles), $projectInfo->sourceLabel, $projectInfo->targetsNote);
         } else {
@@ -286,11 +290,13 @@ class Application
         // hook that its companion plugin fires (or vice versa) is a normal, correct pattern in
         // a multi-target project, not a false "unmatched".
         if ($config->wantsType('functions')) {
-            $findings = array_merge($findings, (new FunctionAnalyzer($parser))->analyze($allFiles));
+            $findings = array_merge($findings, (new FunctionAnalyzer($parser))->analyze($allFiles, $this->progressCallback($reporter, 'Functions')));
+            $reporter->finishProgress();
         }
 
         if ($config->wantsType('hooks')) {
-            $findings = array_merge($findings, (new HookAnalyzer($parser))->analyze($allFiles));
+            $findings = array_merge($findings, (new HookAnalyzer($parser))->analyze($allFiles, $this->progressCallback($reporter, 'Hooks')));
+            $reporter->finishProgress();
         }
 
         if ($config->wantsType('classes')) {
@@ -303,7 +309,9 @@ class Application
                 $allFiles,
                 $vendorAutoloadPaths,
                 !$config->noSuppressUnusedClassMethods,
+                $this->progressCallback($reporter, 'Classes'),
             ));
+            $reporter->finishProgress();
         }
 
         // Templates and files need a specific root to know what's "root-level" and which mode's
@@ -320,12 +328,16 @@ class Application
             // recognize those wrapper functions and `TemplateAnalyzer`'s own partial-match
             // resolution was fixed to work against a plugin's directory-nested template files the
             // same way it already did for a theme's root-level ones.
+            $targetLabel = count($targets) > 1 ? " ({$target->name})" : '';
+
             if ($config->wantsType('templates') && $target->mode !== null) {
-                $findings = array_merge($findings, (new TemplateAnalyzer($parser, $modeDetector))->analyze($allFiles, $target->mode, $target->path));
+                $findings = array_merge($findings, (new TemplateAnalyzer($parser, $modeDetector))->analyze($allFiles, $target->mode, $target->path, $this->progressCallback($reporter, 'Templates' . $targetLabel)));
+                $reporter->finishProgress();
             }
 
             if ($config->wantsType('files')) {
-                $findings = array_merge($findings, (new FileAnalyzer($parser))->analyze($allFiles, $target->path));
+                $findings = array_merge($findings, (new FileAnalyzer($parser))->analyze($allFiles, $target->path, $this->progressCallback($reporter, 'Files' . $targetLabel)));
+                $reporter->finishProgress();
             }
         }
 
@@ -590,6 +602,13 @@ class Application
      * classes the other doesn't. Returns an empty list when neither exists; the reflection
      * fallback is simply unavailable then, same as it always was before this existed.
      *
+    /** @return callable(int, int): void */
+    private function progressCallback(TerminalReporter $reporter, string $label): callable
+    {
+        return static fn(int $current, int $total) => $reporter->printProgress($label, $current, $total);
+    }
+
+    /**
      * @param list<ScanTarget> $targets
      * @return list<string>
      */
@@ -645,6 +664,13 @@ class Application
         $generateBaseline = false;
         $noVendorReflection = false;
         $noSuppressUnusedClassMethods = false;
+        // Also defaulted on via the WP_SPECTER_NO_PROGRESS env var — set once in phpunit.xml so
+        // every test that drives Application::run() in-process (there's no subprocess boundary
+        // to hide a real terminal's TTY-ness behind) gets deterministic output regardless of
+        // whether the developer happens to be running the suite from an actual interactive
+        // terminal or a piped/CI context. The CLI flag remains the primary, documented way for a
+        // real end user to opt out.
+        $noProgressbar = getenv('WP_SPECTER_NO_PROGRESS') !== false;
 
         foreach ($args as $arg) {
             if (str_starts_with($arg, '--stubs=')) {
@@ -678,6 +704,8 @@ class Application
                 $noVendorReflection = true;
             } elseif ($arg === '--no-suppress-unused-class-methods') {
                 $noSuppressUnusedClassMethods = true;
+            } elseif ($arg === '--no-progressbar') {
+                $noProgressbar = true;
             } elseif (!str_starts_with($arg, '--')) {
                 $path = $arg;
             } else {
@@ -724,6 +752,7 @@ class Application
             generateBaseline: $generateBaseline,
             noVendorReflection: $noVendorReflection,
             noSuppressUnusedClassMethods: $noSuppressUnusedClassMethods,
+            noProgressbar: $noProgressbar,
         );
     }
 

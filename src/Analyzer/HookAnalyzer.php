@@ -16,11 +16,12 @@ final class HookAnalyzer
 
     /**
      * @param list<string> $files
+     * @param (callable(int, int): void)|null $onProgress See PhpTokenParser::parseAll().
      * @return list<Finding>
      */
-    public function analyze(array $files): array
+    public function analyze(array $files, ?callable $onProgress = null): array
     {
-        $parseResults = array_map(fn(string $f) => $this->parser->parse($f), $files);
+        $parseResults = $this->parser->parseAll($files, $onProgress);
 
         // Collect all literal tags fired within the project, plus the literal prefix of any
         // dynamic invocation that has one — e.g. apply_filters("acf/settings/{$name}", $value)
