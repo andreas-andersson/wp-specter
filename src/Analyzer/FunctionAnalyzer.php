@@ -13,6 +13,29 @@ final class FunctionAnalyzer
 {
     private const MAGIC_PREFIXES = ['__'];
 
+    // WordPress's "object cache drop-in" contract: a plugin/theme ships wp-content/object-
+    // cache.php (WP core loads it INSTEAD of its own wp-includes/cache.php whenever present),
+    // which must declare every one of these exact bare function names itself — WP core calls
+    // them directly at bootstrap, from a file that lives OUTSIDE the scanned project's own tree
+    // entirely (WP copies the plugin's template file there), so no call site can ever exist in
+    // project code no matter how the object-cache backend is actually implemented. Real-world
+    // finding (LiteSpeed Cache): all ~19 of `src/object.lib.php`'s own `wp_cache_*` function
+    // declarations (the exact template WP copies into wp-content/object-cache.php) looked
+    // unused. This list is exactly WP core's own wp-includes/cache.php function set (confirmed
+    // against LiteSpeed's real drop-in template, which must mirror it exactly for the drop-in
+    // swap to work at all) — not one plugin's own naming, so a name-only match here is safe: WP
+    // core itself never loads its own wp-includes/cache.php once ANY of these is redeclared,
+    // making a same-named unrelated function an immediate fatal redeclaration error rather than
+    // a plausible false-match risk.
+    private const WP_OBJECT_CACHE_DROPIN_FUNCS = [
+        'wp_cache_init', 'wp_cache_add', 'wp_cache_add_multiple', 'wp_cache_replace',
+        'wp_cache_set', 'wp_cache_set_multiple', 'wp_cache_get', 'wp_cache_get_multiple',
+        'wp_cache_delete', 'wp_cache_delete_multiple', 'wp_cache_incr', 'wp_cache_decr',
+        'wp_cache_flush', 'wp_cache_flush_runtime', 'wp_cache_flush_group', 'wp_cache_supports',
+        'wp_cache_close', 'wp_cache_add_global_groups', 'wp_cache_add_non_persistent_groups',
+        'wp_cache_switch_to_blog',
+    ];
+
     public function __construct(private readonly PhpTokenParser $parser) {}
 
     /**
@@ -112,6 +135,6 @@ final class FunctionAnalyzer
                 return true;
             }
         }
-        return false;
+        return in_array($name, self::WP_OBJECT_CACHE_DROPIN_FUNCS, true);
     }
 }

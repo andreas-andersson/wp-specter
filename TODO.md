@@ -905,6 +905,43 @@ not shipped bugs.
   previously-hidden true positive, not a regression); full suite (538 tests) and phpstan both
   green.
 
+- [x] **WordPress's "object cache drop-in" function contract was invisible.** A plugin/theme
+  can ship `wp-content/object-cache.php` (WP core loads it *instead of* its own
+  `wp-includes/cache.php` whenever present) — the drop-in must declare a fixed set of bare
+  `wp_cache_*` function names itself, called by WP core directly at bootstrap from a file that
+  lives entirely outside the scanned project's own tree (WP copies the plugin's own template
+  file there at runtime). No call site can ever exist in project code, no matter how the backend
+  is actually implemented — the same class of gap `BASE_CLASS_CONTRACT_METHODS` already exists
+  for class methods, just for bare functions instead. Found by a fresh gap-hunting pass:
+  LiteSpeed Cache's `src/object.lib.php` (the exact template it copies to
+  `wp-content/object-cache.php`) declares all ~19 of these — `wp_cache_init`, `wp_cache_get`,
+  `wp_cache_set`, `wp_cache_delete`, `wp_cache_flush`, etc. — every one of them flagged
+  `UnusedFunction`.
+
+  Fixed with a new `FunctionAnalyzer::WP_OBJECT_CACHE_DROPIN_FUNCS` curated list (the exact
+  function set, taken directly from LiteSpeed's real drop-in template — which must mirror WP
+  core's own `wp-includes/cache.php` function set exactly for the drop-in swap to work at all,
+  so this isn't LiteSpeed's own naming, it's WP core's), checked by `isExcluded()` the same way
+  the magic-`__`-prefix exclusion already is. A name-only match (no guard, no file-path check)
+  is safe here specifically because these are WP core's own reserved global function names: WP
+  core simply never loads its own `wp-includes/cache.php` once any of these is redeclared
+  anywhere, making an unrelated same-named function an immediate fatal redeclaration error
+  rather than a plausible false-match risk — a materially stronger signal than an ordinary
+  name-prefix heuristic would be.
+
+  Deliberately scoped to only this one drop-in: WP's other drop-ins (`advanced-cache.php`,
+  `db.php`, `sunrise.php`, `maintenance.php`, ...) are whole-file replacements WP core executes
+  wholesale, not a fixed callable-by-name API surface the way `object-cache.php` is — they don't
+  share this exact shape, and extending the fix to them would be speculation with no real-world
+  evidence behind it.
+
+  Verified: new `FunctionAnalyzerTest` case (5 of the real drop-in function names, matching
+  LiteSpeed's actual signatures); real LiteSpeed Cache corpus — all 19 `wp_cache_*` functions no
+  longer flagged, plugin's unused-function count dropped from 19 to 0; full 20-target corpus
+  sanity pass (11 plugins + 9 themes, WP Rig newly added to the corpus as a Hybrid-mode theme)
+  shows every other finding count unchanged and no crashes; full suite (539 tests) and phpstan
+  both green.
+
 - [x] **Legacy `spl_autoload_register()` class-map callbacks — partially recognized, known
   remaining gap accepted as-is.** Pre-Composer (or hybrid) WP plugins sometimes register their
   own autoloader mapping class name → file path in code, rather than declaring `composer.json`

@@ -63,6 +63,22 @@ add_action("admin_notices", function () {
         self::assertEmpty($this->analyzer->analyze([$file]));
     }
 
+    public function testWpObjectCacheDropinFunctionsAreNeverReportedUnused(): void
+    {
+        // Real-world finding (LiteSpeed Cache): a wp-content/object-cache.php drop-in's own
+        // wp_cache_* function declarations are called by WP core directly at bootstrap, from a
+        // file living outside the scanned project's own tree entirely — no call site can ever
+        // exist in project code no matter how the backend is implemented.
+        $file = $this->write('<?php
+function wp_cache_init() {}
+function wp_cache_add( $key, $data, $group = "", $expire = 0 ) {}
+function wp_cache_get( $key, $group = "", $force = false, &$found = null ) {}
+function wp_cache_flush_runtime() {}
+function wp_cache_switch_to_blog( $blog_id ) {}
+');
+        self::assertEmpty($this->analyzer->analyze([$file]));
+    }
+
     public function testFunctionExistsGuardExcludesTheGuardedFunctionEntirely(): void
     {
         // `if ( ! function_exists( 'my_helper' ) ) { function my_helper() {} }` is the real WP
