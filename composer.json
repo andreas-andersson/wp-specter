@@ -1,7 +1,7 @@
 {
     "name": "andreas-andersson/wp-specter",
     "description": "CLI tool to find unused code in WordPress projects",
-    "keywords": ["cli", "wordpress", "unused code", "static analysis"],
+    "keywords": ["wordpress", "static-analysis", "dead-code", "unused-code", "hooks", "theme", "plugin", "cli"],
     "authors": [{
         "name": "Andreas Andersson",
         "email": "andreas@aikon.se",
