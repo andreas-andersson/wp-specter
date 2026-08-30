@@ -393,6 +393,23 @@ final class PhpTokenParser
                     // clear a pending function-scope push so it doesn't wrongly latch onto
                     // whatever brace comes next (e.g. a sibling method's own body).
                     $expectingFunctionOpen = false;
+                } elseif ($token === '"') {
+                    // A bare '"' token (rather than one whole T_CONSTANT_ENCAPSED_STRING) means
+                    // this double-quoted string is genuinely interpolated — see
+                    // resolveInterpolatedLoopSuffixPath()'s own docblock for the real-world shape
+                    // this covers (Astra theme's numbered icon files) and why it's deliberately
+                    // narrow. A null result means the shape wasn't recognized — leave $i
+                    // untouched so the token loop keeps walking through it one token at a time,
+                    // exactly as it already did before this mechanism existed (including
+                    // $interpolationDepth's own brace-depth-safety tracking below).
+                    $interpResult = $this->resolveInterpolatedLoopSuffixPath($tokens, $i, $forLoopVarNameStack, $forLoopVarValuesStack);
+                    if ($interpResult !== null) {
+                        [$enumeratedPaths, $lastInterpIndex] = $interpResult;
+                        foreach ($enumeratedPaths as $path) {
+                            $phpPathStrings[] = $path;
+                        }
+                        $i = $lastInterpIndex;
+                    }
                 }
                 continue;
             }
@@ -2903,6 +2920,142 @@ final class PhpTokenParser
         }
 
         return [$results, $lastIndex];
+    }
+
+    /**
+     * $i points at the bare `"` token that opens a genuinely-interpolated double-quoted string
+     * (PHP tokenizes a non-interpolated one as a single T_CONSTANT_ENCAPSED_STRING instead, so
+     * reaching this bare token at all already means at least one variable is embedded). Real-
+     * world shape this covers (Astra theme): `"{$icons_dir}/icons-v6-{$i}.php"` inside
+     * `for ($i = 0; $i < 4; $i++)` — `$icons_dir` is derived from a WP-core `plugin_dir_path()`
+     * call this parser has no way to resolve (and, being an absolute filesystem path, wouldn't
+     * even be a meaningful project-relative reference if it could be). This deliberately never
+     * attempts to resolve the *whole* interpolated string: it keeps only the literal segment
+     * directly adjacent to the matched loop variable on each side ("/icons-v6-" and ".php" here)
+     * and discards anything further out (`$icons_dir` itself, and whatever came before it, if
+     * anything) — an unresolved, non-adjacent leading segment is irrelevant once matching happens
+     * by basename alone anyway (see phpPathStrings' own basename-indexing in
+     * FileAnalyzer::buildReferencedIndex()), and a leading '/' left over from the adjacent
+     * literal (as here) doesn't change what basename()/pathinfo() extract from it either.
+     *
+     * Bails (returns null) unless every segment is one of exactly two recognized shapes — a
+     * plain literal run (T_ENCAPSED_AND_WHITESPACE) or a single interpolated variable (`$var` or
+     * `{$var}`, never `$var[0]`/`$var->prop`/`{$obj->prop}`/`${expr}`) — and the LAST variable
+     * segment matches a currently-tracked bounded for-loop variable with nothing but a single
+     * trailing literal segment (ending in '.php' — the only consumption context with any
+     * real-world evidence) after it. Any other shape (two different loop variables, a variable
+     * after the last recognized one that isn't tracked, a non-'.php' suffix, ...) is left
+     * completely unresolved, same as before this mechanism existed — deliberately narrow rather
+     * than a general interpolated-string evaluator.
+     *
+     * @param list<Token> $tokens
+     * @param list<string> $forLoopVarNameStack
+     * @param list<list<int>> $forLoopVarValuesStack
+     * @return array{list<string>, int}|null [enumerated basenames, last consumed token index —
+     *   the closing '"']
+     */
+    private function resolveInterpolatedLoopSuffixPath(
+        array $tokens,
+        int $i,
+        array $forLoopVarNameStack,
+        array $forLoopVarValuesStack,
+    ): ?array {
+        $segments = [];
+        $j = $i + 1;
+
+        while (true) {
+            if (!isset($tokens[$j])) {
+                return null; // ran off the end without a closing quote — malformed, bail
+            }
+            $t = $tokens[$j];
+
+            if ($t === '"') {
+                break;
+            }
+
+            if (is_array($t) && $t[0] === T_ENCAPSED_AND_WHITESPACE) {
+                $segments[] = ['literal', $t[1]];
+                $j++;
+                continue;
+            }
+
+            if (is_array($t) && $t[0] === T_VARIABLE) {
+                // Simple `$var` interpolation — array/property access right after it ($var[0],
+                // $var->prop) isn't attempted; the next loop iteration will simply fail to
+                // recognize whatever token follows and bail, same as any other unrecognized shape.
+                $segments[] = ['var', $t[1]];
+                $j++;
+                continue;
+            }
+
+            if (is_array($t) && $t[0] === T_CURLY_OPEN) {
+                if (!isset($tokens[$j + 1]) || !is_array($tokens[$j + 1]) || $tokens[$j + 1][0] !== T_VARIABLE) {
+                    return null; // {$obj->prop}, {$arr['key']}, ... — not a bare variable
+                }
+                if (!isset($tokens[$j + 2]) || $tokens[$j + 2] !== '}') {
+                    return null;
+                }
+                $segments[] = ['var', $tokens[$j + 1][1]];
+                $j += 3;
+                continue;
+            }
+
+            // T_DOLLAR_OPEN_CURLY_BRACES (${expr}), or anything else unrecognized inside the
+            // interpolation — bail rather than guess.
+            return null;
+        }
+        $closingQuoteIndex = $j;
+
+        $lastVarSegmentIndex = null;
+        foreach ($segments as $idx => $segment) {
+            if ($segment[0] === 'var') {
+                $lastVarSegmentIndex = $idx;
+            }
+        }
+        if ($lastVarSegmentIndex === null) {
+            return null;
+        }
+        for ($idx = $lastVarSegmentIndex + 1; $idx < count($segments); $idx++) {
+            if ($segments[$idx][0] !== 'literal') {
+                return null; // another variable after the last recognized one — too complex
+            }
+        }
+
+        $varName = $segments[$lastVarSegmentIndex][1];
+        $values = null;
+        for ($k = count($forLoopVarNameStack) - 1; $k >= 0; $k--) {
+            if ($forLoopVarNameStack[$k] === $varName) {
+                $values = $forLoopVarValuesStack[$k];
+                break;
+            }
+        }
+        if ($values === null) {
+            return null; // not a tracked bounded loop variable
+        }
+
+        // The literal segment directly abutting the matched variable (on either side) is the
+        // meaningful filename text ("icons-v6-" / ".php" in Astra's shape) — kept even though
+        // whatever came *before* that prefix segment (an earlier, unrelated/unresolved variable,
+        // or nothing at all) is discarded. Only a literal immediately adjacent counts as prefix;
+        // if the preceding segment is itself another variable (no literal directly touching the
+        // matched one), there's no stable filename text to anchor on, so prefix stays empty.
+        $prefix = ($lastVarSegmentIndex > 0 && $segments[$lastVarSegmentIndex - 1][0] === 'literal')
+            ? $segments[$lastVarSegmentIndex - 1][1]
+            : '';
+        $suffix = '';
+        for ($idx = $lastVarSegmentIndex + 1; $idx < count($segments); $idx++) {
+            $suffix .= $segments[$idx][1];
+        }
+        if (!str_ends_with($suffix, '.php')) {
+            return null;
+        }
+
+        $results = [];
+        foreach ($values as $value) {
+            $results[] = $prefix . $value . $suffix;
+        }
+
+        return [$results, $closingQuoteIndex];
     }
 
     /**

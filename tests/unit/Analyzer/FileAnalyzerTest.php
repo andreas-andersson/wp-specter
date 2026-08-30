@@ -484,6 +484,34 @@ foreach ( $files as $file ) {
         self::assertContains('orphan.php', $names);
     }
 
+    public function testInterpolatedStringWithBoundedLoopVarExemptsEnumeratedFiles(): void
+    {
+        // Real-world finding (Astra theme): "{$icons_dir}/icons-v6-{$i}.php" inside a bounded
+        // for loop, where $icons_dir is derived from a WP-core call this analyzer can't resolve.
+        // Only the basename ("icons-v6-N.php") needs to match — see PhpTokenParser::
+        // resolveInterpolatedLoopSuffixPath()'s own docblock for why the unresolved directory
+        // prefix is deliberately discarded rather than guessed at.
+        $bootstrap = $this->write('inc/core/common-functions.php', '<?php
+function astra_get_logo_svg_icons_array() {
+    $icons_dir = ASTRA_THEME_DIR . "assets/svg/logo-svg-icons";
+    for ( $i = 0; $i < 4; $i++ ) {
+        $file = "{$icons_dir}/icons-v6-{$i}.php";
+        if ( file_exists( $file ) ) {
+            include_once $file;
+        }
+    }
+}
+');
+        $icon0 = $this->write('assets/svg/logo-svg-icons/icons-v6-0.php', '<?php // loaded by the loop above');
+        $icon3 = $this->write('assets/svg/logo-svg-icons/icons-v6-3.php', '<?php // loaded by the loop above');
+        $icon4 = $this->write('assets/svg/logo-svg-icons/icons-v6-4.php', '<?php // loop never reaches 4 — genuinely unused');
+
+        $names = array_column($this->analyzer->analyze([$bootstrap, $icon0, $icon3, $icon4], $this->tmp), 'name');
+        self::assertNotContains('icons-v6-0.php', $names);
+        self::assertNotContains('icons-v6-3.php', $names);
+        self::assertContains('icons-v6-4.php', $names);
+    }
+
     public function testDynamicMiddleSegmentRequireWithFilenamePrefixTrimsToRealDirectory(): void
     {
         // Real-world regression (Sydney theme): `require get_template_directory() .

@@ -823,14 +823,46 @@ not shipped bugs.
   *correctly still flagged* (proving this isn't just "quieter," it's more precise), and the
   theme's total unused-function count dropped from 32 to 24; full 19-target corpus sanity pass (11
   plugins + 8 themes) shows every other finding count unchanged and no crashes; full suite (516
-  tests) and phpstan both green. **Scope limitation, found and deliberately not chased further
-  here**: Astra's own real-world case uses double-quoted *string interpolation*
-  (`"...{$icons_dir}/icons-v6-{$i}.php"`) assigned to a variable, then `include_once`d — a
-  fundamentally different token shape (interpolated strings tokenize as several separate tokens,
-  not one literal) than the concatenation this fix recognizes, and this parser has no interpolated-
-  string-to-template resolution mechanism at all yet (elsewhere or here) to build on. Astra's
-  `icons-v6-0..3.php` false positives remain unresolved; would need a separate, larger effort to
-  parse interpolated-string templates generally, not a small extension of this fix.
+  tests) and phpstan both green. **Scope limitation at the time, closed by the next entry
+  below**: Astra's own real-world case uses double-quoted *string interpolation*
+  (`"...{$icons_dir}/icons-v6-{$i}.php"`), a fundamentally different token shape than the
+  concatenation this fix recognizes, and wasn't resolved yet.
+
+- [x] **Closing the scope limitation above: a `.php`-suffixed double-quoted *interpolated*
+  string (as opposed to concatenation) split across a bounded loop variable still wasn't
+  resolved.** Astra's real shape: `$icons_dir = ASTRA_THEME_DIR . 'assets/svg/logo-svg-icons';
+  for ($i = 0; $i < 4; $i++) { $file = "{$icons_dir}/icons-v6-{$i}.php"; }` — `$icons_dir` is
+  itself unresolvable (`ASTRA_THEME_DIR` isn't a tracked literal), but that turned out not to
+  matter: `FileAnalyzer` already matches a `phpPathStrings` entry by **basename** alone (see
+  `buildReferencedIndex()`), so the unresolvable directory prefix can simply be discarded rather
+  than resolved — only the literal text immediately adjacent to the loop variable on each side
+  ("/icons-v6-" and ".php") needs to survive. New `PhpTokenParser::
+  resolveInterpolatedLoopSuffixPath()` walks an interpolated string's own token sequence (`"`,
+  then alternating `T_ENCAPSED_AND_WHITESPACE` literal runs and `$var`/`{$var}` variable
+  segments until the closing `"`) and, when the *last* variable segment matches a currently-
+  tracked bounded for-loop variable (reusing the same `$forLoopVarNameStack`/
+  `$forLoopVarValuesStack` the concatenation fix above already built) with only a single
+  trailing `.php`-suffixed literal segment after it, enumerates one basename per loop value —
+  keeping the literal segment directly before the matched variable too, so "icons-v6-" isn't
+  lost along with the genuinely-unresolvable `$icons_dir` before it. Any more complex shape
+  (`{$obj->prop}`, `${expr}`, two different loop variables, a non-'.php' suffix, ...) bails
+  entirely, same "don't guess" stance as its concatenation-based sibling.
+
+  A real bug caught mid-implementation, not just an edge case handled up front: the first cut
+  discarded the adjacent "icons-v6-" literal along with the unresolvable `$icons_dir` before it
+  (keeping only the *trailing* literal), enumerating `0.php`/`1.php`/... instead of
+  `icons-v6-0.php`/`icons-v6-1.php`/... — caught by testing against the real file directly
+  (`../wp-tests/themes/astra`) before declaring it fixed, not by the unit tests alone (their
+  fixtures happened not to distinguish the two).
+
+  Verified: 4 new `PhpTokenParserTest` cases (the real Astra shape, the simple `$var` — no
+  braces — interpolation syntax, a non-`.php` suffix correctly left alone, and a
+  `{$this->prop}`-shaped bail) and one new `FileAnalyzerTest` end-to-end case (including a 5th
+  icon file the loop never reaches, confirming it's still correctly flagged — the "sharper, not
+  just quieter" bar every fix in this project holds itself to); real Astra corpus —
+  `icons-v6-0..3.php` no longer flagged, unused-file count dropped from 5 to 1; full 19-target
+  corpus sanity pass (11 plugins + 8 themes) shows every other finding count unchanged and no
+  crashes; full suite (534 tests) and phpstan both green.
 
 - [x] **Legacy `spl_autoload_register()` class-map callbacks — partially recognized, known
   remaining gap accepted as-is.** Pre-Composer (or hybrid) WP plugins sometimes register their

@@ -939,6 +939,62 @@ for ($i = 0; $i <= 3; $i++) {
         ], $result->phpPathStrings);
     }
 
+    public function testInterpolatedStringWithBoundedLoopVarEnumeratesEveryPhpPathString(): void
+    {
+        // Real-world shape (Astra theme): "{$icons_dir}/icons-v6-{$i}.php" — $icons_dir is
+        // derived from a WP-core plugin_dir_path() call this parser can't (and doesn't need to)
+        // resolve; only the "/icons-v6-" (adjacent literal before $i) and ".php" (adjacent
+        // literal after) matter, since FileAnalyzer matches phpPathStrings by basename anyway.
+        $result = $this->parse('<?php
+$icons_dir = some_theme_dir_constant();
+for ($i = 0; $i < 4; $i++) {
+    $file = "{$icons_dir}/icons-v6-{$i}.php";
+}
+');
+        self::assertSame([
+            '/icons-v6-0.php',
+            '/icons-v6-1.php',
+            '/icons-v6-2.php',
+            '/icons-v6-3.php',
+        ], $result->phpPathStrings);
+    }
+
+    public function testInterpolatedStringWithSimpleDollarVarSyntaxAlsoEnumerates(): void
+    {
+        // Same mechanism, the other (bare "$var", no curly braces) interpolation syntax.
+        $result = $this->parse('<?php
+for ($i = 0; $i < 2; $i++) {
+    $file = "icons-$i.php";
+}
+');
+        self::assertSame(['icons-0.php', 'icons-1.php'], $result->phpPathStrings);
+    }
+
+    public function testInterpolatedStringWithoutTrailingPhpSuffixIsNotEnumerated(): void
+    {
+        // Only the '.php' file-path consumption context has real-world evidence — a
+        // non-'.php'-suffixed interpolated string (a CSS class, a hook tag, ...) must be left
+        // alone rather than guessed at.
+        $result = $this->parse('<?php
+for ($i = 0; $i < 3; $i++) {
+    $class = "item-{$i}";
+}
+');
+        self::assertEmpty($result->phpPathStrings);
+    }
+
+    public function testInterpolatedStringWithComplexExpressionBailsEntirely(): void
+    {
+        // {$obj->prop} — a property access inside the interpolation, not a bare variable — must
+        // be left completely unresolved rather than mis-parsed.
+        $result = $this->parse('<?php
+for ($i = 0; $i < 3; $i++) {
+    $file = "{$this->dir}/icons-{$i}.php";
+}
+');
+        self::assertEmpty($result->phpPathStrings);
+    }
+
     public function testUnboundedForLoopDoesNotEnumerateConcatenatedLiterals(): void
     {
         // A non-canonical for-loop (non-literal bound) must leave the loop variable completely
