@@ -1468,6 +1468,55 @@ $x = array($this, "not_really_a_method", "Three", "Four");
         self::assertContains('Four', $names);
     }
 
+    public function testPlainTwoElementStringArrayAssignedToAVariableIsNotMisparsedAsACallback(): void
+    {
+        // Real-world regression (WooCommerce): `$controllers = array(
+        // 'WC_REST_Product_Brands_V2_Controller', 'WC_REST_Product_Brands_Controller' );`
+        // followed by `foreach ($controllers as $controller) { new $controller(); }` — a plain
+        // 2-item list of class names, not a callback at all. Unlike the 3+-element regression
+        // above, "last element" alone can't rule this shape out — a genuine ['Foo', 'method']
+        // callback pair is also exactly 2 elements. Before this fix, the 2nd literal was
+        // fabricated into ScopedMethodCall(1st, 2nd) and silently vanished from
+        // $functionCalls/$classReferences, so `new $controller()` never found either literal
+        // and both classes looked unused.
+        $result = $this->parse('<?php
+$controllers = array(
+    "WC_REST_Product_Brands_V2_Controller",
+    "WC_REST_Product_Brands_Controller",
+);
+');
+        self::assertEmpty($result->scopedMethodCalls);
+        $names = array_column($result->functionCalls, 'name');
+        self::assertContains('WC_REST_Product_Brands_V2_Controller', $names);
+        self::assertContains('WC_REST_Product_Brands_Controller', $names);
+    }
+
+    public function testPlainTwoElementStringArrayShortSyntaxAssignedToAVariableIsNotMisparsedAsACallback(): void
+    {
+        // Same regression, short array syntax (`[...]` instead of `array(...)`).
+        $result = $this->parse('<?php
+$controllers = ["Foo_Controller", "Bar_Controller"];
+');
+        self::assertEmpty($result->scopedMethodCalls);
+        $names = array_column($result->functionCalls, 'name');
+        self::assertContains('Foo_Controller', $names);
+        self::assertContains('Bar_Controller', $names);
+    }
+
+    public function testBareTwoElementCallbackArrayAsCallArgumentIsStillRecognizedAsScoped(): void
+    {
+        // The genuine shape this whole branch exists for (Akismet): a bare-string callback
+        // pair, but nested directly in a call's own argument list rather than assigned to a
+        // variable first — must still resolve to a scoped call, not fall back to the generic
+        // $functionCalls pool.
+        $result = $this->parse('<?php
+add_action("init", array("Akismet", "init"));
+');
+        self::assertCount(1, $result->scopedMethodCalls);
+        self::assertSame('Akismet', $result->scopedMethodCalls[0]->receiverClass);
+        self::assertSame('init', $result->scopedMethodCalls[0]->method);
+    }
+
     public function testArrayCallbackWithTrailingCommaIsStillRecognizedAsScoped(): void
     {
         // A genuine 2-element callback with a trailing comma (`[$this, 'method',]`) must still

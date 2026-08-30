@@ -905,6 +905,44 @@ not shipped bugs.
   previously-hidden true positive, not a regression); full suite (538 tests) and phpstan both
   green.
 
+- [x] **The exactly-2-element case of the same array-callback misparse — `isLastArrayElementAt()`
+  can't rule it out, since a real `['Foo', 'method']` pair is also exactly 2 elements.** Found
+  while corpus-checking the "ignoring effort" shipmonk/dead-code-detector question: WooCommerce's
+  `includes/class-wc-brands.php` builds `$controllers = array('WC_REST_Product_Brands_V2_Controller',
+  'WC_REST_Product_Brands_Controller'); foreach ($controllers as $controller) { (new
+  $controller())->register_routes(); }` — a plain 2-item list of class names, not a callback at
+  all, but shape-identical to a genuine bare-string callback pair. `arrayCallbackReceiverClass()`'s
+  `['Foo', 'method']` branch (unlike its `$this`/`Foo::class` siblings, which have unambiguous
+  receiver syntax) accepted *any* 2-element array of plain string literals as a callback pair —
+  the 2nd literal (`WC_REST_Product_Brands_Controller`) was fabricated into
+  `ScopedMethodCall('WC_REST_Product_Brands_V2_Controller', 'WC_REST_Product_Brands_Controller')`
+  and vanished from `$functionCalls`/`$classReferences`, so it stayed `UnusedClass` even though
+  `new $controller()` genuinely reaches it.
+
+  No local token shape can disambiguate a real bare-string callback pair from an arbitrary
+  2-string list — both are "two identifier-shaped string literals, last one preceded by a comma
+  preceded by the array's own open bracket." The one signal available without full dataflow:
+  every genuine bare-string callback pair found in the wild (Akismet: `add_action('init',
+  array('Akismet', 'init'))`, repeated ~15x across the plugin) sits directly inside a function
+  call's own argument list; a bare `$var = array(...)`/`$var = [...]` assignment never is. Fixed:
+  new `tokenBeforeArrayLiteral()` walks back past the array's own opening bracket (past the
+  `array` keyword for long syntax) to the token immediately before the whole literal; the
+  `['Foo', 'method']` branch now bails if that token is `=`. Scoped narrowly to the ambiguous
+  bare-string branch only — the `$this`/`Foo::class` branches have unambiguous syntax and are
+  untouched.
+
+  Verified: 3 new `PhpTokenParserTest` cases (the exact WooCommerce regression, a short-array-
+  syntax variant, and a same-shape-but-nested-in-a-call-argument case proving the fix doesn't
+  over-correct — Akismet's own shape, still resolves to `ScopedMethodCall('Akismet', 'init')`);
+  full 28-target corpus sanity pass (13 plugins + 15 themes) shows zero crashes and only
+  reductions, no new findings anywhere — WooCommerce: `WC_REST_Product_Brands_Controller` no
+  longer flagged (168→167 unused classes, 948→945 unused methods, its own methods no longer
+  double-counted per `--no-suppress-unused-class-methods` default); Jetpack:
+  `hook_wpmu_dev_domain_mapping` (`3rd-party/class-domain-mapping.php`) no longer flagged
+  (322→321 unused methods) — a second, independent real instance of the same bug, not spotted by
+  manual inspection, only by the full corpus diff; every other project's finding counts unchanged.
+  Full suite (557 tests) and phpstan both green.
+
 - [x] **WordPress's "object cache drop-in" function contract was invisible.** A plugin/theme
   can ship `wp-content/object-cache.php` (WP core loads it *instead of* its own
   `wp-includes/cache.php` whenever present) — the drop-in must declare a fixed set of bare

@@ -3763,11 +3763,49 @@ final class PhpTokenParser
             if ($openIndex === null || !$this->isArrayOpenAt($tokens, $openIndex)) {
                 return null;
             }
+            // Unlike the $this/self::class/Foo::class branches above, a bare pair of plain
+            // string literals has no unambiguous callback syntax at all — shape alone can't
+            // tell a real ['Foo', 'method'] pair apart from an ordinary 2-item list of
+            // unrelated strings (real-world regression: WooCommerce's `$controllers =
+            // array('WC_REST_Product_Brands_V2_Controller', 'WC_REST_Product_Brands_Controller');`
+            // later consumed via `new $controller()` in a foreach — not a callback at all;
+            // the 2nd literal was silently fabricated into ScopedMethodCall(1st, 2nd) and
+            // vanished from $functionCalls/$classReferences, the same failure mode
+            // testPlainThreeElementStringArrayIsNotMisparsedAsACallback already fixed for
+            // 3+ elements — just never covered the exactly-2 case, where "last element"
+            // alone can't rule anything out). Every genuine bare-string-pair callback found
+            // in the wild (Akismet: `add_action('init', array('Akismet', 'init'))`) sits
+            // directly inside a function call's own argument list; a bare `$var =
+            // array(...)`/`$var = [...]` assignment never is — the one context signal this
+            // token-based parser can check without full dataflow.
+            $beforeArray = $this->tokenBeforeArrayLiteral($tokens, $openIndex);
+            if ($beforeArray !== null && $tokens[$beforeArray] === '=') {
+                return null;
+            }
             $literal = $this->stripQuotes($receiverEndToken[1]);
             return $literal !== '' ? $this->resolveFqcn($literal, $currentNamespace, $useImports) : null;
         }
 
         return null;
+    }
+
+    /**
+     * Index of the token immediately preceding an array/list literal's own opening bracket —
+     * for short syntax (`[`) that's just whatever comes before $openIndex; for long syntax
+     * (`array(`) it's whatever comes before the `array` keyword itself, not before the `(`.
+     *
+     * @param list<Token> $tokens
+     */
+    private function tokenBeforeArrayLiteral(array $tokens, int $openIndex): ?int
+    {
+        if ($tokens[$openIndex] === '[') {
+            return $this->peekPrevMeaningfulIndex($tokens, $openIndex);
+        }
+        $arrayKeywordIndex = $this->peekPrevMeaningfulIndex($tokens, $openIndex);
+        if ($arrayKeywordIndex === null) {
+            return null;
+        }
+        return $this->peekPrevMeaningfulIndex($tokens, $arrayKeywordIndex);
     }
 
     private function stripQuotes(string $value): string
