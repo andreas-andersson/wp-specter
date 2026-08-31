@@ -2367,8 +2367,7 @@ final class PhpTokenParser
         array $nodes,
         bool $allowGuardedUnknownVariable = false,
         ?string $guardScope = null,
-    ): ?array
-    {
+    ): ?array {
         $sourceNode = $this->literalPathNodeFromTokens($expression, $nodes);
         if ($sourceNode !== null) {
             return [$sourceNode, '', '', null];
