@@ -1,8 +1,8 @@
-<h1 align="center">WP Specter - Find unused code and files</h1>
-
 <p align="center">
 	<img src="wp-specter.png" alt="WP-Specter" width="200" height="200">
 </p>
+
+<h1 align="center">WP Specter - Find unused code and files</h1>
 
 WP Specter is a static analyser for WordPress code. It understands WordPress conventions (template hierarchy, hooks, action strings) and reports genuinely orphaned code:
 
