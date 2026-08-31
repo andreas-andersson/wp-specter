@@ -475,6 +475,29 @@ class My_Theme_Update {
         self::assertContains('truly_unused', $unusedMethods);
     }
 
+    public function testNamespaceConcatenatedClassMethodCallbackCountsAsCall(): void
+    {
+        // LiteSpeed Cache supplies its uninstall callback as `__NAMESPACE__ .
+        // '\Activation::uninstall_litespeed_cache'`. The callback string's class segment must
+        // resolve to LiteSpeed\Activation, not global Activation, so only this used method is
+        // removed from the unused-method results.
+        $file = $this->write('<?php
+namespace LiteSpeed;
+class Activation {
+    public static function uninstall_litespeed_cache() {}
+    public static function truly_unused() {}
+}
+register_uninstall_hook(
+    __FILE__,
+    __NAMESPACE__ . "\Activation::uninstall_litespeed_cache",
+);
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('uninstall_litespeed_cache', $unusedMethods);
+        self::assertContains('truly_unused', $unusedMethods);
+    }
+
     // ── class-scoped call matching ──────────────────────────────────────────
 
     public function testClassScopedMatchingDoesNotLeakBetweenUnrelatedClasses(): void

@@ -17,6 +17,11 @@ final class TemplateAnalyzer
     // (index.blade.php, single.blade.php, ...) and partials both live there instead of at the
     // theme root / template-parts, so it needs the same treatment as the other three.
     private const TEMPLATE_DIRS = ['templates', 'template-parts', 'parts', 'resources/views'];
+    // Rector's documented project-level configuration filename. WP Rig carries rector.php at
+    // its theme root; it imports RectorConfig and returns tooling configuration, never a
+    // WordPress template. Keep this deliberately narrow rather than treating arbitrary root PHP
+    // configuration-looking files as non-templates.
+    private const ROOT_TOOLING_CONFIG_FILES = ['rector.php'];
     private const BLOCK_JSON_RENDER_KEYS = ['render', 'renderCallback'];
 
     // Blade directives whose argument(s) name another view, dot-notation (Blade's own path
@@ -69,6 +74,20 @@ final class TemplateAnalyzer
                 $referenced[basename($normalized)] = true;
                 $referenced[pathinfo($normalized, PATHINFO_FILENAME)] = true;
             }
+        }
+
+        // WPForms' render helper hands its slug through several named/scoped methods before
+        // include_html() appends ".php" and reaches load_template()/require. Resolve that same
+        // bounded fixed-fragment wrapper graph used by FileAnalyzer, so a template is treated as
+        // referenced without a WPForms-specific name/path rule.
+        foreach (LiteralPathPropagationResolver::resolve($parseResults) as $path) {
+            $normalized = $this->normalizePath($path);
+            if ($normalized === '') {
+                continue;
+            }
+            $referenced[$normalized] = true;
+            $referenced[basename($normalized)] = true;
+            $referenced[pathinfo($normalized, PATHINFO_FILENAME)] = true;
         }
 
         // get_header( helper_fn() ) / get_template_part( $var ) where `$var = helper_fn();` —
@@ -234,6 +253,10 @@ final class TemplateAnalyzer
             // its .blade.php is stripped down to "index") is never mistaken for theme root
             // index.php.
             if ($relative === 'functions.php' || $relative === 'index.php') {
+                continue;
+            }
+
+            if (in_array($relative, self::ROOT_TOOLING_CONFIG_FILES, true)) {
                 continue;
             }
 

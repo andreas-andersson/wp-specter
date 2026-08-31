@@ -133,6 +133,29 @@ final class ParseResult
      *                                           `$anyLocalVar['literal'] = ...;` anywhere in the
      *                                           class's own methods (see
      *                                           PhpTokenParser::arrayKeyLiteralAssignment).
+     * @param list<LiteralPathPropagationLink> $literalPathPropagationLinks Directed, local
+     *                                           dataflow links from wrapper parameters through
+     *                                           fixed literal path fragments, named/scoped
+     *                                           wrapper calls, return values, and an include or
+     *                                           WP template sink. Resolved only after every file
+     *                                           is parsed — see LiteralPathPropagationLink.
+     * @param list<LiteralPathInput>     $literalPathInputs Literal positional or keyed-array
+     *                                           values supplied at named/scoped wrapper call
+     *                                           sites. These seed the bounded link traversal in
+     *                                           LiteralPathPropagationResolver.
+     * @param list<string>               $literalPathFileExistenceGuards Exact expression/node
+     *                                           guards recorded for `file_exists()`/`is_file()`;
+     *                                           they permit only their matching guarded
+     *                                           literal-path link to discard one unknown direct
+     *                                           variable term.
+     * @param array<string,int> $hookPassThroughParams Function/method key => which of its own
+     *                                           declared parameter positions is passed unchanged
+     *                                           as the hook-tag argument to an already-recognized
+     *                                           CRON_SCHEDULE_FUNCS/HOOK_INVOKE_FUNCS call inside
+     *                                           its own body (see
+     *                                           PhpTokenParser::captureHookPassThroughParam).
+     *                                           Resolved against $literalPathInputs in
+     *                                           HookAnalyzer.
      */
     public function __construct(
         public readonly string $file,
@@ -164,6 +187,10 @@ final class ParseResult
         public readonly array $pendingSelfDispatchCalls = [],
         public readonly array $selfDispatchPrefixSuffixTemplates = [],
         public readonly array $classArrayKeyLiterals = [],
+        public readonly array $literalPathPropagationLinks = [],
+        public readonly array $literalPathInputs = [],
+        public readonly array $literalPathFileExistenceGuards = [],
+        public readonly array $hookPassThroughParams = [],
         public readonly ?string $error = null,
     ) {}
 }

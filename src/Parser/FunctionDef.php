@@ -43,5 +43,12 @@ final class FunctionDef
         // PendingDirectoryLoaderCall to recognize a bulk-directory-loader method called from a
         // different file with a literal directory-name argument — see that class's own docblock.
         public readonly bool $hasIncludeInBody = false,
+        // Declared parameter variable names in positional order. LiteralPathPropagation uses
+        // this to connect a caller's literal argument to the exact parameter from which a
+        // wrapper constructs an include/template path; retaining names rather than assuming
+        // "any variable in the body" prevents ordinary local transformations from becoming
+        // interprocedural path references.
+        /** @var list<string> */
+        public readonly array $parameters = [],
     ) {}
 }

@@ -738,6 +738,20 @@ final class FileAnalyzer
             }
         }
 
+        // Literal wrapper arguments that form a fixed path and reach an include/template sink
+        // only after one or more named/scoped calls — e.g. Blocksy's options/dynamic-styles
+        // wrappers and their shared require helper. The resolver is intentionally bounded and
+        // contributes exact paths to this same index rather than exempting a broad directory.
+        foreach (LiteralPathPropagationResolver::resolve($parseResults) as $path) {
+            $normalized = $this->normalizePath($path);
+            if ($normalized === '') {
+                continue;
+            }
+            $referenced[$normalized] = true;
+            $referenced[basename($normalized)] = true;
+            $referenced[pathinfo($normalized, PATHINFO_FILENAME)] = true;
+        }
+
         // get_template_part( helper_fn() ) — helper_fn() is a project-defined function whose own
         // `return` statements (see PhpTokenParser's T_RETURN handling) resolve to one or more
         // literal paths. Merged across every scanned file first, since the helper and its caller

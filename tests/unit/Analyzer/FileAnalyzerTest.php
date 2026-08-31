@@ -684,6 +684,112 @@ class Helpers {
         self::assertNotContains('settings-posttypes.php', $names);
     }
 
+    public function testMultiHopLiteralWrapperPathsReferencePositionalAndKeyedFiles(): void
+    {
+        // Blocksy's options loader receives a positional slug, while its dynamic-styles loader
+        // receives the literal through `$args['name']`. Both build a fixed path locally and pass
+        // it to a separate require helper, so neither direct include-ref collection nor directory
+        // bulk-loader detection can identify the individual files.
+        $bootstrap = $this->write('functions.php', '<?php
+function require_file( $file ) {
+    require $file;
+}
+function load_options( $slug ) {
+    $file = get_template_directory() . "/inc/options/" . $slug . ".php";
+    require_file( $file );
+}
+function load_styles( $args ) {
+    $args = wp_parse_args( $args, [] );
+    $args["path"] = get_template_directory() . "/inc/styles/" . $args["name"] . ".php";
+    require_file( $args["path"] );
+}
+load_options( "general/buttons" );
+load_styles( [ "name" => "global-inline", "css" => $css ] );
+');
+        $option = $this->write('inc/options/general/buttons.php', '<?php // loaded through positional wrapper');
+        $style = $this->write('inc/styles/global-inline.php', '<?php // loaded through keyed wrapper');
+        $orphan = $this->write('inc/orphan.php', '<?php // no fixed path reaches this');
+
+        $names = array_column($this->analyzer->analyze([$bootstrap, $option, $style, $orphan], $this->tmp), 'name');
+
+        self::assertNotContains('buttons.php', $names);
+        self::assertNotContains('global-inline.php', $names);
+        self::assertContains('orphan.php', $names);
+    }
+
+    public function testBareParameterPassedToRequireDoesNotBecomeAFileReference(): void
+    {
+        // A literal argument alone is insufficient: without a fixed prefix/suffix construction,
+        // this direct parameter-to-require wrapper must not hide a same-named orphan file.
+        $bootstrap = $this->write('functions.php', '<?php
+function include_as_is( $filename ) {
+    require $filename;
+}
+include_as_is( "inc/orphan" );
+');
+        $orphan = $this->write('inc/orphan.php', '<?php // not proven reachable');
+
+        $names = array_column($this->analyzer->analyze([$bootstrap, $orphan], $this->tmp), 'name');
+
+        self::assertContains('orphan.php', $names);
+    }
+
+    public function testUnknownPathBaseDoesNotMakeAFileReference(): void
+    {
+        // The fixed ".php" suffix cannot prove this project's inc/orphan.php is the target:
+        // $base is runtime data and may name any external directory.
+        $bootstrap = $this->write('functions.php', '<?php
+function include_file( $name ) {
+    $path = $base . $name . ".php";
+    require $path;
+}
+include_file( "orphan" );
+');
+        $orphan = $this->write('inc/orphan.php', '<?php // not proven reachable');
+
+        $names = array_column($this->analyzer->analyze([$bootstrap, $orphan], $this->tmp), 'name');
+
+        self::assertContains('orphan.php', $names);
+    }
+
+    public function testStaticAndKnownInstanceWrapperCallsReferenceFiles(): void
+    {
+        // The path-forming method is reached through three already-resolved method forms:
+        // late-static forwarding, a type-hinted object, and an object assigned from `new`.
+        // Each receiver has an exact class, unlike an arbitrary `$object->load()` call.
+        $bootstrap = $this->write('functions.php', '<?php
+function require_file( $file ) {
+    require $file;
+}
+class PathLoader {
+    public static function load( $slug ) {
+        $file = get_template_directory() . "/inc/" . $slug . ".php";
+        require_file( $file );
+    }
+    public static function through_static( $slug ) {
+        static::load( $slug );
+    }
+}
+function bootstrap( PathLoader $typed ) {
+    PathLoader::through_static( "static" );
+    $typed->load( "typed" );
+    $created = new PathLoader();
+    $created->load( "new" );
+}
+');
+        $static = $this->write('inc/static.php', '<?php // loaded through static::');
+        $typed = $this->write('inc/typed.php', '<?php // loaded through typed parameter');
+        $new = $this->write('inc/new.php', '<?php // loaded through known new instance');
+        $orphan = $this->write('inc/orphan.php', '<?php // not referenced');
+
+        $names = array_column($this->analyzer->analyze([$bootstrap, $static, $typed, $new, $orphan], $this->tmp), 'name');
+
+        self::assertNotContains('static.php', $names);
+        self::assertNotContains('typed.php', $names);
+        self::assertNotContains('new.php', $names);
+        self::assertContains('orphan.php', $names);
+    }
+
     public function testArrayOfLiteralsForeachLoopExemptsListedFiles(): void
     {
         // Real-world finding (Astra theme): a plain array of relative path fragments (no glob(),

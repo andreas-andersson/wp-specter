@@ -51,6 +51,33 @@ final class HookAnalyzer
             }
         }
 
+        // `as_schedule_single_action( $timestamp, $action_name, ... )` inside a wrapper whose own
+        // parameter is `$action_name` — the hook fires later inside Action Scheduler, never via a
+        // literal argument visible at the CRON_SCHEDULE_FUNCS/HOOK_INVOKE_FUNCS call site itself.
+        // See $hookPassThroughParams' own docblock (WooCommerce's
+        // schedule_variation_summary_regeneration()). Merged across every scanned file first,
+        // since the wrapper and its callers are routinely in different files; resolved against
+        // $literalPathInputs (already populated for every named/scoped call site in the project,
+        // not just file-related ones — see LiteralPathInput's own docblock) the same way a direct
+        // literal argument to the sink already would be.
+        $hookPassThroughParams = [];
+        foreach ($parseResults as $result) {
+            foreach ($result->hookPassThroughParams as $functionKey => $paramPosition) {
+                $hookPassThroughParams[$functionKey] = $paramPosition;
+            }
+        }
+        if ($hookPassThroughParams !== []) {
+            foreach ($parseResults as $result) {
+                foreach ($result->literalPathInputs as $input) {
+                    foreach ($hookPassThroughParams as $functionKey => $paramPosition) {
+                        if ($input->targetNode === $functionKey . '#param:' . $paramPosition) {
+                            $firedTags[$input->literal] = true;
+                        }
+                    }
+                }
+            }
+        }
+
         // Report registrations whose tag is not fired within project
         $findings = [];
         foreach ($parseResults as $result) {

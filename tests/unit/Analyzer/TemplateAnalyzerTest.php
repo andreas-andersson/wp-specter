@@ -164,6 +164,86 @@ function render() {
         self::assertEmpty($findings);
     }
 
+    public function testRectorConfigEntrypointIsNotTreatedAsAThemeTemplate(): void
+    {
+        // WP Rig's root rector.php returns a RectorConfig closure. Rector documents this exact
+        // filename as its project configuration entrypoint, so it is tooling rather than a
+        // WordPress template even though classic/hybrid themes otherwise treat root PHP files as
+        // template candidates.
+        $themeDir = $this->tmp;
+        $rectorConfig = $this->writeRoot('rector.php', '<?php
+use Rector\Config\RectorConfig;
+return static function (RectorConfig $config): void {};
+');
+
+        $findings = $this->analyzer->analyze([$rectorConfig], WpMode::Hybrid, $themeDir);
+
+        self::assertEmpty($findings);
+    }
+
+    public function testOtherUnreferencedRootPhpFileRemainsATemplateCandidate(): void
+    {
+        // The Rector exception must stay confined to its documented tooling filename: an
+        // arbitrary root PHP file still follows the normal classic-theme template rule.
+        $themeDir = $this->tmp;
+        $template = $this->writeRoot('custom-layout.php', '<?php');
+
+        $findings = $this->analyzer->analyze([$template], WpMode::Classic, $themeDir);
+
+        self::assertCount(1, $findings);
+        self::assertSame('custom-layout.php', $findings[0]->name);
+    }
+
+    public function testMultiHopNamedAndScopedWrappersReferenceTemplatePath(): void
+    {
+        // WPForms' wpforms_render() passes a slug through get_html(), include_html(), and
+        // locate(). include_html appends ".php"; locate returns the path through apply_filters()
+        // before load_template()/require consumes it. This fixture uses generic names but keeps
+        // that full, bounded wrapper shape including the PHP-core ltrim($path, '/') normalization.
+        $themeDir = $this->tmp;
+        $embed = $this->touch('templates/admin/challenge/embed.php');
+        $orphan = $this->touch('templates/admin/challenge/orphan.php');
+        $unguarded = $this->touch('templates/admin/challenge/unguarded.php');
+        $helpers = $this->writeCode('<?php
+function render_template( $template_name ) {
+    return Templates::get_html( $template_name );
+}
+class Templates {
+    public static function locate( $template_name ) {
+        $template_name = ltrim( $template_name, "/" );
+        if ( file_exists( $template_path . $template_name ) ) {
+            $located = $template_path . $template_name;
+        }
+        return apply_filters( "template_located", $located, $template_name );
+    }
+    public static function include_html( $template_name ) {
+        $template_name .= ".php";
+        $located = apply_filters( "template_include", self::locate( $template_name ) );
+        load_template( $located, false );
+    }
+    public static function get_html( $template_name ) {
+        static::include_html( $template_name );
+    }
+}
+function include_as_is( $template_name ) {
+    require $template_name;
+}
+function include_unguarded( $template_name ) {
+    $located = $base . $template_name . ".php";
+    load_template( $located, false );
+}
+render_template( "admin/challenge/embed" );
+include_as_is( "admin/challenge/orphan" );
+include_unguarded( "admin/challenge/unguarded" );
+');
+
+        $names = array_column($this->analyzer->analyze([$helpers, $embed, $orphan, $unguarded], WpMode::Plugin, $themeDir), 'name');
+
+        self::assertNotContains('embed.php', $names);
+        self::assertContains('orphan.php', $names);
+        self::assertContains('unguarded.php', $names);
+    }
+
     public function testIncludeCountsAsReference(): void
     {
         $themeDir = $this->tmp;
@@ -350,6 +430,13 @@ acf_register_block_type(array(
             mkdir($dir, 0755, true);
         }
         file_put_contents($path, '<?php');
+        return $path;
+    }
+
+    private function writeRoot(string $filename, string $content): string
+    {
+        $path = $this->tmp . '/' . $filename;
+        file_put_contents($path, $content);
         return $path;
     }
 

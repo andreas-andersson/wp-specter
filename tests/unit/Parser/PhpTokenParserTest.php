@@ -865,6 +865,28 @@ if ( ! \class_exists( "My_Guarded_Class" ) ) {
         self::assertContains('Astra_Customizer_Partials::render_partial_site_title', $calls);
     }
 
+    public function testNamespaceConcatenatedClassMethodCallbackUsesCurrentNamespace(): void
+    {
+        // LiteSpeed Cache's uninstall callback is written as `__NAMESPACE__ .
+        // '\Activation::uninstall_litespeed_cache'`. Its literal fragment starts with a slash,
+        // but that slash joins the namespace magic constant to the class suffix; it must not
+        // resolve as globally-qualified Activation.
+        $result = $this->parse('<?php
+namespace LiteSpeed;
+register_uninstall_hook(
+    __FILE__,
+    __NAMESPACE__ . "\Activation::uninstall_litespeed_cache",
+);
+');
+
+        self::assertContains('Activation', $result->classReferences);
+        $calls = array_map(
+            fn($c) => $c->receiverClass . '::' . $c->method,
+            $result->scopedMethodCalls,
+        );
+        self::assertContains('LiteSpeed\Activation::uninstall_litespeed_cache', $calls);
+    }
+
     public function testConcatenatedArrayCallbackMethodNameEnumeratesExactCallsAcrossBoundedLoop(): void
     {
         // Real-world finding (Astra theme): `add_action('astra_footer_html_'.$i, array($this,
@@ -1526,6 +1548,201 @@ class Helpers {
 }
 ');
         self::assertSame(['.php'], $result->functionParamSuffixReturns['Helpers::view'] ?? null);
+    }
+
+    public function testLiteralPathPropagationCapturesPositionalAndKeyedWrapperInputs(): void
+    {
+        // Blocksy supplies both shapes in production: a positional options slug and a keyed
+        // `name` within dynamic-style arguments. Both form a fixed path, then hand it to the
+        // same require helper in another function rather than including it directly.
+        $result = $this->parse('<?php
+function require_file( $file ) {
+    require $file;
+}
+function load_options( $slug ) {
+    $file = get_template_directory() . "/inc/options/" . $slug . ".php";
+    require_file( $file );
+}
+function load_styles( $args ) {
+    $args = wp_parse_args( $args, [] );
+    $args["path"] = get_template_directory() . "/inc/styles/" . $args["name"] . ".php";
+    require_file( $args["path"] );
+}
+load_options( "general/buttons" );
+load_styles( [ "name" => "global-inline", "css" => $css ] );
+');
+
+        $inputs = [];
+        foreach ($result->literalPathInputs as $input) {
+            $inputs[$input->targetNode] = $input->literal;
+        }
+        self::assertSame('general/buttons', $inputs['load_options#param:0'] ?? null);
+        self::assertSame('global-inline', $inputs['load_styles#param:0:key:name'] ?? null);
+
+        $pathLinks = array_filter(
+            $result->literalPathPropagationLinks,
+            fn($link) => $link->prefix !== '' || $link->suffix !== '',
+        );
+        self::assertCount(2, $pathLinks);
+        self::assertSame('/inc/options/', array_values($pathLinks)[0]->prefix);
+        self::assertSame('.php', array_values($pathLinks)[0]->suffix);
+        self::assertSame('/inc/styles/', array_values($pathLinks)[1]->prefix);
+        self::assertSame('.php', array_values($pathLinks)[1]->suffix);
+    }
+
+    public function testLiteralPathPropagationResolvesBasenameWrappedParameterThroughAnUnresolvableConstantPrefix(): void
+    {
+        // Real-world shape (Akismet): `Akismet::view( $name ) { $file = AKISMET__PLUGIN_DIR .
+        // 'views/' . basename( $name ) . '.php'; include $file; }`. Two tolerances at once:
+        // basename() wrapping the parameter is transparent for matching purposes (FileAnalyzer's
+        // own referenced-index already matches by basename anyway), and the unresolvable leading
+        // `AKISMET__PLUGIN_DIR` constant is ignorable the same way a curated root-directory call
+        // already is — a bare identifier in concatenation position is virtually always a
+        // define()d bootstrap constant, not a genuinely unknowable value.
+        $result = $this->parse('<?php
+class Akismet {
+    public static function view( $name ) {
+        $file = AKISMET__PLUGIN_DIR . "views/" . basename( $name ) . ".php";
+        include $file;
+    }
+}
+Akismet::view( "activate" );
+');
+        // The prefix/suffix live on the assignment link (param -> local, where the
+        // concatenation actually happens); the sink link itself (local -> null) carries none,
+        // since `include $file;` has no concatenation of its own — the resolver accumulates
+        // prefix/suffix while walking the graph, the same way testLiteralPathPropagation
+        // CapturesPositionalAndKeyedWrapperInputs above checks it.
+        $pathLinks = array_values(array_filter(
+            $result->literalPathPropagationLinks,
+            fn($link) => $link->prefix !== '' || $link->suffix !== '',
+        ));
+        self::assertCount(1, $pathLinks);
+        self::assertSame('views/', $pathLinks[0]->prefix);
+        self::assertSame('.php', $pathLinks[0]->suffix);
+        self::assertTrue(array_any(
+            $result->literalPathPropagationLinks,
+            fn($link) => $link->isSink,
+        ));
+
+        $inputs = [];
+        foreach ($result->literalPathInputs as $input) {
+            $inputs[$input->targetNode] = $input->literal;
+        }
+        self::assertSame('activate', $inputs['Akismet::view#param:0'] ?? null);
+    }
+
+    public function testLiteralPathPropagationDoesNotTreatArbitraryTransformAsAPathTemplate(): void
+    {
+        // A wrapper that happens to pass its parameter through str_replace() into require is not
+        // a fixed prefix + parameter + suffix path construction. Keeping its output unresolved
+        // prevents ordinary transformations from suppressing unrelated unused-file findings.
+        $result = $this->parse('<?php
+function include_transformed( $name ) {
+    $path = str_replace( "/", "-", $name );
+    require $path;
+}
+include_transformed( "inc/orphan" );
+');
+
+        self::assertEmpty(array_filter(
+            $result->literalPathPropagationLinks,
+            fn($link) => $link->isSink,
+        ));
+    }
+
+    public function testLiteralPathPropagationRejectsUnknownConcatenatedPathSegments(): void
+    {
+        // A fixed extension alone must not make `$base . $name . '.php'` a known project path:
+        // the untracked base can point outside the project or at any sibling directory. Only the
+        // explicitly recognized WordPress root-directory APIs may be omitted from a path shape.
+        $result = $this->parse('<?php
+function include_file( $name ) {
+    $path = $base . $name . ".php";
+    require $path;
+}
+include_file( "orphan" );
+');
+
+        self::assertEmpty(array_filter(
+            $result->literalPathPropagationLinks,
+            fn($link) => $link->prefix !== '' || $link->suffix !== '',
+        ));
+    }
+
+    public function testLiteralPathPropagationCapturesStaticAndKnownInstanceMethodHops(): void
+    {
+        // Calls already resolved to their concrete receiver class must seed the same graph as
+        // named calls. This covers late-static forwarding plus a type-hinted receiver and an
+        // instance whose class was established by `new`, without granting that precision to an
+        // arbitrary object variable.
+        $result = $this->parse('<?php
+class PathLoader {
+    public static function load( $slug ) {}
+    public static function through_static( $slug ) {
+        static::load( $slug );
+    }
+}
+function bootstrap( PathLoader $typed ) {
+    PathLoader::through_static( "static" );
+    $typed->load( "typed" );
+    $created = new PathLoader();
+    $created->load( "new" );
+}
+');
+
+        $inputs = [];
+        foreach ($result->literalPathInputs as $input) {
+            $inputs[$input->targetNode][] = $input->literal;
+        }
+        self::assertSame(['static'], $inputs['PathLoader::through_static#param:0'] ?? null);
+        self::assertSame(['typed', 'new'], $inputs['PathLoader::load#param:0'] ?? null);
+        self::assertContains(
+            'PathLoader::through_static#param:0',
+            array_map(fn($link) => $link->fromNode, array_filter(
+                $result->literalPathPropagationLinks,
+                fn($link) => $link->toNode === 'PathLoader::load#param:0',
+            )),
+        );
+    }
+
+    public function testCronScheduleFuncPassThroughParamIsRecordedAgainstDeclaringFunction(): void
+    {
+        // Real-world shape (WooCommerce): `schedule_variation_summary_regeneration( $action_name,
+        // ... ) { as_schedule_single_action( $timestamp, $action_name, $args, $group ); }` — the
+        // hook name passes through unchanged, no concatenation, no transform. as_schedule_single_
+        // action's own hook-tag argument is position 1 (see CRON_SCHEDULE_FUNCS).
+        $result = $this->parse('<?php
+class WC_Post_Data {
+    private static function schedule_variation_summary_regeneration( $action_name, $timestamp, $args, $group ) {
+        as_schedule_single_action( $timestamp, $action_name, $args, $group );
+    }
+}
+');
+        self::assertSame(
+            0,
+            $result->hookPassThroughParams['WC_Post_Data::schedule_variation_summary_regeneration'] ?? null,
+        );
+    }
+
+    public function testClosureHookPassThroughParamResolvesAtItsOwnCallSite(): void
+    {
+        // Real-world shape (WooCommerce, wc-product-functions.php:575-611): a local closure
+        // assigned to $schedule takes the hook name as its own parameter and passes it through
+        // unchanged to as_schedule_single_action() — entirely local, resolved immediately at
+        // $schedule(...)'s own call site rather than through cross-file merging.
+        $result = $this->parse('<?php
+function wc_schedule_product_sale_events( $product ) {
+    $schedule = function ( $date, $hook ) {
+        as_schedule_single_action( time(), $hook, array(), "woocommerce-sales" );
+    };
+    $schedule( $product->get_date_on_sale_from( "edit" ), "wc_product_start_scheduled_sale" );
+    $schedule( $product->get_date_on_sale_to( "edit" ), "wc_product_end_scheduled_sale" );
+}
+');
+        $tags = array_column($result->hookInvocations, 'tag');
+        self::assertContains('wc_product_start_scheduled_sale', $tags);
+        self::assertContains('wc_product_end_scheduled_sale', $tags);
     }
 
     public function testLocalVariableTypeDoesNotLeakAcrossFunctions(): void

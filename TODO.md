@@ -245,6 +245,27 @@ scope limit that trades recall or precision for staying a single-pass, no-depend
 
 ## Method detection
 
+- [x] **A namespaced `Class::method` callback assembled as `__NAMESPACE__ .
+  '\Class::method'` was resolved as a global class.** Fresh corpus evidence: LiteSpeed Cache
+  registers its uninstall callback in `src/core.cls.php` as `register_uninstall_hook(
+  $plugin_file, __NAMESPACE__ . '\Activation::uninstall_litespeed_cache')`, while the public
+  static method is declared by `LiteSpeed\Activation` in `src/activation.cls.php`. The parser
+  already split the literal at `::`, but passed the remaining `\Activation` to `resolveFqcn()`;
+  the leading slash therefore incorrectly made it global `Activation`, leaving the real method
+  reported unused. Fixed: the bare-class-string callback path now recognizes the exact adjacent
+  `T_NS_C . '\Class::method'` token shape and combines the current namespace and suffix directly
+  before recording the scoped method call. An ordinary standalone `'\Global_Class::method'`
+  remains explicitly global, so this does not broaden callback matching beyond PHP's known
+  namespace-constant construction. The same portable pattern resolved 12 genuine LiteSpeed
+  callback methods (71 → 59 unused methods), with no other corpus target changing.
+
+  Verified with new parser-level (`testNamespaceConcatenatedClassMethodCallbackUsesCurrentNamespace`)
+  and analyzer-level (`testNamespaceConcatenatedClassMethodCallbackCountsAsCall`) regressions;
+  the latter retains an actually-unused sibling method. Full `composer check` is clean (577
+  PHPUnit tests, PHPStan, and formatting), and before/after `--type=all` scans of all 28 supplied
+  plugins/themes changed only LiteSpeed Cache as described and WP Rig's separately-fixed template
+  finding below.
+
 - [x] **Contract-method exemption (`ClassAnalyzer::isContractMethod`) only checks the declaring
   class's own `extends`/`implements`, not the full inheritance chain.** Fixed: `isContractMethod`
   now walks `$classDefsByName` via `$def->extends[0]` (bounded by `MAX_INHERITANCE_DEPTH = 50` to
@@ -1421,6 +1442,23 @@ way the class/method/file gaps above were found; nothing here has been fixed yet
 
 ## Template detection
 
+- [x] **A Rector configuration file at a classic/hybrid theme's root was misclassified as an
+  unused WordPress template.** Fresh corpus evidence: WP Rig's `rector.php` imports
+  `Rector\Config\RectorConfig` and returns Rector's configuration closure, yet
+  `collectTemplateFiles()` treated every root PHP file other than `functions.php`/`index.php` as
+  a theme-template candidate and reported it `UnusedTemplate`. Fixed with the deliberately
+  narrow, tool-convention-based `ROOT_TOOLING_CONFIG_FILES` exclusion for Rector's documented
+  `rector.php` entrypoint — not a theme-specific path or a broad guess based on arbitrary file
+  contents. Other root PHP files continue to be evaluated as classic-theme template candidates.
+
+  Verified with a new `TemplateAnalyzerTest::testRectorConfigEntrypointIsNotTreatedAsAThemeTemplate`
+  regression plus `testOtherUnreferencedRootPhpFileRemainsATemplateCandidate` proving the
+  exception does not hide arbitrary root PHP. WP Rig's `--type=all` result drops only
+  `rector.php` (one unused template → none); full `composer check` is clean (577 PHPUnit tests,
+  PHPStan, and formatting), and before/after scans of all 28 supplied corpus targets show no
+  other template or target changes beyond LiteSpeed Cache's separately-fixed callback methods
+  above.
+
 - [x] **`TemplateAnalyzer` doesn't know about `Template Name:` custom page templates.** Fixed:
   `TemplateAnalyzer` now has its own `hasPageTemplateHeader()` (same regex as
   `FileAnalyzer`'s), checked right alongside `isHierarchyTemplate()` for every collected
@@ -1816,44 +1854,103 @@ own bar for "worth building" is usually cleared at 2+ independent instances plus
 low-risk implementation path — neither item here clears both). Re-read this entry before picking
 either back up; don't re-discover the same evidence from scratch.
 
-- [ ] **A hook/action name passed as a literal argument to a private wrapper function or closure,
-  which internally calls an already-recognized hook-firing function using that parameter, isn't
-  resolved.** Confirmed **twice** in WooCommerce alone:
-  - `includes/class-wc-post-data.php`: `self::schedule_variation_summary_regeneration(
-    'wc_regenerate_attribute_variation_summaries', ...)` / `('wc_regenerate_product_variation_
-    summaries', ...)` — the private static method's own body does
-    `as_schedule_single_action($timestamp, $action_name, $args, $group)` using its own
-    `$action_name` parameter.
-  - `includes/wc-product-functions.php:610-611`: a local closure assigned to `$schedule`, called
-    as `$schedule($date, 'wc_product_start_scheduled_sale')` /
-    `('wc_product_end_scheduled_sale')`, whose body does `as_schedule_single_action($timestamp,
-    $hook, $args, 'woocommerce-sales')` using its own `$hook` parameter.
+- [x] **A hook/action name passed as a literal argument to a private wrapper *function or
+  method*, which internally calls an already-recognized hook-firing function using that
+  parameter unchanged, wasn't resolved.** Confirmed real-world (WooCommerce,
+  `includes/class-wc-post-data.php`): `self::schedule_variation_summary_regeneration(
+  'wc_regenerate_attribute_variation_summaries', ...)` / `('wc_regenerate_product_variation_
+  summaries', ...)` — the private static method's own body does
+  `as_schedule_single_action($timestamp, $action_name, $args, $group)` using its own
+  `$action_name` parameter, no concatenation, no transform. Both hooks are real,
+  `add_action()`-registered, and genuinely fire, but showed as `UnmatchedHook` since nothing at
+  the sink call site is a *direct* literal argument — the literal only reaches it via an
+  intermediate parameter one call away.
 
-  Both hooks are real, `add_action()`-registered, and genuinely fire — but show as
-  `UnmatchedHook`, since nothing here is a *direct* literal argument to a recognized hook-firing
-  function; the literal only reaches one via an intermediate parameter one call away. Fixing this
-  generally means a real (if narrow) form of interprocedural constant propagation: correlate a
-  literal argument at a call site with the callee's own parameter, then treat that parameter's use
-  inside a `CRON_SCHEDULE_FUNCS`/`HOOK_INVOKE_FUNCS` call as if the literal were passed directly.
-  Meaningfully harder than anything else fixed this session (a new analysis capability, not a
-  list addition or a token-shape extension) — two independent real occurrences in one plugin
-  suggest it recurs, but not yet enough evidence (or a low-risk enough design) to justify the
-  effort over the many bounded, low-risk fixes this session found instead.
+  Fixed with a small, targeted piece rather than the full `LiteralPathPropagationResolver` graph
+  (that mechanism is scoped to file/template sinks only): `captureHookPassThroughParam()`
+  recognizes a `CRON_SCHEDULE_FUNCS`/`HOOK_INVOKE_FUNCS` call whose hook-tag argument is a bare
+  variable resolving to one of the *enclosing* function's own `#param:N` graph nodes (reusing
+  the node map `LiteralPathPropagation` already builds for every function — no new per-function
+  tracking needed), and records `(functionKey, paramPosition)` into
+  `$hookPassThroughParams`. `HookAnalyzer` resolves this directly against `$literalPathInputs`
+  (already populated for every named/scoped call site project-wide, not just file-related ones)
+  once every file is merged: any literal argument at that exact parameter position credits the
+  hook as fired, the same way a direct literal at the sink already would. Verified: WooCommerce's
+  `UnmatchedHook` count drops (both `wc_regenerate_*_variation_summaries` findings gone), no
+  regressions and no crashes across the full corpus.
 
-- [ ] **A literal reaching a recognized sink (`TEMPLATE_FUNCS`, an `include`, a dynamic function
-  call) two or more function-call hops away isn't resolved — only a direct literal argument at
-  the sink itself is.** Real-world finding (wpforms-lite): `wpforms_render('admin/challenge/
-  embed', [...])` (`src/Admin/Challenge.php:625`) → body is `return Templates::get_html(...)` →
-  `Templates::include_html()` → `Templates::locate()` builds the path → `require $located` /
-  `load_template()`. The literal first arg is right there at the outermost call, but two
-  function-call hops removed from the actual `TEMPLATE_FUNCS` sink — accounts for a large chunk
-  of wpforms-lite's 118 `UnusedTemplate` findings (`admin/challenge/embed.php`,
-  `admin/challenge/modal.php`, `admin/challenge/welcome.php`, `admin/components/chart.php`, all
-  confirmed live via `wpforms_render()`). Same family as the WooCommerce hook-name-through-a-
-  wrapper-parameter item above — confirms the pattern also applies to file/template sinks, not
-  just hooks/methods. If a shared interprocedural-constant-propagation mechanism ever gets built
-  for those, design it to cover include/template sinks too, not just hook-firing and method-
-  dispatch calls.
+  **Also fixed — the closure variant:** `includes/wc-product-functions.php:575-611`, a local
+  closure assigned to `$schedule`, called as `$schedule($date, 'wc_product_start_scheduled_sale')`
+  / `('wc_product_end_scheduled_sale')`, whose body does `as_schedule_single_action($timestamp,
+  $hook, $args, 'woocommerce-sales')` using its own `$hook` parameter. Same pass-through shape,
+  but the call site is `$schedule(...)` — variable-as-function dispatch, which this parser
+  doesn't track receivers/parameters for in general, so it needed its own small, entirely local
+  mechanism rather than an extension of `captureHookPassThroughParam()`'s named/scoped-call
+  machinery:
+  - A closure has no stable `Class::method` key the way a named function/method does, so it gets
+    no `LiteralPathPropagation` graph node at all (that machinery deliberately skips anonymous
+    closures). Instead, `$var = function ($date, $hook) { ... };` is recognized directly at the
+    `T_FUNCTION` token (backward-checking for `$var =` immediately before it), capturing the
+    closure's own parameter names via the same `parseFunctionParameterNames()` used for named
+    functions.
+  - Inside the closure's body, a new `captureClosureHookPassThroughParam()` — the closure-local
+    sibling of `captureHookPassThroughParam()` — matches a `CRON_SCHEDULE_FUNCS`/
+    `HOOK_INVOKE_FUNCS` call's bare-variable tag argument against the closure's own parameter
+    *names* (not a node map), recording which parameter position holds the hook name, keyed by
+    the variable the closure is currently assigned to.
+  - At the closure's own call site (`$schedule(...)`), a new bare-variable-invocation check
+    (previously entirely unhandled) looks up that recorded position and, if the literal argument
+    there resolves, emits a `HookInvocation` immediately — no merge-later `Pending*` struct
+    needed, since a closure can never leak its identity to another file.
+  - **Bug caught during implementation:** the closure's own body opens a fresh function scope
+    like any other declaration (`$expectingFunctionOpen` fires unconditionally for every
+    function/method/closure), which was pushing a *new* `$closureHookPassThroughParamStack`
+    frame for the closure's own body — meaning every match got recorded into a frame that was
+    discarded the instant the closure's own `}` closed, before the outer `$schedule(...)` call
+    was ever reached. Fixed by skipping that stack's push/pop specifically when the scope being
+    opened/closed is *also* a closure scope (checked via `$closureVarDepthStack`), so matches
+    land in the enclosing scope's frame instead — pinned directly with
+    `testClosureHookPassThroughParamResolvesAtItsOwnCallSite`, not just corpus verification.
+  Verified: WooCommerce's `UnmatchedHook` count drops 48 → 46 (both `wc_product_*_scheduled_sale`
+  findings gone), no regressions and no crashes across the full corpus.
+
+- [x] **A literal reaching an include/template sink through named or scoped wrappers was only
+  recognized at the sink itself.** Confirmed real-world finding (wpforms-lite):
+  `wpforms_render('admin/challenge/embed', [...])` in `src/Admin/Challenge.php` passes its first
+  parameter through `Templates::get_html()` and `Templates::include_html()`;
+  `include_html()` appends `'.php'`, obtains `Templates::locate($template_name)` through
+  `apply_filters()`, then reaches `load_template($located)`/`require $located`. Thus the
+  outermost literal was several calls removed from the real template sink, leaving
+  `admin/challenge/embed.php`, `admin/challenge/modal.php`, `admin/challenge/welcome.php`, and
+  `admin/components/chart.php` among 118 apparent `UnusedTemplate` findings despite live
+  `wpforms_render()` call sites.
+
+  Fixed by the shared bounded `LiteralPathPropagationResolver`: the tokenizer records only
+  exact parameter/local/return links through named or resolved scoped calls, applies fixed
+  prefix/suffix fragments, and follows them for at most 16 links to `include`/`require` or a
+  WordPress template sink (`load_template()` and the existing template-loader family). It also
+  accepts the two portable, independently justified pass-through forms in this evidence:
+  `apply_filters($tag, $value, ...)`'s documented value position and PHP-core
+  `ltrim($path, '/')`; neither permits arbitrary transformations. This follows the same
+  coarse-net philosophy as existing deferred resolution, but requires at least one fixed path
+  fragment before a direct parameter-to-include can suppress a finding — it is specifically not
+  an "any function that passes a variable" rule.
+
+  **Scope limitation:** Literal values must be direct positional strings or direct literal
+  key/value entries of an array argument; wrapper assignments must be a direct local/array-key
+  flow, fixed concatenation, the two pass-through forms above, or a resolved scoped return.
+  Dynamic function callbacks, variable-as-function calls, arbitrary string transforms, and the
+  separate `wpforms_settings_output_field()` callback/config-array shape below remain unresolved.
+
+  Verified with parser regressions for positional/keyed inputs and a rejecting arbitrary
+  `str_replace()` transform, plus a `TemplateAnalyzer` end-to-end chain retaining an
+  unconstructed direct-parameter orphan. Before/after current-corpus scans reduce wpforms-lite
+  `UnusedTemplate` findings **118 → 42** (−76); direct graph inspection finds 113 literal
+  `wpforms_render` inputs, 90 resolved paths, and 80 matching bundled templates (the four
+  remaining already-referenced paths explain the 76-finding delta). The remaining 42 template
+  findings are outside that resolved `wpforms_render` path. All 28 supplied targets were
+  re-scanned with no crash; no other target/category count changed. Final `composer check` is
+  clean (PHP-CS-Fixer, PHPStan, and PHPUnit).
 
   Related, same file, but turns out to be a *fourth*, deeper shape on investigation (re-read this
   before attempting it — see the Group 2 gap-hunt session that also fixed the Sydney/WooCommerce
@@ -1871,29 +1968,39 @@ either back up; don't re-discover the same evidence from scratch.
   tractability than the other three items in this family; not attempted when Sydney/WooCommerce
   were fixed.
 
-- [ ] **A scoped call's literal argument reaches an `include`/`require` only after the callee's
-  own body wraps the parameter in a transform function (`basename($param)`) before concatenating
-  a fixed prefix/suffix around it — the existing bulk-directory-loader mechanism
+- [x] **A scoped call's literal argument reached an `include`/`require` only after the callee's
+  own body wrapped the parameter in a transform function (`basename($param)`) before
+  concatenating a fixed prefix/suffix around it — the existing bulk-directory-loader mechanism
   (`PendingDirectoryLoaderCall`) is the wrong shape for this and can't be patched into fitting.**
   Real-world finding (Akismet): `Akismet::view($name)` (`class.akismet.php:2078-2088`) does
   `$file = AKISMET__PLUGIN_DIR . 'views/' . basename( $name ) . '.php'; ... include $file;`,
   called throughout as `Akismet::view('activate')`, `Akismet::view('notice', ...)`, etc. — a
   textbook scoped-call-with-literal-first-arg-reaching-an-include, except **100% of Akismet's 14
   `UnusedFile` findings** (`activate.php`, `notice.php`, `start.php`, ... every file under
-  `views/`) are still flagged. Root cause isn't really the `basename()` wrapper specifically —
-  even without it, `PendingDirectoryLoaderCall` treats the literal argument (`'activate'`) as a
+  `views/`) were flagged. Root cause wasn't really the `basename()` wrapper specifically — even
+  without it, `PendingDirectoryLoaderCall` treats the literal argument (`'activate'`) as a
   *directory name* to exempt wholesale (the shape that fits `Foo::bulkLoad('inc')`: exempt the
   whole `inc/` tree), not as a filename to resolve to one specific file via a prefix/suffix
-  template the callee's body reveals. A real fix means extracting the callee's own path-template
-  shape (fixed prefix + parameter + fixed suffix, tolerant of a small curated set of safe
-  wrapper transforms like `basename()`) once per method, then applying it to every caller's
-  literal argument to resolve one specific file — genuinely new interprocedural
-  constant-propagation capability, not a bulk-directory tweak. Same family as the two-hop
-  wrapper-to-`include`/template-sink items above (WooCommerce hook-wrapper, Sydney dispatch,
-  wpforms two-hop, Blocksy two-hop below) — if a shared mechanism ever gets built for that family,
-  this is the "single specific file via a parameter-derived filename" variant of it, distinct from
-  the "whole subtree via a directory-name argument" case `PendingDirectoryLoaderCall` already
-  handles.
+  template the callee's body reveals — a fundamentally different shape.
+
+  Fixed by extending the shared `LiteralPathPropagationResolver` graph (see the wpforms/Blocksy
+  items above) with two small, evidence-driven tolerances, rather than a bespoke Akismet
+  mechanism:
+  - `literalPathNodeFromTokens()` now recognizes `basename( $param )` as transparent for
+    matching purposes — it resolves to the exact same graph node its inner expression would.
+    This is a safe no-op specifically because `FileAnalyzer`'s own referenced-index already
+    matches by `basename()` regardless of what the caller passes; the transform never changes
+    what the tool can prove.
+  - A new `isLiteralPathIgnorableConstantExpression()` tolerates a bare, unresolvable named
+    constant (`AKISMET__PLUGIN_DIR`) as an ignorable concatenation term, the same "deterministic
+    absolute root this parser doesn't need to resolve" treatment `isLiteralPathRootDirectoryExpression`
+    already gives `get_template_directory()`/`get_stylesheet_directory()` — just generalized to
+    the equally common WP-plugin-bootstrap `define()`d PATH/DIR constant convention instead of a
+    curated pair of function names. A bare identifier term in concatenation position is virtually
+    always a constant reference, not a genuinely unknowable value.
+  Verified: Akismet's `UnusedFile` count drops **14 → 0** (`bin/wp-specter scan
+  ../wp-tests/plugins/akismet` reports "All clear"), no regressions and no crashes across the
+  full corpus.
 
 - [ ] **WooCommerce's PayPal IPN handler dispatches via `payment_status_{$posted['payment_status']}`**
   (`class-wc-gateway-paypal-ipn-handler.php:76`) — genuinely unenumerable from static code alone
@@ -1902,22 +2009,41 @@ either back up; don't re-discover the same evidence from scratch.
   `render_{$column}_column` dispatch found alongside this is now fixed — see the Method detection
   section above.)
 
-- [ ] **A literal argument reaching `include`/`require` two hops through wrapper functions, at
-  far larger real-world scale than any prior instance of this family.** Real-world finding
-  (Blocksy theme): `blocksy_get_options('general/buttons')` → body does `$path =
-  get_template_directory() . '/inc/options/' . $arg . '.php'` → `blocksy_get_variables_from_file(
-  $path, ...)` → that function's body does `require $file_path`. A second, keyed-array-argument
-  variant: `blocksy_theme_get_dynamic_styles(['name' => 'global-inline', ...])` → body builds
-  `'/inc/dynamic-styles/' . $args['name'] . '.php'` → same `require`-via-wrapper. **Accounts for
-  essentially all 77 of Blocksy's `UnusedFile` findings** (its entire `inc/options/`+
-  `inc/dynamic-styles/` tree) — by far the largest confirmed real-world cost of this whole
-  deferred family (WooCommerce hook-wrapper, Sydney dispatch, wpforms two-hop template, Akismet's
-  single-file variant above). General shape: a two-hop call chain — outer call has a literal
-  (positional or array-key) argument; the immediate callee concatenates a fixed prefix/suffix
-  around that argument into a path (stored in a local variable); a second callee (reached by
-  passing that variable) does the actual `require`/`include`. If a shared interprocedural
-  mechanism is ever built for this family, this instance alone likely justifies it on cost/benefit
-  grounds — re-read this entry first rather than re-deriving the evidence.
+- [x] **A literal positional or keyed-array argument reaching `include`/`require` through a
+  fixed-path wrapper and a second require helper was not resolved.** Confirmed real-world
+  evidence (Blocksy theme): `blocksy_get_options('general/buttons')` in
+  `admin/helpers/options.php` builds `get_template_directory() . '/inc/options/' . $path .
+  '.php'` and passes `$path` to `blocksy_get_variables_from_file()` in `inc/helpers.php`, whose
+  body does `require $file_path`. The sibling
+  `blocksy_theme_get_dynamic_styles(['name' => 'global-inline', ...])` form in
+  `inc/helpers/dynamic-css.php` first preserves its caller-supplied array via `wp_parse_args()`,
+  builds `$args['path']` as `'/inc/dynamic-styles/' . $args['name'] . '.php'`, then calls the
+  same require helper.
+
+  Fixed by the shared literal-path graph described in the wpforms item above, rather than any
+  Blocksy-specific name/path rule. It tracks the declared parameter position (or a direct
+  literal keyed array entry), its fixed prefix/suffix construction, and the exact named/scoped
+  call that passes the local result to another wrapper's parameter. A `wp_parse_args($sameArray,
+  ...)` normalization preserves explicitly supplied literal keys because that is WordPress
+  core's documented merge behavior; no other arbitrary array transform is accepted. This
+  resolves each concrete file path rather than incorrectly exempting a directory as a
+  bulk-loader.
+
+  **Scope limitation:** It does not infer values from computed array keys, `array_merge()`,
+  callback/config-array iteration, concatenated literals at the call site, or arbitrary
+  sanitizers/transforms. A chain without at least one fixed prefix/suffix segment still cannot
+  suppress an `UnusedFile`, even if its final helper contains `require`.
+
+  Verified in the parser test's independent positional and keyed fixtures and the
+  `FileAnalyzer` end-to-end regression, including a bare parameter-to-require negative case.
+  On the supplied current Blocksy corpus, graph inspection resolves **70 existing
+  `inc/options/` paths and 24 existing `inc/dynamic-styles/` paths** through these exact two
+  forms. Its current baseline already reported `UnusedFile` **0 → 0**, so that historic
+  77-finding cost cannot produce an additional visible scan delta in this worktree; the new
+  resolver's exact paths and isolated analyzer regression are the attributable verification.
+  All 28 supplied targets were re-scanned with no crash; only wpforms-lite's separately
+  documented template count changed. Final `composer check` is clean (PHP-CS-Fixer, PHPStan,
+  and PHPUnit).
 
 - [ ] **A class-property array of literal-string entries, iterated by a shared trait/base method
   that registers `[$this, transform(literal)]` as an `add_action`/`add_filter` callback where

@@ -219,6 +219,48 @@ as_schedule_cron_action( time(), '*/5 * * * *', 'my_cron_task' );
         self::assertEmpty($this->analyzer->analyze([$file]));
     }
 
+    public function testCronScheduleFuncPassThroughWrapperCountsAsFiring(): void
+    {
+        // Real-world shape (WooCommerce, includes/class-wc-post-data.php): a private wrapper
+        // takes the hook name as its own parameter and passes it through unchanged to
+        // as_schedule_single_action() — the hook fires later inside Action Scheduler, never via a
+        // literal argument visible at that call site itself. The literal only appears at the
+        // wrapper's own call site, in a different file than the wrapper's declaration.
+        $wrapper = $this->write('<?php
+class WC_Post_Data {
+    private static function schedule_variation_summary_regeneration( $action_name, $timestamp, $args, $group ) {
+        as_schedule_single_action( $timestamp, $action_name, $args, $group );
+    }
+}
+');
+        $caller = $this->write('<?php
+add_action( "wc_regenerate_attribute_variation_summaries", "handler" );
+WC_Post_Data::schedule_variation_summary_regeneration( "wc_regenerate_attribute_variation_summaries", time(), array(), "woocommerce-db-updates" );
+');
+        self::assertEmpty($this->analyzer->analyze([$wrapper, $caller]));
+    }
+
+    public function testClosureHookPassThroughParamCountsAsFiring(): void
+    {
+        // Real-world shape (WooCommerce, includes/wc-product-functions.php:575-611): a local
+        // closure — not a named function or method — takes the hook name as its own parameter
+        // and passes it through unchanged to as_schedule_single_action(). Entirely local (a
+        // closure has no way to leak its identity to another file), so declaration and call
+        // sites are always in the same file, unlike the named-wrapper case above.
+        $file = $this->write('<?php
+add_action( "wc_product_start_scheduled_sale", "handler" );
+add_action( "wc_product_end_scheduled_sale", "handler" );
+function wc_schedule_product_sale_events( $product ) {
+    $schedule = function ( $date, $hook ) {
+        as_schedule_single_action( time(), $hook, array(), "woocommerce-sales" );
+    };
+    $schedule( $product->get_date_on_sale_from( "edit" ), "wc_product_start_scheduled_sale" );
+    $schedule( $product->get_date_on_sale_to( "edit" ), "wc_product_end_scheduled_sale" );
+}
+');
+        self::assertEmpty($this->analyzer->analyze([$file]));
+    }
+
     // ── WP core stub suppression ───────────────────────────────────────────
 
     public function testWpCoreHooksSilentlyIgnored(): void
