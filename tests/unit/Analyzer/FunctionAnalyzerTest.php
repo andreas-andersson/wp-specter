@@ -236,6 +236,45 @@ sydney_get_template_part( "content", "quick-view" );
         self::assertNotContains('sydney_get_template_part', $names);
     }
 
+    public function testCreditsFunctionBuiltFromAnArrayMapTransformOfADifferentFunctionsReturnedArray(): void
+    {
+        // Real-world shape (Botiga): botiga_get_quick_view_summary_components() runs
+        // array_map() over botiga_get_default_single_product_components()'s own returned array
+        // of literal function names, str_replace()-stripping a fixed prefix and rebuilding an
+        // interpolated dynamic function name — dispatched via call_user_func() elsewhere.
+        // botiga_quick_view_summary_title is never spelled out as a literal anywhere. The two
+        // functions live in different files, same as the real theme.
+        $domain = $this->write('<?php
+function botiga_get_default_single_product_components() {
+    $components = array(
+        "woocommerce_template_single_title",
+        "botiga_divider_output",
+    );
+    return apply_filters( "botiga_default_single_product_components", $components );
+}
+');
+        $transform = $this->write('<?php
+function botiga_get_quick_view_summary_components( $components = array() ) {
+    $components = array_map( function( $component ) {
+        $suffix = str_replace( "woocommerce_template_single_", "", $component );
+        if ( $component === "woocommerce_template_single_$suffix" ) {
+            return "botiga_quick_view_summary_$suffix";
+        }
+        return $component;
+    }, $components );
+    return apply_filters( "botiga_quick_view_product_components", $components );
+}
+');
+        $target = $this->write('<?php
+function botiga_quick_view_summary_title( $product ) {}
+function truly_unused_function() {}
+');
+        $findings = $this->analyzer->analyze([$domain, $transform, $target]);
+        $names = array_column($findings, 'name');
+        self::assertNotContains('botiga_quick_view_summary_title', $names);
+        self::assertContains('truly_unused_function', $names);
+    }
+
     public function testWpPrefixedFunctionsAreNotBlanketExcluded(): void
     {
         // A wp_/get_/the_/is_-prefixed name is no longer an automatic exemption on its own —

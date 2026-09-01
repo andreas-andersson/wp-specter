@@ -1020,6 +1020,331 @@ class WC_Admin_List_Table_Products {
         );
     }
 
+    public function testReturnedKeyedArrayLiteralIsTrackedAsClassArrayKeyLiterals(): void
+    {
+        // Real-world shape (WPForms): `smart_tags_list()` returns a big keyed array literal
+        // directly, rather than building it via repeated `$var['key'] = ...;` assignment.
+        $result = $this->parse('<?php
+class SmartTags {
+    protected function smart_tags_list() {
+        return [
+            "admin_email" => "Site Administrator Email",
+            "field_id"    => "Field ID",
+        ];
+    }
+}
+');
+        self::assertSame(
+            ['admin_email', 'field_id'],
+            $result->classArrayKeyLiterals['SmartTags'] ?? null,
+        );
+    }
+
+    public function testReturnedKeyedArrayLiteralStructuredCaptureBailsButGeneralHarvestStillFindsPlainKeys(): void
+    {
+        // resolveReturnedKeyedArrayLiteralKeys() itself still bails entirely the moment any key
+        // isn't a plain string literal (that structured, all-or-nothing capture is unchanged) —
+        // but the general "'literal' =>' anywhere in the class" harvest (see the real-world
+        // WooCommerce shape below) doesn't share that all-or-nothing requirement, so
+        // 'admin_email' is still independently captured through it.
+        $result = $this->parse('<?php
+class SmartTags {
+    protected function smart_tags_list() {
+        return [
+            "admin_email" => "Site Administrator Email",
+            $dynamic_key  => "Whatever",
+        ];
+    }
+}
+');
+        self::assertSame(['admin_email'], $result->classArrayKeyLiterals['SmartTags'] ?? null);
+    }
+
+    public function testDeeplyNestedArrayLiteralKeysAreHarvestedRegardlessOfDepthOrFlow(): void
+    {
+        // Real-world shape (WooCommerce): WC_Admin_Reports::get_reports() returns a 3-level-
+        // nested array literal built through a local variable, a conditional key assignment, and
+        // two apply_filters() hops — far deeper than the structured, single-level
+        // resolveReturnedKeyedArrayLiteralKeys() capture (or any $var['key']=/$this->prop=[...]
+        // shape) can reach. The general harvest doesn't trace any of that: every literal-key
+        // pair textually present in the class is credited, regardless of nesting depth or how
+        // (or whether) it actually flows to a return statement.
+        $result = $this->parse('<?php
+class WC_Admin_Reports {
+    public static function get_reports() {
+        $reports = array(
+            "orders" => array(
+                "title"   => "Orders",
+                "reports" => array(
+                    "sales_by_date" => array(
+                        "title"    => "Sales by date",
+                        "callback" => array( __CLASS__, "get_report" ),
+                    ),
+                ),
+            ),
+        );
+        if ( wc_tax_enabled() ) {
+            $reports["taxes"] = array(
+                "reports" => array(
+                    "taxes_by_code" => array( "title" => "Taxes by code" ),
+                ),
+            );
+        }
+        $reports = apply_filters( "woocommerce_admin_reports", $reports );
+        return $reports;
+    }
+}
+');
+        $keys = $result->classArrayKeyLiterals['WC_Admin_Reports'] ?? [];
+        self::assertContains('sales_by_date', $keys);
+        self::assertContains('taxes_by_code', $keys);
+    }
+
+    public function testSnakeCaseToPascalCaseClassNameTransformRecordsTemplate(): void
+    {
+        // Real-world shape (WPForms): `get_smart_tag_class_name()` turns a smart-tag key like
+        // 'admin_email' into the class name 'AdminEmail' via the canonical
+        // str_replace/ucwords/str_replace idiom, then concatenates it onto a fixed namespace
+        // prefix to build the fully-qualified class name. The doubled backslashes below (both
+        // in the fixture and in the expected value) are two escaping layers stacking up, not a
+        // typo — stripQuotes() never interprets PHP's own string escapes, so a source literal
+        // written `'\\WPForms\\...'` (one PHP-level escaped backslash per segment) is captured
+        // exactly as typed: two raw backslash bytes per segment.
+        $result = $this->parse('<?php
+class SmartTags {
+    protected function get_smart_tag_class_name( $smart_tag_name ) {
+        $class_name = str_replace( " ", "", ucwords( str_replace( "_", " ", $smart_tag_name ) ) );
+        $full_class_name = "\\\\WPForms\\\\SmartTags\\\\SmartTag\\\\" . $class_name;
+        return $full_class_name;
+    }
+}
+');
+        self::assertSame(
+            [[
+                '\\\\WPForms\\\\SmartTags\\\\SmartTag\\\\',
+                [['str_replace', ['_', ' ']], ['ucwords', []], ['str_replace', [' ', '']]],
+                '',
+            ]],
+            $result->classNameTransformTemplates['SmartTags'] ?? null,
+        );
+    }
+
+    public function testSnakeCaseToPascalCaseTransformIsNotRecordedWithoutANamespacePrefix(): void
+    {
+        // The literal must look like a namespace prefix (end in a backslash) — an unrelated
+        // "prefix + pascal-cased variable" concatenation (e.g. building a CSS class or a label)
+        // must not be mistaken for dynamic class-name construction.
+        $result = $this->parse('<?php
+class Labels {
+    protected function get_label( $key ) {
+        $pascal = str_replace( " ", "", ucwords( str_replace( "_", " ", $key ) ) );
+        $label = "Field: " . $pascal;
+        return $label;
+    }
+}
+');
+        self::assertArrayNotHasKey('Labels', $result->classNameTransformTemplates);
+    }
+
+    public function testTransformChainSpanningTwoStatementsIsResolved(): void
+    {
+        // Real-world shape (wp-nested-pages): Events::setHandlers() reassigns the same variable
+        // across two statements — `$class = str_replace('admin_post_np', '', $action); $class =
+        // ucfirst(str_replace('wp_ajax_np', '', $class));` — then concatenates it onto a fixed
+        // namespace prefix assigned to a complex lvalue (`$this->handlers[$key]->class = ...`),
+        // not a bare variable.
+        $result = $this->parse('<?php
+class Events {
+    public function setHandlers() {
+        foreach ($this->actions as $key => $action) {
+            $class = str_replace("admin_post_np", "", $action);
+            $class = ucfirst(str_replace("wp_ajax_np", "", $class));
+            $this->handlers[$key] = new \\stdClass();
+            $this->handlers[$key]->class = "NestedPages\\\\Form\\\\Listeners\\\\" . $class;
+        }
+    }
+}
+');
+        self::assertSame(
+            [[
+                'NestedPages\\\\Form\\\\Listeners\\\\',
+                [['str_replace', ['admin_post_np', '']], ['str_replace', ['wp_ajax_np', '']], ['ucfirst', []]],
+                '',
+            ]],
+            $result->classNameTransformTemplates['Events'] ?? null,
+        );
+    }
+
+    public function testSanitizeTitleIsATransparentIdentityStepInATransformChain(): void
+    {
+        // Real-world shape (WooCommerce): WC_Admin_Reports::get_report() does `$name =
+        // sanitize_title( str_replace( '_', '-', $name ) ); $class = 'WC_Report_' .
+        // str_replace( '-', '_', $name );` — sanitize_title() contributes nothing to the
+        // replayed transform (every domain value here is already a clean slug), so it must not
+        // appear as a step, but must not break the chain either.
+        $result = $this->parse('<?php
+class WC_Admin_Reports {
+    public static function get_report( $name ) {
+        $name = sanitize_title( str_replace( "_", "-", $name ) );
+        $class = "WC_Report_" . str_replace( "-", "_", $name );
+        return $class;
+    }
+}
+');
+        self::assertSame(
+            [[
+                'WC_Report_',
+                [['str_replace', ['_', '-']], ['str_replace', ['-', '_']]],
+                '',
+            ]],
+            $result->classNameTransformTemplates['WC_Admin_Reports'] ?? null,
+        );
+    }
+
+    public function testCurlyInterpolatedVariableWithPrefixAndSuffixRecordsATemplate(): void
+    {
+        // Real-world shape (WordPress SEO): `$callback = static function ( $presenter ) {
+        // return "Yoast\WP\SEO\Presenters\\{$presenter}_Presenter"; };` — a curly-brace
+        // interpolated variable with both a prefix and a suffix. Unlike every other confirmed
+        // shape, $presenter is never transformed at all — it's used exactly as the config array
+        // declared it, resolving to a zero-step identity.
+        $result = $this->parse('<?php
+class Front_End_Integration {
+    protected $base_presenters = [ "Title", "Meta_Description" ];
+    private function get_needed_presenters( $page_type ) {
+        $callback = static function ( $presenter ) {
+            return "Yoast\\\\WP\\\\SEO\\\\Presenters\\\\{$presenter}_Presenter";
+        };
+        return \\array_map( $callback, $this->base_presenters );
+    }
+}
+');
+        self::assertSame(
+            [[
+                'Yoast\\\\WP\\\\SEO\\\\Presenters\\\\',
+                [],
+                '_Presenter',
+            ]],
+            $result->classNameTransformTemplates['Front_End_Integration'] ?? null,
+        );
+    }
+
+    public function testCurlyInterpolatedVariableWithATransformedSourceStillResolves(): void
+    {
+        // A variable that *did* go through a recognized transform chain first must still
+        // resolve correctly through the curly-interpolation shape, not just the untransformed
+        // (identity) case above.
+        $result = $this->parse('<?php
+class Front_End_Integration {
+    private function build( $raw ) {
+        $presenter = ucfirst( $raw );
+        return "Yoast\\\\WP\\\\SEO\\\\Presenters\\\\{$presenter}_Presenter";
+    }
+}
+');
+        self::assertSame(
+            [[
+                'Yoast\\\\WP\\\\SEO\\\\Presenters\\\\',
+                [['ucfirst', []]],
+                '_Presenter',
+            ]],
+            $result->classNameTransformTemplates['Front_End_Integration'] ?? null,
+        );
+    }
+
+    public function testCurlyInterpolatedVariableWithANonClassShapedPrefixIsNotRecorded(): void
+    {
+        // Same class-name shape gate as the concatenation form: the prefix must either end in a
+        // namespace separator or look like a capitalized, underscore-joined identifier.
+        $result = $this->parse('<?php
+class Labels {
+    private function build( $key ) {
+        return "field-{$key}-value";
+    }
+}
+');
+        self::assertArrayNotHasKey('Labels', $result->classNameTransformTemplates);
+    }
+
+    public function testInlineUcfirstTransformIsRecognizedWithoutAPriorAssignment(): void
+    {
+        // Real-world shape (Jetpack tiled-gallery): the transform is applied directly inside
+        // the concatenation — `'Jetpack_Tiled_Gallery_Layout_' . ucfirst( $this->atts['type'] )`
+        // — with no intermediate variable assignment at all, and the innermost expression is a
+        // property-array-key read this parser can't identify further (resolved as an opaque
+        // zero-step base — see resolveTransformChainExpr()'s own $allowOpaqueBase docblock).
+        // The literal doesn't end in a namespace separator, so it's gated by the alternative
+        // "looks like a capitalized, underscore-joined identifier" shape check instead.
+        $result = $this->parse('<?php
+class Layout {
+    public function build() {
+        $class = "Jetpack_Tiled_Gallery_Layout_" . ucfirst( $this->atts["type"] );
+        return $class;
+    }
+}
+');
+        self::assertSame(
+            [['Jetpack_Tiled_Gallery_Layout_', [['ucfirst', []]], '']],
+            $result->classNameTransformTemplates['Layout'] ?? null,
+        );
+    }
+
+    public function testInlineTransformIsNotRecordedWhenTheLiteralDoesNotLookLikeAClassName(): void
+    {
+        // The literal must either end in a namespace separator or look like a capitalized,
+        // underscore-joined identifier ending in `_` — an unrelated "prefix + transformed
+        // variable" concatenation (a lowercase label, a CSS class, ...) must not be mistaken for
+        // dynamic class-name construction.
+        $result = $this->parse('<?php
+class Labels {
+    public function build( $key ) {
+        $label = "field-" . ucfirst( $key );
+        return $label;
+    }
+}
+');
+        self::assertArrayNotHasKey('Labels', $result->classNameTransformTemplates);
+    }
+
+    public function testPropertyAssignedAFlatLiteralArrayFeedsTheClassWideDomain(): void
+    {
+        // Real-world shape (wp-nested-pages): `$this->actions = [ 'wp_ajax_npsort', ... ];` — a
+        // property assigned a flat literal array, not built via repeated `$var['key'] = ...;`
+        // assignment or a returned keyed array literal (the two shapes $classArrayKeyLiterals
+        // already covered).
+        $result = $this->parse('<?php
+class Events {
+    public function registerEvents() {
+        $this->actions = [
+            "wp_ajax_npsort",
+            "admin_post_npBulkActions",
+        ];
+    }
+}
+');
+        self::assertSame(
+            ['wp_ajax_npsort', 'admin_post_npBulkActions'],
+            $result->classArrayKeyLiterals['Events'] ?? null,
+        );
+    }
+
+    public function testStaticPropertyDeclarationWithArrayDefaultFeedsTheClassWideDomain(): void
+    {
+        // Real-world shape (Jetpack tiled-gallery): `private static $talaveras = array(
+        // 'rectangular', 'square', ... );` — a class-body property *declaration* with a flat
+        // literal array default, not an assignment inside a method body (the shape the sibling
+        // test above covers).
+        $result = $this->parse('<?php
+class Layout {
+    private static $talaveras = array( "rectangular", "square", "circle" );
+}
+');
+        self::assertSame(
+            ['rectangular', 'square', 'circle'],
+            $result->classArrayKeyLiterals['Layout'] ?? null,
+        );
+    }
+
     public function testConcatenatedArrayCallbackMethodNameRegistersAScopedPrefixWhenLoopBoundIsNotLiteral(): void
     {
         // Same shape as the sibling test above, but the loop's upper bound comes from a
@@ -1042,6 +1367,54 @@ class My_Builder {
             $result->scopedMethodCallPrefixes,
         );
         self::assertContains('My_Builder::footer_html_', $prefixes);
+    }
+
+    public function testMethodExistsWithConcatenatedNameRecordsScopedPrefixAndSuffix(): void
+    {
+        // Real-world shape (WooCommerce, WC_Settings_API::generate_settings_html()):
+        // `method_exists($this, 'generate_' . $type . '_html')`, later dispatched via
+        // `$this->{'generate_' . $type . '_html'}(...)`. No array-callback shape at all — the
+        // function name itself (method_exists) is the whole signal that this position names a
+        // real method, so no domain enumeration is needed to credit every 'generate_*_html'
+        // method on the resolved receiver as reachable.
+        $result = $this->parse('<?php
+class WC_Settings_API {
+    public function generate_settings_html( $type ) {
+        if ( method_exists( $this, "generate_" . $type . "_html" ) ) {
+            return true;
+        }
+        return false;
+    }
+}
+');
+        self::assertEmpty($result->scopedMethodCalls);
+        $prefixes = array_map(
+            fn($p) => $p->receiverClass . '::' . $p->prefix . '|' . $p->suffix,
+            $result->scopedMethodCallPrefixes,
+        );
+        self::assertContains('WC_Settings_API::generate_|_html', $prefixes);
+    }
+
+    public function testMethodExistsWithCurlyInterpolatedNameRecordsScopedPrefix(): void
+    {
+        // Real-world shape (WPForms, Views/Overview/Table.php): `method_exists( $this,
+        // "get_column_{$column_name}" )` — the interpolated-string sibling of the concatenation
+        // shape above, no suffix in this real case.
+        $result = $this->parse('<?php
+class Overview_Table {
+    public function column_default( $item, $column_name ) {
+        if ( method_exists( $this, "get_column_{$column_name}" ) ) {
+            return true;
+        }
+        return false;
+    }
+}
+');
+        $prefixes = array_map(
+            fn($p) => $p->receiverClass . '::' . $p->prefix . '|' . $p->suffix,
+            $result->scopedMethodCallPrefixes,
+        );
+        self::assertContains('Overview_Table::get_column_|', $prefixes);
     }
 
     public function testBareCallbackNameConcatenatedWithBoundedLoopVarEnumeratesEveryRealName(): void
@@ -1071,6 +1444,30 @@ for ($i = 1; $i < 5; $i++) {
         self::assertContains('sydney_partial_slider_title_4', $names);
         self::assertNotContains('sydney_partial_slider_title_5', $names);
         self::assertNotContains('sydney_partial_slider_title_', $names);
+    }
+
+    public function testForeachConcatenatedStringCallableWithNamespacePrefixAndMethodSuffixEnumeratesEachClass(): void
+    {
+        // Real-world shape (litespeed-cache, thirdparty/entry.inc.php): `add_action(
+        // 'litespeed_load_thirdparty', 'LiteSpeed\Thirdparty\\' . $cls . '::detect');` inside
+        // `foreach ($third_cls as $cls) { ... }` — a fully-qualified string-callable whose class
+        // segment moves with the loop variable, sandwiched between a fixed namespace prefix and
+        // a fixed '::method' suffix. The prefix literal itself already ends in "\\", which makes
+        // the existing bare callback-name check see an empty trailing segment (not
+        // callback-shaped) — this needs each concrete enumerated string ('LiteSpeed\Thirdparty\
+        // Aelia_CurrencySwitcher::detect', ...) re-split on its own rightmost separator instead.
+        $result = $this->parse('<?php
+$third_cls = array( "Aelia_CurrencySwitcher", "Avada" );
+foreach ($third_cls as $cls) {
+    add_action("litespeed_load_thirdparty", "LiteSpeed\\Thirdparty\\\\" . $cls . "::detect");
+}
+');
+        $calls = array_map(
+            fn($c) => $c->receiverClass . '::' . $c->method,
+            $result->scopedMethodCalls,
+        );
+        self::assertContains('LiteSpeed\Thirdparty\Aelia_CurrencySwitcher::detect', $calls);
+        self::assertContains('LiteSpeed\Thirdparty\Avada::detect', $calls);
     }
 
     public function testFilePathConcatenatedWithBoundedLoopVarEnumeratesEveryPhpPathString(): void
@@ -1550,6 +1947,157 @@ class Helpers {
         self::assertSame(['.php'], $result->functionParamSuffixReturns['Helpers::view'] ?? null);
     }
 
+    public function testMethodReturningAPlainLiteralIsKeyedByOwnerClassInFunctionLiteralReturns(): void
+    {
+        // $functionLiteralReturns previously only tracked top-level named functions
+        // ($functionNameStack was null inside any method body) — a method's own `return
+        // 'literal';` was invisible to it entirely, unlike the sibling
+        // $functionParamSuffixReturns mechanism just above, which already keys by "Class::method".
+        $result = $this->parse('<?php
+class Templates {
+    protected function get_slug() {
+        return "general";
+    }
+}
+');
+        self::assertSame(['general'], $result->functionLiteralReturns['Templates::get_slug'] ?? null);
+    }
+
+    public function testMethodReturningSelfClassConstantIsResolvedInFunctionLiteralReturns(): void
+    {
+        // Real-world shape (WPForms): General::get_slug() returns `static::TEMPLATE_SLUG` — a
+        // bare class-constant return, previously unrecognized by resolveReturnLiterals() at all
+        // (only a direct literal, a variable, or apply_filters() were).
+        $result = $this->parse('<?php
+class General {
+    const TEMPLATE_SLUG = "general";
+    protected function get_slug() {
+        return static::TEMPLATE_SLUG;
+    }
+    protected function get_parent_slug() {
+        return self::TEMPLATE_SLUG;
+    }
+}
+');
+        self::assertSame(['general'], $result->functionLiteralReturns['General::get_slug'] ?? null);
+        self::assertSame(['general'], $result->functionLiteralReturns['General::get_parent_slug'] ?? null);
+    }
+
+    public function testMethodReturningAnExplicitClassConstantIsResolved(): void
+    {
+        // Real-world shape (WPForms): StripeCardTestingAlert::get_parent_slug() returns
+        // `Summary::TEMPLATE_SLUG` — an explicit class reference, not self/static.
+        $result = $this->parse('<?php
+class Summary {
+    const TEMPLATE_SLUG = "summary";
+}
+class StripeCardTestingAlert extends Summary {
+    public function get_parent_slug() {
+        return Summary::TEMPLATE_SLUG;
+    }
+}
+');
+        self::assertSame(['summary'], $result->functionLiteralReturns['StripeCardTestingAlert::get_parent_slug'] ?? null);
+    }
+
+    public function testMethodReturningAnUnresolvableClassConstantYieldsNoLiteral(): void
+    {
+        // No matching const declared anywhere — must not guess or crash.
+        $result = $this->parse('<?php
+class General {
+    protected function get_slug() {
+        return static::TEMPLATE_SLUG;
+    }
+}
+');
+        self::assertArrayNotHasKey('General::get_slug', $result->functionLiteralReturns);
+    }
+
+    public function testTopLevelFunctionLiteralReturnKeyingIsUnchanged(): void
+    {
+        // Same-name safety: a bare top-level function still keys by its own plain name, not
+        // qualified by any class, and is unaffected by the method-keying generalization above.
+        $result = $this->parse('<?php
+function ocean_single_post_header_template() {
+    return "partials/single/header";
+}
+');
+        self::assertSame(['partials/single/header'], $result->functionLiteralReturns['ocean_single_post_header_template'] ?? null);
+    }
+
+    public function testFunctionReturningAFlatLiteralArrayIsCapturedInFunctionArrayReturns(): void
+    {
+        // Real-world shape (Botiga): botiga_get_default_single_product_components() returns
+        // exactly this — a local variable built from a flat literal array, wrapped in
+        // apply_filters()'s own documented value position.
+        $result = $this->parse('<?php
+function botiga_get_default_single_product_components() {
+    $components = array(
+        "woocommerce_template_single_title",
+        "woocommerce_template_single_rating",
+    );
+    return apply_filters( "botiga_default_single_product_components", $components );
+}
+');
+        self::assertSame(
+            ['woocommerce_template_single_title', 'woocommerce_template_single_rating'],
+            $result->functionArrayReturns['botiga_get_default_single_product_components'] ?? null,
+        );
+    }
+
+    public function testInterpolatedTransformInsideAnArrayMapClosureRecordsAFunctionNameTemplate(): void
+    {
+        // Real-world shape (Botiga): botiga_get_quick_view_summary_components() runs
+        // array_map() over a components array, stripping a fixed prefix via str_replace() then
+        // rebuilding an interpolated (not concatenated) function name from the result.
+        $result = $this->parse('<?php
+function botiga_get_quick_view_summary_components( $components = array() ) {
+    $components = array_map( function( $component ) {
+        $suffix = str_replace( "woocommerce_template_single_", "", $component );
+        if ( $component === "woocommerce_template_single_$suffix" ) {
+            return "botiga_quick_view_summary_$suffix";
+        }
+        return $component;
+    }, $components );
+    return apply_filters( "botiga_quick_view_product_components", $components );
+}
+');
+        self::assertSame(
+            [['botiga_quick_view_summary_', [['str_replace', ['woocommerce_template_single_', '']]]]],
+            $result->functionNameTransformTemplates,
+        );
+    }
+
+    public function testInterpolatedTransformOutsideAnArrayMapClosureIsNotRecorded(): void
+    {
+        // The array_map()-closure gate matters: the same interpolated-transform shape outside
+        // that context must not be mistaken for a dynamic function-name dispatch.
+        $result = $this->parse('<?php
+function botiga_build_name( $component ) {
+    $suffix = str_replace( "woocommerce_template_single_", "", $component );
+    return "botiga_quick_view_summary_$suffix";
+}
+');
+        self::assertSame([], $result->functionNameTransformTemplates);
+    }
+
+    public function testInterpolatedTransformWithANonSnakeCasePrefixIsNotRecorded(): void
+    {
+        // The literal must look like a snake_case function-name prefix (lowercase, ends in
+        // `_`) — an unrelated interpolated string inside an array_map() closure must not be
+        // mistaken for dynamic function-name construction.
+        $result = $this->parse('<?php
+function botiga_build_label( $components ) {
+    $components = array_map( function( $component ) {
+        $suffix = str_replace( "woocommerce_template_single_", "", $component );
+        return "Label: $suffix";
+    }, $components );
+    return $components;
+}
+');
+        self::assertSame([], $result->functionNameTransformTemplates);
+    }
+
     public function testLiteralPathPropagationCapturesPositionalAndKeyedWrapperInputs(): void
     {
         // Blocksy supplies both shapes in production: a positional options slug and a keyed
@@ -1630,6 +2178,85 @@ Akismet::view( "activate" );
             $inputs[$input->targetNode] = $input->literal;
         }
         self::assertSame('activate', $inputs['Akismet::view#param:0'] ?? null);
+    }
+
+    public function testLiteralPathPropagationResolvesAMethodCallTermInAConcatenation(): void
+    {
+        // Real-world shape (WPForms): General::get_full_template_name() builds `'emails/' .
+        // $this->get_slug() . '-' . $name` — two non-literal terms in one concatenation
+        // ($this->get_slug() and $name), where resolveLiteralPathExpressionTokens's own
+        // one-dynamic-term-per-statement rule would normally bail entirely. get_slug() resolves
+        // to exactly one literal (via $functionLiteralReturns, see the sibling
+        // testMethodReturning* tests), so it's substituted as if it were a literal term
+        // directly, leaving $name as the sole flowing node.
+        $result = $this->parse('<?php
+class General {
+    const TEMPLATE_SLUG = "general";
+    public function get_slug() {
+        return static::TEMPLATE_SLUG;
+    }
+    protected function get_full_template_name( $name ) {
+        $template = "emails/" . $this->get_slug() . "-" . $name;
+        return $template;
+    }
+}
+');
+        $pathLinks = array_values(array_filter(
+            $result->literalPathPropagationLinks,
+            fn($link) => $link->prefix !== '' || $link->suffix !== '',
+        ));
+        self::assertCount(1, $pathLinks);
+        self::assertSame('emails/general-', $pathLinks[0]->prefix);
+        self::assertSame('', $pathLinks[0]->suffix);
+    }
+
+    public function testLiteralPathPropagationLeavesAMethodCallTermUnresolvedWithMultipleReturns(): void
+    {
+        // get_slug() here has two possible literal returns (an if/else, both branches literal) —
+        // this position needs exactly one deterministic value, not a set, so the whole
+        // concatenation is correctly left unresolved rather than guessing either branch.
+        $result = $this->parse('<?php
+class General {
+    public function get_slug() {
+        if ( $this->cond ) {
+            return "general";
+        }
+        return "classic";
+    }
+    protected function get_full_template_name( $name ) {
+        $template = "emails/" . $this->get_slug() . "-" . $name;
+        return $template;
+    }
+}
+');
+        $pathLinks = array_filter(
+            $result->literalPathPropagationLinks,
+            fn($link) => $link->prefix !== '' || $link->suffix !== '',
+        );
+        self::assertCount(0, $pathLinks);
+    }
+
+    public function testLiteralPathPropagationTreatsSanitizeFileNameAsAnIdentityTransform(): void
+    {
+        // Real-world shape (WPForms): `$name = \sanitize_file_name( $name );` — a backslash-
+        // qualified global call (WPForms' own code style throughout Templates.php/General.php),
+        // confirming the identity-transform check uses CLASS_NAME_TOKENS + shortClassName()
+        // rather than a bare T_STRING match that would miss the qualified form.
+        $result = $this->parse('<?php
+class General {
+    public function get_full_template_name( $name ) {
+        $name = \sanitize_file_name( $name );
+        $template = "emails/general-" . $name;
+        return $template;
+    }
+}
+');
+        $pathLinks = array_values(array_filter(
+            $result->literalPathPropagationLinks,
+            fn($link) => $link->prefix !== '' || $link->suffix !== '',
+        ));
+        self::assertCount(1, $pathLinks);
+        self::assertSame('emails/general-', $pathLinks[0]->prefix);
     }
 
     public function testLiteralPathPropagationDoesNotTreatArbitraryTransformAsAPathTemplate(): void

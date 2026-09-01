@@ -68,6 +68,55 @@ final class FileScanner
         }
     }
 
+    /**
+     * Every PHP file living under a vendor-prefixed directory (vendor/, vendor_prefixed/,
+     * jetpack_vendor/, ...) anywhere in the tree — the exact files scan() excludes from every
+     * other check. Used only for VendorHookInvocationScanner's cross-boundary hook-invocation
+     * scan (see HookAnalyzer::analyze()'s own docblock): auditing a dependency's own internal
+     * dead code stays out of scope, but a bundled dependency firing a hook the host project
+     * listens to is a normal WordPress pattern this scan needs to see.
+     *
+     * A deliberately separate walk from scan() rather than a shared one bucketing files two
+     * ways: scan()'s own directory-pruning (`RecursiveCallbackFilterIterator` returning `false`)
+     * means an excluded directory's contents are never even visited, so there's nothing to
+     * bucket from that same walk without restructuring it — simpler and lower-risk to walk the
+     * (much smaller, filesystem-only) directory tree once more here than to touch scan()'s own
+     * exclusion logic for a second, unrelated purpose.
+     *
+     * @return list<string>
+     */
+    public function scanVendorPrefixedFiles(string $dir): array
+    {
+        if (!is_dir($dir)) {
+            return [];
+        }
+
+        $files = [];
+        $dirIterator = new \RecursiveDirectoryIterator($dir, \FilesystemIterator::SKIP_DOTS);
+        $filtered = new \RecursiveCallbackFilterIterator(
+            $dirIterator,
+            fn(\SplFileInfo $current): bool => !$current->isDir() || !in_array($current->getFilename(), ['.git', 'node_modules'], true),
+        );
+        $iterator = new \RecursiveIteratorIterator($filtered);
+
+        foreach ($iterator as $file) {
+            /** @var \SplFileInfo $file */
+            if (!$file->isFile() || $file->getExtension() !== 'php') {
+                continue;
+            }
+            $path = $file->getPathname();
+            $relativeDir = ltrim(str_replace($dir, '', dirname($path)), '/');
+            foreach ($relativeDir === '' ? [] : explode('/', $relativeDir) as $segment) {
+                if ($this->isVendorPrefixedDirName($segment)) {
+                    $files[] = $path;
+                    break;
+                }
+            }
+        }
+
+        return $files;
+    }
+
     /** @param list<string> $excludes */
     private function shouldExcludeDir(string $path, array $excludes, string $root): bool
     {

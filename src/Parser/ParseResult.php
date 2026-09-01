@@ -87,16 +87,22 @@ final class ParseResult
      *                                           imports (see PhpTokenParser::parseUseImports).
      *                                           Used to resolve an extends/implements target to
      *                                           a real vendor class for VendorClassReflector.
-     * @param array<string,list<string>> $functionLiteralReturns Top-level function name => every
-     *                                           literal a `return` statement inside its body
-     *                                           resolved to (direct literal, a variable
-     *                                           accumulated from literal-only assignments, or
+     * @param array<string,list<string>> $functionLiteralReturns Function/method key ("Class::
+     *                                           method" for a method, bare name for a top-level
+     *                                           function — same convention as
+     *                                           $functionParamSuffixReturns) => every literal a
+     *                                           `return` statement inside its body resolved to
+     *                                           (direct literal, a variable accumulated from
+     *                                           literal-only assignments, a resolved `self::`/
+     *                                           `static::`/`Foo::` class constant, or
      *                                           apply_filters()'s own default-value argument —
-     *                                           see PhpTokenParser's T_RETURN handling). Lets a
+     *                                           see PhpTokenParser's T_RETURN handling and
+     *                                           resolveReturnLiterals()). Lets a
      *                                           get_template_part()-family call whose argument is
-     *                                           a bare call to one of these functions (see
-     *                                           $pendingTemplateHelperCalls) resolve to every
-     *                                           literal path that function might hand back.
+     *                                           a bare call to one of these top-level functions
+     *                                           (see $pendingTemplateHelperCalls — methods aren't
+     *                                           yet a recognized call-site shape there) resolve to
+     *                                           every literal path that function might hand back.
      * @param list<PendingTemplateHelperCall> $pendingTemplateHelperCalls
      * @param array<string,list<string>> $functionParamSuffixReturns Function/method key
      *                                           ("Class::method" for a method, bare name for a
@@ -156,6 +162,94 @@ final class ParseResult
      *                                           PhpTokenParser::captureHookPassThroughParam).
      *                                           Resolved against $literalPathInputs in
      *                                           HookAnalyzer.
+     * @param array<string,list<array{string,list<array{string,list<string>}>,string}>> $classNameTransformTemplates
+     *                                           Owner class => every [literal prefix, transform
+     *                                           steps, literal suffix] triple recognized as
+     *                                           building a dynamic class name from a variable —
+     *                                           either `'prefix' . $var` (suffix always `''`
+     *                                           there — literalConcatVarAt()), requiring $var to
+     *                                           have gone through a recognized
+     *                                           str_replace()/ucfirst()/ucwords() chain first, or
+     *                                           `"prefix{$var}suffix"` (curly-brace complex
+     *                                           interpolation —
+     *                                           interpolatedPrefixCurlyVarSuffixAt()), which
+     *                                           doesn't require any transform at all — a bare,
+     *                                           untransformed variable resolves to a zero-step
+     *                                           identity. See
+     *                                           PhpTokenParser::resolveTransformChainExpr's own
+     *                                           docblock for the transform-chain shapes (one
+     *                                           hardcoded idiom generalized twice after
+     *                                           independent real-world confirmations each used a
+     *                                           different transform combination, or none at all).
+     *                                           Steps are replayed in order by
+     *                                           WpSpecter\Support\StringTransformChain::apply(),
+     *                                           then the suffix appended. Cross-referenced
+     *                                           against $classArrayKeyLiterals (same owner class)
+     *                                           in ClassAnalyzer/FileAnalyzer, the same "no
+     *                                           literal call-site argument, cross-product against
+     *                                           every literal key/value the class ever declares"
+     *                                           trade-off $selfDispatchPrefixSuffixTemplates
+     *                                           already makes — except when the transform's own
+     *                                           source variable (`literalConcatVarAt()`'s chain
+     *                                           tuple, `[sourceVar, steps]`) matches an actively-
+     *                                           tracked `foreach` loop variable, in which case
+     *                                           that loop's own concrete values are pushed into
+     *                                           $classArrayKeyLiterals directly at capture time
+     *                                           instead (Elementor's widget/control/element
+     *                                           registries: `foreach ($build_widgets_filename as
+     *                                           $widget_filename) { $class_name = str_replace('-',
+     *                                           '_', $widget_filename); $class_name =
+     *                                           __NAMESPACE__ . '\Widget_' . $class_name; new
+     *                                           $class_name(); }` — the domain is a local flat
+     *                                           array, never a class-body array literal). A prefix
+     *                                           with a leading backslash but no trailing one (that
+     *                                           example's `'\Widget_'`) is the __NAMESPACE__
+     *                                           separator, not part of the literal short name —
+     *                                           ClassAnalyzer/FileAnalyzer strip it before
+     *                                           prepending.
+     * @param array<string,list<string>> $functionArrayReturns Function/method key (same
+     *                                           convention as $functionLiteralReturns) => every
+     *                                           literal value a function/method's own `return`
+     *                                           statement resolved to when the returned value is
+     *                                           a flat literal array rather than a scalar (a
+     *                                           bare `$var` tracked in `$anyArrayLiteralVars`, or
+     *                                           `apply_filters('tag', $var, ...)` wrapping one) —
+     *                                           see PhpTokenParser::resolveReturnArrayLiterals.
+     *                                           Real-world shape (Botiga):
+     *                                           `botiga_get_default_single_product_components()`
+     *                                           returns exactly this. Feeds
+     *                                           $functionNameTransformTemplates below.
+     * @param list<array{string,list<array{string,list<string>}>}> $functionNameTransformTemplates
+     *                                           Flat, project-wide list of [literal function-name
+     *                                           prefix, transform steps] pairs — the procedural
+     *                                           (no enclosing class) counterpart to
+     *                                           $classNameTransformTemplates, feeding
+     *                                           FunctionAnalyzer instead of Class/FileAnalyzer.
+     *                                           Real-world shape (Botiga):
+     *                                           `botiga_get_quick_view_summary_components()`
+     *                                           does `array_map(function($component){ $suffix =
+     *                                           str_replace('woocommerce_template_single_', '',
+     *                                           $component); if ($component ===
+     *                                           "woocommerce_template_single_$suffix") { return
+     *                                           "botiga_quick_view_summary_$suffix"; } return
+     *                                           $component; }, $components)` — the domain-
+     *                                           providing function and the transforming closure
+     *                                           are two unrelated top-level functions, not
+     *                                           methods sharing a class, so there's no owner to
+     *                                           scope the cross-product by the way
+     *                                           $classNameTransformTemplates is; every entry here
+     *                                           is cross-referenced against every
+     *                                           $functionArrayReturns entry project-wide instead,
+     *                                           the same "coarse net" trade-off just widened to
+     *                                           project scope. See
+     *                                           PhpTokenParser::interpolatedPrefixVarAt's own
+     *                                           docblock for the interpolated-string shape this
+     *                                           recognizes (`"literal$var"`, not `.`
+     *                                           concatenation) and the T_RETURN handling's own
+     *                                           comment for the two gates (inside an
+     *                                           `array_map()` closure, and the literal looks like
+     *                                           a snake_case function-name prefix) that keep this
+     *                                           narrow.
      */
     public function __construct(
         public readonly string $file,
@@ -191,6 +285,9 @@ final class ParseResult
         public readonly array $literalPathInputs = [],
         public readonly array $literalPathFileExistenceGuards = [],
         public readonly array $hookPassThroughParams = [],
+        public readonly array $classNameTransformTemplates = [],
+        public readonly array $functionArrayReturns = [],
+        public readonly array $functionNameTransformTemplates = [],
         public readonly ?string $error = null,
     ) {}
 }

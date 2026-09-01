@@ -49,6 +49,21 @@ do_action( 'my_hook' );
         self::assertEmpty($this->analyzer->analyze([$file]));
     }
 
+    public function testVendorFiredTagCountsAsFiring(): void
+    {
+        // Real-world shape (Jetpack): `add_filter('jetpack_sync_home_url', ...)` registered in
+        // host code, actually fired from inside jetpack_vendor/automattic/jetpack-connection/'s
+        // own bundled `apply_filters('jetpack_sync_home_url', $url)` — a file FileScanner
+        // excludes from every other check, so it's never among $files here. See
+        // VendorHookInvocationScanner's own docblock for why that scan happens separately and is
+        // passed in as a plain tag set rather than parsed the normal way.
+        $file = $this->write("<?php add_filter( 'jetpack_sync_home_url', 'handler' );");
+
+        $findings = $this->analyzer->analyze([$file], vendorFiredTags: ['jetpack_sync_home_url' => true]);
+
+        self::assertEmpty($findings);
+    }
+
     public function testAddFilterHandledSameAsAddAction(): void
     {
         $file = $this->write("<?php add_filter( 'my_filter', 'cb' );");

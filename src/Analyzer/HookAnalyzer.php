@@ -17,9 +17,17 @@ final class HookAnalyzer
     /**
      * @param list<string> $files
      * @param (callable(int, int): void)|null $onProgress See PhpTokenParser::parseAll().
+     * @param array<string,true> $vendorFiredTags Hook tags found fired inside a vendor-prefixed
+     *   directory (see VendorHookInvocationScanner) — files FileScanner excludes from every other
+     *   check, since auditing a dependency's own internal dead code is out of scope, but WordPress's
+     *   hook system is fundamentally cross-boundary: a vendored dependency firing a hook the host
+     *   project registers a callback for is a normal, correct pattern, not something host-code
+     *   candidacy exclusion should hide from hook resolution. Real-world case (Jetpack): 55 of 174
+     *   `UnmatchedHook` findings were callbacks for hooks genuinely fired inside
+     *   `jetpack_vendor/automattic/jetpack-connection/`'s own bundled packages.
      * @return list<Finding>
      */
-    public function analyze(array $files, ?callable $onProgress = null): array
+    public function analyze(array $files, ?callable $onProgress = null, array $vendorFiredTags = []): array
     {
         $parseResults = $this->parser->parseAll($files, $onProgress);
 
@@ -33,7 +41,7 @@ final class HookAnalyzer
         // literal last (e.g. "{$this->id_base}_widget_updated" → "_widget_updated") — rarer than
         // the prefix shape in practice (WP convention overwhelmingly puts the static/plugin-
         // specific part first), but real (per-widget-ID or per-post-type hook naming).
-        $firedTags = [];
+        $firedTags = $vendorFiredTags;
         $firedPrefixes = [];
         $firedSuffixes = [];
         foreach ($parseResults as $result) {
