@@ -11,6 +11,7 @@ use WpSpecter\Parser\ClassDef;
 use WpSpecter\Parser\ParseResult;
 use WpSpecter\Parser\PhpTokenParser;
 use WpSpecter\Stubs\WpCoreContractMethods;
+use WpSpecter\Support\StringTransformChain;
 
 final class ClassAnalyzer
 {
@@ -87,11 +88,28 @@ final class ClassAnalyzer
     // WP_List_Table's own display()/prepare_items() machinery (and its AJAX response handler),
     // never by a visible name reference in project code. Confirmed in the wild: Contact Form 7's
     // WPCF7_Contact_Form_List_Table overrides get_sortable_columns()/get_bulk_actions()/
-    // column_default()/column_cb() with zero call sites anywhere in the plugin.
+    // column_default()/column_cb() with zero call sites anywhere in the plugin. handle_row_actions()
+    // is single_row_columns()'s own per-column row-actions override point (the same real class's
+    // column_title() builds the "Edit | Duplicate | Delete" links WP core's own single_row_columns()
+    // renders under the primary column) — confirmed missing from this list entirely, not just an
+    // omission that happened not to matter yet.
     private const WP_LIST_TABLE_CONTRACT_METHODS = [
         'get_columns', 'get_sortable_columns', 'get_bulk_actions', 'column_default', 'column_cb',
         'prepare_items', 'no_items', 'get_views', 'extra_tablenav', 'display_rows', 'single_row',
-        'single_row_columns',
+        'single_row_columns', 'handle_row_actions',
+    ];
+
+    // WP_List_Table::single_row_columns() dispatches each of get_columns()'s own keys to a
+    // `column_{$column_name}()` method when one exists (`method_exists($this, 'column_' .
+    // $column_name)`), falling back to column_default() otherwise — a project-defined column key
+    // (Contact Form 7's own 'title'/'author'/'shortcode'/'date') can never be enumerated as a
+    // fixed name the way WP_LIST_TABLE_CONTRACT_METHODS' own literal overrides can, so this needs
+    // a prefix match instead of a name list. Confirmed in the wild across the corpus: besides
+    // Contact Form 7's own column_title()/column_author()/column_shortcode()/column_date(),
+    // WooCommerce, WPForms, Jetpack, and WordPress SEO's own admin list tables all declare
+    // several column_*() overrides apiece — a broadly-applicable gap, not one plugin's own.
+    private const BASE_CLASS_CONTRACT_METHOD_PREFIXES = [
+        'WP_List_Table' => ['column_'],
     ];
 
     private const BASE_CLASS_CONTRACT_METHODS = [
@@ -290,6 +308,62 @@ final class ClassAnalyzer
         foreach ($parseResults as $result) {
             foreach ($result->functionCalls as $call) {
                 $calledNames[strtolower($call->name)] = true;
+            }
+        }
+
+        // A class name synthesized via a recognized transform chain (`str_replace('lit',
+        // 'lit', ...)`/`ucfirst(...)`/`ucwords(...)`, in any recognized combination — see
+        // PhpTokenParser::resolveTransformChainExpr()'s own docblock for the real-world shapes:
+        // WPForms' `SmartTags::get_smart_tag_class_name()` turns `'admin_email'` into
+        // `AdminEmail`; wp-nested-pages' `Events::setHandlers()` turns
+        // `'admin_post_npBulkActions'` into `BulkActions`) concatenated onto a fixed namespace
+        // prefix — see $classNameTransformTemplates' own docblock on ParseResult. No literal
+        // call-site argument drives the transformed value in either real case (a plain method
+        // parameter, or a `foreach` loop variable) — so, the same "no proof of causality,
+        // cross-product against every literal key/value the class ever declares" trade-off
+        // $selfDispatchPrefixSuffixTemplates already accepts elsewhere in this analyzer, every
+        // literal array key or flat-array value the SAME owner class declares anywhere (via
+        // $classArrayKeyLiterals, which covers a keyed array literal returned directly, a flat
+        // array assigned to `$this->prop`, and `$var['key'] = ...;` — see its own docblock) is
+        // transformed and credited as referenced. Same-class only, no descendant fan-out — every
+        // confirmed real-world case has both the transform site and the array literal on the
+        // same class — a documented scope limitation, not a bug, until real-world evidence for a
+        // base/subclass split shows up.
+        $classArrayKeyLiterals = [];
+        foreach ($parseResults as $result) {
+            foreach ($result->classArrayKeyLiterals as $ownerClass => $keys) {
+                if (!isset($classArrayKeyLiterals[$ownerClass])) {
+                    $classArrayKeyLiterals[$ownerClass] = [];
+                }
+                array_push($classArrayKeyLiterals[$ownerClass], ...$keys);
+            }
+        }
+        foreach ($parseResults as $result) {
+            foreach ($result->classNameTransformTemplates as $ownerClass => $templates) {
+                if ($templates === [] || !isset($classArrayKeyLiterals[$ownerClass])) {
+                    continue;
+                }
+                foreach ($templates as [$prefix, $steps, $suffix]) {
+                    // A namespace-separator-ending prefix names a namespace, stripped from
+                    // $def->name (short-name-only) already — the transformed value alone is the
+                    // short name to match (WPForms'/wp-nested-pages' own real cases). Any other
+                    // prefix (Jetpack tiled-gallery: 'Jetpack_Tiled_Gallery_Layout_', a flat,
+                    // non-namespaced class-naming convention) is itself part of the literal short
+                    // name, so it must be prepended back to reconstruct it. $suffix (WordPress
+                    // SEO's own '_Presenter') is always part of the literal short name too,
+                    // appended after the transformed value regardless of prefix kind. A leading
+                    // backslash on an otherwise-non-namespace-ending prefix (Elementor:
+                    // `__NAMESPACE__ . '\Widget_' . $class_name`) is only the namespace
+                    // separator following the __NAMESPACE__ magic constant, never part of the
+                    // literal short name itself — stripped before prepending.
+                    $isNamespacePrefix = str_ends_with($prefix, '\\');
+                    $reconstructPrefix = ltrim($prefix, '\\');
+                    foreach ($classArrayKeyLiterals[$ownerClass] as $arrayKey) {
+                        $transformed = StringTransformChain::apply($arrayKey, $steps);
+                        $shortName = ($isNamespacePrefix ? $transformed : $reconstructPrefix . $transformed) . $suffix;
+                        $referenced[strtolower($shortName)] = true;
+                    }
+                }
             }
         }
 
@@ -593,15 +667,19 @@ final class ClassAnalyzer
         // A callback built via string concatenation with a resolvable receiver — `array($this,
         // 'footer_html_' . $index)` inside a loop — can't be matched exactly, since the real
         // suffix is only known at runtime. $scopedCalledPrefixes mirrors $scopedCalled above but
-        // is checked with str_starts_with() instead of an exact key lookup (matchesAnyPrefix()).
-        // Deliberately scoped-only: an *unscoped* prefix pool would match against every method
-        // project-wide by name prefix, and a short incidental one (confirmed against the Astra
-        // theme — plain string-building like 'astra_' . $key, unrelated to any callback) would
-        // hide genuinely dead code far more readily than an unscoped exact-name match does.
+        // is checked with str_starts_with()/str_ends_with() instead of an exact key lookup
+        // (matchesAnyPrefixSuffix()). Deliberately scoped-only: an *unscoped* prefix pool would
+        // match against every method project-wide by name prefix, and a short incidental one
+        // (confirmed against the Astra theme — plain string-building like 'astra_' . $key,
+        // unrelated to any callback) would hide genuinely dead code far more readily than an
+        // unscoped exact-name match does. Each entry also carries a suffix (empty for the
+        // array-callback shape above, which has none) — `method_exists($this, 'generate_' .
+        // $type . '_html')`'s own second argument names both ends of the real method, unlike a
+        // loop-counter suffix that's only known at runtime.
         $scopedCalledPrefixes = [];
         foreach ($parseResults as $result) {
             foreach ($result->scopedMethodCallPrefixes as $call) {
-                $scopedCalledPrefixes[$call->receiverClass][] = $call->prefix;
+                $scopedCalledPrefixes[$call->receiverClass][] = [$call->prefix, $call->suffix];
             }
         }
 
@@ -627,9 +705,23 @@ final class ClassAnalyzer
         // trait itself — only through whatever `use`s it — so isUsedByTraitConsumer() walks this
         // graph to widen the check below for methods owned by a trait.
         $traitUsers = [];
+        // The inverse direction: class/trait name => list of traits its own body directly
+        // `use`s. Needed for a different composition than $traitUsers' own BFS (trait -> its
+        // consumers): a trait can call a method it never declares itself, expecting whoever
+        // `use`s it to provide it — real-world shape (Elementor's atomic-widgets module):
+        // `trait Has_Atomic_Base { function render() { $this->define_atomic_controls(); } }`,
+        // `abstract class Atomic_Widget_Base extends Widget_Base { use Has_Atomic_Base; }`, and
+        // every real `define_atomic_controls()` override lives on a *concrete descendant* of
+        // `Atomic_Widget_Base` (`Atomic_Button`, `Atomic_Svg`, ...), never on
+        // `Atomic_Widget_Base` itself. isUsedByTraitConsumer() alone can't credit this: it
+        // requires the checked method's own $ownerClass to *be* the trait, but here $ownerClass
+        // is the concrete leaf widget — see isUsedByAncestorsTraitSelfCall()'s own docblock for
+        // the composed walk this map feeds.
+        $traitsUsedByClass = [];
         foreach ($parseResults as $result) {
             foreach ($result->traitUsages as $usage) {
                 $traitUsers[$usage->trait][] = $usage->user;
+                $traitsUsedByClass[$usage->user][] = $usage->trait;
             }
         }
 
@@ -644,10 +736,11 @@ final class ClassAnalyzer
                     || isset($called[$def->name])
                     || isset($scopedCalled[$def->ownerClass ?? ''][$def->name])
                     || isset($reflectionDispatchedClassNames[strtolower($def->ownerClass ?? '')])
-                    || $this->matchesAnyPrefix($def->name, $scopedCalledPrefixes[$def->ownerClass ?? ''] ?? [])
+                    || $this->matchesAnyPrefixSuffix($def->name, $scopedCalledPrefixes[$def->ownerClass ?? ''] ?? [])
                     || self::isFullyExemptClass($def->ownerClass, $classDefsByName)
                     || $this->isContractMethod($def->name, $def->ownerClass, $classDefsByName, $reflector)
                     || $this->isUsedByTraitConsumer($def->ownerClass, $def->name, $classDefsByName, $traitUsers, $scopedCalled)
+                    || $this->isUsedByAncestorsTraitSelfCall($def->ownerClass, $def->name, $classDefsByName, $traitsUsedByClass, $scopedCalled)
                     || $this->isUsedByPolymorphicCall($def->ownerClass, $def->name, $classDefsByName, $scopedCalled)
                     || $this->isUsedByDescendantReceiver($def->ownerClass, $def->name, $descendantsOf, $scopedCalled)
                 ) {
@@ -719,6 +812,7 @@ final class ClassAnalyzer
             if (
                 in_array($methodName, self::baseClassContractMethods($baseRef->short), true)
                 || in_array($methodName, self::generatedContractMethods($baseRef->short), true)
+                || $this->matchesAnyPrefix($methodName, self::baseClassContractMethodPrefixes($baseRef->short))
             ) {
                 return true;
             }
@@ -805,6 +899,14 @@ final class ClassAnalyzer
         return $ci[strtolower($base)] ?? [];
     }
 
+    /** @return list<string> */
+    private static function baseClassContractMethodPrefixes(string $base): array
+    {
+        static $ci = null;
+        $ci ??= array_change_key_case(self::BASE_CLASS_CONTRACT_METHOD_PREFIXES, CASE_LOWER);
+        return $ci[strtolower($base)] ?? [];
+    }
+
     /**
      * Same case-insensitive lookup as baseClassContractMethods(), against
      * WpCoreContractMethods::methods() (see tools/generate-wp-contract-methods-stub.php)
@@ -869,6 +971,84 @@ final class ClassAnalyzer
         }
 
         return false;
+    }
+
+    /**
+     * A trait can call a method it never declares itself — a template-method pattern, expecting
+     * whoever `use`s it to provide the real implementation — same as an abstract base class's
+     * own `$this->method()` call, just via trait composition instead of inheritance. Real-world
+     * shape (Elementor's atomic-widgets module): `trait Has_Atomic_Base { function render() {
+     * $this->define_atomic_controls(); } }`, `abstract class Atomic_Widget_Base extends
+     * Widget_Base { use Has_Atomic_Base; }`, and every real `define_atomic_controls()` override
+     * lives on a *concrete descendant* of `Atomic_Widget_Base` (`Atomic_Button`, `Atomic_Svg`,
+     * ...) — never on `Atomic_Widget_Base` itself, which only consumes the trait.
+     *
+     * isUsedByTraitConsumer() alone can't credit this: it requires the checked method's own
+     * $ownerClass to *be* the trait, so it can fan out to the trait's consumers — but here
+     * $ownerClass is the concrete leaf widget, several inheritance levels below the trait
+     * consumer. This walks the *opposite* direction instead: starting at the method's own
+     * $ownerClass, climb its `extends` chain (same bounded walk isContractMethod() already uses)
+     * and, at every level visited, check whether any trait that level's class directly (or
+     * transitively, one trait using another) `use`s itself calls `$this->$methodName()`
+     * internally. Same 122-of-502 real-world impact class as isUsedByDescendantReceiver()'s own
+     * fan-out, just composed with trait consumption instead of a typed-parameter receiver.
+     *
+     * @param array<string,ClassDef> $classDefsByName Keyed by FQCN.
+     * @param array<string,list<string>> $traitsUsedByClass Class/trait FQCN => traits its own
+     *                                    body directly `use`s (the inverse of $traitUsers).
+     * @param array<string,array<string,bool>> $scopedCalled
+     */
+    private function isUsedByAncestorsTraitSelfCall(?string $ownerClass, string $methodName, array $classDefsByName, array $traitsUsedByClass, array $scopedCalled): bool
+    {
+        if ($ownerClass === null) {
+            return false;
+        }
+
+        $className = $ownerClass;
+        for ($depth = 0; $depth < self::MAX_INHERITANCE_DEPTH; $depth++) {
+            foreach ($this->traitsUsedTransitively($className, $traitsUsedByClass) as $trait) {
+                if (isset($scopedCalled[$trait][$methodName])) {
+                    return true;
+                }
+            }
+
+            $def = $classDefsByName[$className] ?? null;
+            $baseRef = $def?->extends[0] ?? null;
+            if ($baseRef === null) {
+                return false;
+            }
+            $className = $baseRef->fqcn;
+        }
+
+        return false;
+    }
+
+    /**
+     * Every trait $className's own body directly `use`s, plus every trait *those* traits use in
+     * turn (a trait composing another trait effectively inherits its method bodies too, `$this`
+     * calls included) — bounded the same way the rest of this file's graph walks are, to survive
+     * a cyclic/malformed input.
+     *
+     * @param array<string,list<string>> $traitsUsedByClass
+     * @return list<string>
+     */
+    private function traitsUsedTransitively(string $className, array $traitsUsedByClass): array
+    {
+        $visited = [];
+        $queue = $traitsUsedByClass[$className] ?? [];
+        for ($depth = 0; $queue !== [] && $depth < self::MAX_INHERITANCE_DEPTH; $depth++) {
+            $next = [];
+            foreach ($queue as $trait) {
+                if (isset($visited[$trait])) {
+                    continue;
+                }
+                $visited[$trait] = true;
+                array_push($next, ...($traitsUsedByClass[$trait] ?? []));
+            }
+            $queue = $next;
+        }
+
+        return array_keys($visited);
     }
 
     /**
@@ -969,6 +1149,17 @@ final class ClassAnalyzer
     {
         foreach ($prefixes as $prefix) {
             if (str_starts_with($name, $prefix)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** @param list<array{string,string}> $prefixSuffixPairs [prefix, suffix] */
+    private function matchesAnyPrefixSuffix(string $name, array $prefixSuffixPairs): bool
+    {
+        foreach ($prefixSuffixPairs as [$prefix, $suffix]) {
+            if (str_starts_with($name, $prefix) && ($suffix === '' || str_ends_with($name, $suffix))) {
                 return true;
             }
         }

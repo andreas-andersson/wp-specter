@@ -328,6 +328,46 @@ class Consumer {
         self::assertNotContains('base_method', $unusedMethods);
     }
 
+    public function testDoesNotReportConcreteDescendantOverrideOfATraitsOwnUndeclaredTemplateMethod(): void
+    {
+        // Real-world shape (Elementor's atomic-widgets module): the trait calls a method it
+        // never declares itself — a template-method pattern, expecting whoever `use`s it to
+        // provide the real implementation — and the real override lives on a *concrete
+        // descendant* of the trait's direct consumer, never on the consumer itself.
+        // isUsedByTraitConsumer() alone can't credit this: Atomic_Button::define_atomic_controls
+        // is the method being checked, but Atomic_Button itself isn't a trait, so that mechanism
+        // never even starts walking. Needs isUsedByAncestorsTraitSelfCall() instead: climb
+        // Atomic_Button's own extends chain (to Atomic_Widget_Base), find the trait it consumes
+        // there (Has_Atomic_Base), and check whether that trait calls $this->define_atomic_
+        // controls() internally.
+        $file = $this->write('<?php
+trait Has_Atomic_Base {
+    public function render() {
+        return $this->define_atomic_controls();
+    }
+}
+abstract class Atomic_Widget_Base {
+    use Has_Atomic_Base;
+}
+class Atomic_Button extends Atomic_Widget_Base {
+    public function define_atomic_controls() {
+        return [];
+    }
+}
+class Truly_Unused_Widget extends Atomic_Widget_Base {
+    public function truly_unused() {
+        return "dead";
+    }
+}
+new Atomic_Button();
+new Truly_Unused_Widget();
+');
+        $findings = $this->analyzer->analyze([$file]);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('define_atomic_controls', $unusedMethods);
+        self::assertContains('truly_unused', $unusedMethods);
+    }
+
     public function testTraitMethodScopingDoesNotLeakToUnrelatedClass(): void
     {
         // Other_Class doesn't use Greetable at all — greet() being called on it must not count
@@ -664,7 +704,12 @@ class My_Widget extends WP_Widget {
         // Real-world finding from Contact Form 7's WPCF7_Contact_Form_List_Table: WP core's own
         // list-table rendering/AJAX pipeline calls get_sortable_columns()/get_bulk_actions()/
         // column_default()/column_cb() by name convention on any WP_List_Table subclass — never
-        // by a visible name reference in project code.
+        // by a visible name reference in project code. handle_row_actions() (single_row_columns()'s
+        // own per-column row-actions override point) and column_title()/column_author()/
+        // column_shortcode()/column_date() (single_row_columns()'s `column_{$column_name}()`
+        // dispatch — a project-defined column key, never a fixed name a literal list could
+        // enumerate, hence the prefix match) are that same real class's own two previously-missed
+        // pieces.
         $file = $this->write('<?php
 class My_List_Table extends WP_List_Table {
     public function get_columns() { return []; }
@@ -672,6 +717,8 @@ class My_List_Table extends WP_List_Table {
     public function get_bulk_actions() { return []; }
     public function column_default($item, $column_name) {}
     public function column_cb($item) {}
+    public function column_title($item) {}
+    protected function handle_row_actions($item, $column_name, $primary) { return ""; }
     public function prepare_items() {}
     public function truly_unused() {}
 }
@@ -683,6 +730,8 @@ class My_List_Table extends WP_List_Table {
         self::assertNotContains('get_bulk_actions', $unusedMethods);
         self::assertNotContains('column_default', $unusedMethods);
         self::assertNotContains('column_cb', $unusedMethods);
+        self::assertNotContains('column_title', $unusedMethods);
+        self::assertNotContains('handle_row_actions', $unusedMethods);
         self::assertNotContains('prepare_items', $unusedMethods);
         self::assertContains('truly_unused', $unusedMethods);
     }
@@ -1308,6 +1357,335 @@ class WC_Admin_List_Table_Products extends WC_Admin_List_Table {
         self::assertNotContains('render_thumb_column', $unusedMethods);
         self::assertNotContains('render_name_column', $unusedMethods);
         self::assertContains('truly_unused', $unusedMethods);
+    }
+
+    public function testCreditsClassBuiltFromSnakeToPascalCaseTransformOfAConfigArrayKey(): void
+    {
+        // Real-world shape (WPForms): SmartTags::get_smart_tag_class_name() turns each key of
+        // smart_tags_list()'s own returned array into a class name via the canonical
+        // snake_case-to-PascalCase idiom, then instantiates it — never spelling 'AdminEmail' out
+        // as a literal anywhere. AdminEmail lives in a different file, same as the real plugin.
+        $dispatcher = $this->write('<?php
+class SmartTags {
+    protected function smart_tags_list() {
+        return [
+            "admin_email" => "Site Administrator Email",
+            "field_id"    => "Field ID",
+        ];
+    }
+    protected function get_smart_tag_class_name( $smart_tag_name ) {
+        $class_name = str_replace( " ", "", ucwords( str_replace( "_", " ", $smart_tag_name ) ) );
+        $full_class_name = "\\\\WPForms\\\\SmartTags\\\\SmartTag\\\\" . $class_name;
+        return $full_class_name;
+    }
+}
+');
+        $target = $this->write('<?php
+namespace WPForms\SmartTags\SmartTag;
+class AdminEmail {
+    public function process() {}
+}
+class Truly_Unused {
+    public function process() {}
+}
+');
+        $findings = $this->analyzer->analyze([$dispatcher, $target]);
+        $unusedClasses = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedClass), 'name');
+        self::assertNotContains('AdminEmail', $unusedClasses);
+        self::assertContains('Truly_Unused', $unusedClasses);
+    }
+
+    public function testCreditsClassBuiltFromATwoStepStrReplaceAndUcfirstChainOnAPropertyArray(): void
+    {
+        // Real-world shape (wp-nested-pages): Events::setHandlers() turns each value of its own
+        // $this->actions property array into a class name via two chained str_replace() calls
+        // plus ucfirst() (a different transform combination than WPForms' ucwords idiom above),
+        // assigned to a complex lvalue (`$this->handlers[$key]->class = ...`), then instantiated
+        // dynamically elsewhere (`new $handler->class;`) — never spelling 'BulkActions' out as a
+        // literal anywhere. BulkActions lives in a different file, same as the real plugin.
+        $dispatcher = $this->write('<?php
+namespace NestedPages\Form;
+class Events {
+    private $actions;
+    private $handlers;
+    public function registerEvents() {
+        $this->actions = [
+            "wp_ajax_npsort",
+            "admin_post_npBulkActions",
+        ];
+        $this->setHandlers();
+    }
+    public function setHandlers() {
+        foreach ($this->actions as $key => $action) {
+            $class = str_replace("admin_post_np", "", $action);
+            $class = ucfirst(str_replace("wp_ajax_np", "", $class));
+            $this->handlers[$key] = new \stdClass();
+            $this->handlers[$key]->class = "NestedPages\\\\Form\\\\Listeners\\\\" . $class;
+        }
+    }
+}
+');
+        $target = $this->write('<?php
+namespace NestedPages\Form\Listeners;
+class BulkActions {
+    public function handle() {}
+}
+class Truly_Unused {
+    public function handle() {}
+}
+');
+        $findings = $this->analyzer->analyze([$dispatcher, $target]);
+        $unusedClasses = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedClass), 'name');
+        self::assertNotContains('BulkActions', $unusedClasses);
+        self::assertContains('Truly_Unused', $unusedClasses);
+    }
+
+    public function testCreditsClassBuiltFromAnInlineUcfirstTransformWithANonNamespacePrefix(): void
+    {
+        // Real-world shape (Jetpack tiled-gallery): the transform is applied inline
+        // (`ucfirst( $this->atts['type'] )`, no separate assignment first — see the parser-level
+        // tests for that half), and — unlike every other confirmed case — the fixed prefix
+        // ('Jetpack_Tiled_Gallery_Layout_') is *not* a namespace (doesn't end in `\`): it's
+        // itself part of the literal short class name, which must be reconstructed by
+        // prepending the prefix back rather than matching the transformed value alone. Caught a
+        // real bug: the first version of this fix only ever checked the bare transformed value
+        // ('Columns') against $def->name, never the true short name
+        // ('Jetpack_Tiled_Gallery_Layout_Columns') — silently failing to credit every one of
+        // these classes except the ones already resolved by unrelated code elsewhere.
+        $dispatcher = $this->write('<?php
+class Jetpack_Tiled_Gallery {
+    private static $talaveras = array( "rectangular", "columns" );
+    public function render( $type ) {
+        $gallery_class = "Jetpack_Tiled_Gallery_Layout_" . ucfirst( $type );
+        return new $gallery_class();
+    }
+}
+');
+        $target = $this->write('<?php
+class Jetpack_Tiled_Gallery_Layout_Columns {
+    public function build() {}
+}
+class Truly_Unused {
+    public function build() {}
+}
+');
+        $findings = $this->analyzer->analyze([$dispatcher, $target]);
+        $unusedClasses = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedClass), 'name');
+        self::assertNotContains('Jetpack_Tiled_Gallery_Layout_Columns', $unusedClasses);
+        self::assertContains('Truly_Unused', $unusedClasses);
+    }
+
+    public function testCreditsClassBuiltFromANamespaceConcatenatedTransformOverAForeachLoopDomain(): void
+    {
+        // Real-world shape (Elementor): Widgets_Manager::register_widgets() builds each widget
+        // class name from a local flat array (`$build_widgets_filename`, never a class-body
+        // array literal) iterated via `foreach`, transformed, then re-concatenated with
+        // `__NAMESPACE__` onto itself — `$class_name = str_replace('-', '_', $widget_filename);
+        // $class_name = __NAMESPACE__ . '\Widget_' . $class_name;`. Two things had to work
+        // together: the reassignment mustn't wipe $class_name's own tracked transform chain just
+        // because its RHS isn't a bare transform-function call (it's a self-referential concat),
+        // and the domain must come from the actively-tracked foreach loop's own concrete values,
+        // not an unrelated class-body array literal. Widget_Icon_Box is never spelled out as a
+        // literal anywhere and lives in a different file/namespace.
+        $dispatcher = $this->write('<?php
+namespace Elementor;
+class Widgets_Manager {
+    public function register_widgets() {
+        $build_widgets_filename = [
+            "common",
+            "icon-box",
+        ];
+        foreach ( $build_widgets_filename as $widget_filename ) {
+            $class_name = str_replace( "-", "_", $widget_filename );
+            $class_name = __NAMESPACE__ . \'\\Widget_\' . $class_name;
+            $this->register( new $class_name() );
+        }
+    }
+}
+');
+        $target = $this->write('<?php
+namespace Elementor;
+class Widget_Icon_Box {
+    public function get_name() {}
+}
+class Truly_Unused {
+    public function get_name() {}
+}
+');
+        $findings = $this->analyzer->analyze([$dispatcher, $target]);
+        $unusedClasses = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedClass), 'name');
+        self::assertNotContains('Widget_Icon_Box', $unusedClasses);
+        self::assertContains('Truly_Unused', $unusedClasses);
+    }
+
+    public function testCreditsMethodMatchingAMethodExistsDynamicDispatchPrefixAndSuffix(): void
+    {
+        // Real-world shape (WooCommerce, WC_Settings_API::generate_settings_html()):
+        // `if ( method_exists( $this, 'generate_' . $type . '_html' ) ) { return $this->{
+        // 'generate_' . $type . '_html' }( $key, $data ); }` — a dynamic-dispatch registry, no
+        // array-callback shape at all. $type's own domain (whatever field types the class
+        // declares) is never enumerated; method_exists()'s own second argument being built this
+        // way is the entire signal needed to credit any 'generate_*_html' method as reachable.
+        $dispatcher = $this->write('<?php
+class WC_Settings_API {
+    public function generate_settings_html( $type ) {
+        if ( method_exists( $this, "generate_" . $type . "_html" ) ) {
+            return true;
+        }
+        return false;
+    }
+    public function generate_price_html() {}
+}
+class Truly_Unused {
+    public function generate_price_html() {}
+}
+new WC_Settings_API();
+new Truly_Unused();
+');
+        $findings = $this->analyzer->analyze([$dispatcher], suppressUnusedClassMethods: false);
+        $unusedMethodLines = array_column(
+            array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod && $f->name === 'generate_price_html'),
+            'line',
+        );
+        // WC_Settings_API::generate_price_html (line 9) is reachable through its own class's
+        // method_exists() dispatch; Truly_Unused::generate_price_html (line 12) has no such
+        // call scoped to it and must still be flagged — the prefix/suffix credit is scoped to
+        // the resolved receiver, not project-wide.
+        self::assertNotContains(9, $unusedMethodLines);
+        self::assertContains(12, $unusedMethodLines);
+    }
+
+    public function testCreditsMethodCalledThroughAForeachConcatenatedStringCallable(): void
+    {
+        // Real-world shape (litespeed-cache, thirdparty/entry.inc.php): `add_action(
+        // 'litespeed_load_thirdparty', 'LiteSpeed\Thirdparty\\' . $cls . '::detect');` inside
+        // `foreach ($third_cls as $cls) { ... }` — a fully-qualified string-callable, not a
+        // `new $class()` instantiation, so this is a UnusedMethod fix, not UnusedClass. Every
+        // third-party integration class declares its own `detect()`; only the one this loop
+        // never names should still be reported.
+        $dispatcher = $this->write('<?php
+$third_cls = array( "Aelia_CurrencySwitcher", "Avada" );
+foreach ($third_cls as $cls) {
+    add_action("litespeed_load_thirdparty", "LiteSpeed\\Thirdparty\\\\" . $cls . "::detect");
+}
+// Referenced directly so Truly_Unused itself isn\'t also flagged as a whole unused class
+// (which would suppress its own method-level finding) — only its "detect" stays dead.
+new \LiteSpeed\Thirdparty\Truly_Unused();
+');
+        $target = $this->write('<?php
+namespace LiteSpeed\Thirdparty;
+class Aelia_CurrencySwitcher {
+    public static function detect() {}
+}
+class Truly_Unused {
+    public static function detect() {}
+}
+');
+        $findings = $this->analyzer->analyze([$dispatcher, $target]);
+        $unusedMethodLines = array_column(
+            array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod && $f->name === 'detect'),
+            'line',
+        );
+        // Aelia_CurrencySwitcher::detect (line 4) is called through the loop; Truly_Unused::detect
+        // (line 7) never is — Finding only carries the bare method name, so file/line disambiguate
+        // which class's own "detect" is the one still reported.
+        self::assertNotContains(4, $unusedMethodLines);
+        self::assertContains(7, $unusedMethodLines);
+    }
+
+    public function testCreditsClassBuiltFromATransformOverADeeplyNestedArrayLiteralDomain(): void
+    {
+        // Real-world shape (WooCommerce): WC_Admin_Reports::get_reports() returns a 3-level-
+        // nested array literal, whose innermost keys ('sales_by_category', ...) are never
+        // spelled out as class names anywhere — WC_Admin_Reports::get_report($name) turns each
+        // into 'WC_Report_' . str_replace('-', '_', $name) after normalizing $name through
+        // str_replace('_', '-', ...) and sanitize_title() first (a transparent no-op for an
+        // already-clean slug). WC_Report_Sales_By_Category lives in a different file, same as
+        // the real plugin.
+        $dispatcher = $this->write('<?php
+class WC_Admin_Reports {
+    public static function get_reports() {
+        $reports = array(
+            "orders" => array(
+                "title"   => "Orders",
+                "reports" => array(
+                    "sales_by_category" => array(
+                        "title"    => "Sales by category",
+                        "callback" => array( __CLASS__, "get_report" ),
+                    ),
+                ),
+            ),
+        );
+        return apply_filters( "woocommerce_admin_reports", $reports );
+    }
+    public static function get_report( $name ) {
+        $name  = sanitize_title( str_replace( "_", "-", $name ) );
+        $class = "WC_Report_" . str_replace( "-", "_", $name );
+        if ( ! class_exists( $class ) ) {
+            return;
+        }
+        $report = new $class();
+        $report->output_report();
+    }
+}
+');
+        $target = $this->write('<?php
+class WC_Report_Sales_By_Category {
+    public function output_report() {}
+}
+class Truly_Unused {
+    public function output_report() {}
+}
+');
+        $findings = $this->analyzer->analyze([$dispatcher, $target]);
+        $unusedClasses = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedClass), 'name');
+        self::assertNotContains('WC_Report_Sales_By_Category', $unusedClasses);
+        self::assertContains('Truly_Unused', $unusedClasses);
+    }
+
+    public function testCreditsClassBuiltFromAnUntransformedCurlyInterpolatedVariableWithASuffix(): void
+    {
+        // Real-world shape (WordPress SEO): Front_End_Integration's own presenter properties
+        // (e.g. `protected $base_presenters = ['Meta_Author', ...];`) are turned into class
+        // names via `"Yoast\WP\SEO\Presenters\\{$presenter}_Presenter"` — a curly-brace
+        // interpolation with both a prefix and a suffix, and no transform applied to $presenter
+        // at all (unlike every other confirmed case this session). Meta_Author_Presenter is
+        // never spelled out as a literal anywhere and lives in a different file/namespace.
+        $dispatcher = $this->write('<?php
+namespace Yoast\WP\SEO\Integrations;
+class Front_End_Integration {
+    protected $base_presenters = [ "Meta_Author", "Title" ];
+    private function get_needed_presenters( $page_type ) {
+        $callback = static function ( $presenter ) {
+            return "Yoast\\WP\\SEO\\Presenters\\\\{$presenter}_Presenter";
+        };
+        return \array_map( $callback, $this->base_presenters );
+    }
+    public function get_presenters( $page_type ) {
+        $needed = $this->get_needed_presenters( $page_type );
+        $callback = static function ( $presenter ) {
+            if ( ! \class_exists( $presenter ) ) {
+                return null;
+            }
+            return new $presenter();
+        };
+        return \array_filter( \array_map( $callback, $needed ) );
+    }
+}
+');
+        $target = $this->write('<?php
+namespace Yoast\WP\SEO\Presenters;
+class Meta_Author_Presenter {
+    public function present() {}
+}
+class Truly_Unused {
+    public function present() {}
+}
+');
+        $findings = $this->analyzer->analyze([$dispatcher, $target]);
+        $unusedClasses = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedClass), 'name');
+        self::assertNotContains('Meta_Author_Presenter', $unusedClasses);
+        self::assertContains('Truly_Unused', $unusedClasses);
     }
 
     public function testCreditsMethodCalledThroughATopLevelFunctionsReturnType(): void

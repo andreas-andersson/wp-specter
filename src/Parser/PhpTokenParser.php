@@ -37,8 +37,16 @@ final class PhpTokenParser
     // functions — each gets its own filename-stem prefix rewrite in parseTemplateRef() (arg 0
     // 'kiosk' => 'header-kiosk.php'), a WP-core-specific convention no third-party wrapper
     // replicates under its own name, so these three stay fixed, exact entries rather than folded
-    // into the suffix-based check below.
-    private const TEMPLATE_FUNCS = ['get_template_part', 'get_header', 'get_footer', 'get_sidebar'];
+    // into the suffix-based check below. `locate_template()` is WP core's own lower-level
+    // template-file locator (wp-includes/template.php) that get_template_part() and friends are
+    // themselves built on — needs no stem-prefix rewrite of its own (arg 0 is already the exact
+    // relative template path/slug, with or without ".php" — TemplateAnalyzer's own
+    // normalizePath() already strips the extension either way), so it's just another plain entry
+    // here rather than a fourth prefix-rewrite case. Confirmed called directly (not just through
+    // a wrapper) in 9 of the 28 corpus projects — a broadly-applicable WP-core omission, not a
+    // single theme's own convention. Real-world shape (Kadence):
+    // `locate_template( 'template-parts/archive-title/hkb-searchbox' )`.
+    private const TEMPLATE_FUNCS = ['get_template_part', 'get_header', 'get_footer', 'get_sidebar', 'locate_template'];
     // `<prefix>_get_template_part()`/`<prefix>_get_template()` — a widely-replicated WordPress-
     // ecosystem naming convention for a plugin/theme's own template-loader wrapper, not a single
     // plugin's own invention: WooCommerce's `wc_get_template_part()`/`wc_get_template()` (plus
@@ -287,19 +295,17 @@ final class PhpTokenParser
         // narrow for the $phpPathStrings consumer (see parseStringLiteralArray's docblock).
         $anyArrayLiteralVars = [];
 
-        // $functionNameStack/$varLiteralAssignmentsStack run in lockstep with $functionDepthStack
-        // /$varTypesStack (same push-on-'{'/pop-on-'}' pattern) — together they let a `return`
-        // statement resolve to every literal a helper function might hand back, e.g.
-        // `function ocean_single_post_header_template() { if (...) { $p = 'a'; } elseif (...) {
-        // $p = 'b'; } return apply_filters('tag', $p); }` — real-world example (OceanWP theme).
-        // $varLiteralAssignmentsStack *accumulates* every literal ever assigned to a variable
-        // within the current function body (unlike $varTypesStack's last-write-wins), since which
-        // conditional branch runs is exactly what can't be known statically — the whole point is
-        // capturing every possibility a literal-only assignment reveals, tolerating that a
-        // non-literal branch (a value this parser can't resolve at all) is simply invisible
-        // rather than invalidating what *is* known.
-        $functionNameStack = [];
-        $pendingFunctionName = null;
+        // $varLiteralAssignmentsStack runs in lockstep with $functionDepthStack/$varTypesStack
+        // (same push-on-'{'/pop-on-'}' pattern, keyed via $functionDefIndexForBodyStack below) —
+        // together they let a `return` statement resolve to every literal a helper function or
+        // method might hand back, e.g. `function ocean_single_post_header_template() { if (...) {
+        // $p = 'a'; } elseif (...) { $p = 'b'; } return apply_filters('tag', $p); }` — real-world
+        // example (OceanWP theme). $varLiteralAssignmentsStack *accumulates* every literal ever
+        // assigned to a variable within the current function body (unlike $varTypesStack's
+        // last-write-wins), since which conditional branch runs is exactly what can't be known
+        // statically — the whole point is capturing every possibility a literal-only assignment
+        // reveals, tolerating that a non-literal branch (a value this parser can't resolve at
+        // all) is simply invisible rather than invalidating what *is* known.
         $varLiteralAssignmentsStack = [[]];
 
         // Per-function-body "does this function/method's own body (including nested closures)
@@ -317,6 +323,17 @@ final class PhpTokenParser
         $functionHasIncludeStack = [];
         $functionDefIndexForBodyStack = [];
         $pendingFunctionDefIndex = null;
+        // Same push-on-'{'/pop-on-'}' lockstep as $functionDefIndexForBodyStack, but tracks
+        // whether the CURRENT scope is an inline closure passed as `array_map()`'s own first
+        // argument (`array_map( function ( $x ) { ... }, $arr )`) — real-world shape (Botiga):
+        // the closure body builds a dynamic function name from its own parameter, with no
+        // enclosing class to scope $classNameTransformTemplates by (see
+        // $functionNameTransformTemplates' own docblock on ParseResult). Computed once at
+        // T_FUNCTION (walking backward past an optional `static` to check for `array_map(`
+        // immediately before), since nothing later can tell an anonymous closure's own call
+        // context apart from any other.
+        $functionIsArrayMapClosureStack = [];
+        $pendingFunctionIsArrayMapClosure = false;
         // $hook = 'my_plugin_loaded'; do_action($hook); — last-write-wins (unlike
         // $varLiteralAssignmentsStack's accumulation above), the same semantics as $varTypesStack
         // but for a string value instead of a class name: a hook/template-part call site cares
@@ -330,6 +347,18 @@ final class PhpTokenParser
         // own copy by whichever analyzer consumes it, since the helper and its caller are
         // routinely in different files (as in the OceanWP example above).
         $functionLiteralReturns = [];
+        // Same key convention as $functionLiteralReturns, but for a function/method that returns
+        // a flat literal array (`$var = array('lit1', 'lit2', ...); return $var;` or
+        // `return apply_filters('tag', $var, ...);`) rather than a single scalar — see
+        // resolveReturnArrayLiterals()'s own docblock and $functionNameTransformTemplates below
+        // for the real-world shape (Botiga) this feeds.
+        $functionArrayReturns = [];
+        // Flat, project-wide list of [literal function-name prefix, transform steps] pairs — the
+        // procedural (no enclosing class) counterpart to $classNameTransformTemplates, feeding
+        // FunctionAnalyzer instead of Class/FileAnalyzer. See the T_RETURN handling below for the
+        // real-world shape (Botiga) and why this has no per-function "owner" to scope by the way
+        // $classNameTransformTemplates does.
+        $functionNameTransformTemplates = [];
         /** @var list<PendingTemplateHelperCall> $pendingTemplateHelperCalls */
         $pendingTemplateHelperCalls = [];
         // "Class::method" (or bare function name) => every literal suffix a `return <ignored> .
@@ -383,6 +412,40 @@ final class PhpTokenParser
         // makes throughout: correlating this with $selfDispatchPrefixSuffixTemplates' own owner
         // class in ClassAnalyzer is the actual precision-narrowing step.
         $classArrayKeyLiterals = [];
+        // Owner class => property name => literal value, for a class-body property declared with
+        // a single plain string-literal default (`protected $view_file_extension = '.php';`).
+        // Feeds the literal-path mechanism's property-node support (see
+        // $literalPathTrackedPropertyNodes' own declaration comment) as a compile-time-constant
+        // term wherever `$this->propName` appears in a path concatenation and was never
+        // reassigned to anything this parser tracks — real-world shape (Wordfence's `wfView`):
+        // the fixed `.php` extension `render()` appends is this exact convention, never a
+        // constructor parameter.
+        $literalPathPropertyLiteralDefaults = [];
+        // Owner class => property name => true, once `$this->propName = <expr>;` resolved to a
+        // real literal-path source (a wrapper parameter, another property, ...) somewhere in this
+        // same file — see captureLiteralPathPropertyAssignment()'s own docblock. Deliberately
+        // whole-file-scoped (like $classArrayKeyLiterals), not per-method: real-world shape
+        // (Wordfence's `wfView`), the constructor sets `$this->view = $view` and a *different*
+        // method (`render()`) later reads `$this->view` — single-pass parsing means this only
+        // resolves when the assignment is parsed *before* the read, i.e. only when the writer
+        // appears earlier in the same file than the reader (true for every real case seen so
+        // far: constructors are conventionally declared before the methods that consume what
+        // they set). A property with no entry here is never treated as a literal-path node at
+        // all — see literalPathNodeFromTokens()'s own `$this->` case.
+        $literalPathTrackedPropertyNodes = [];
+        // variable name => [ultimate source variable, transform steps] when it was last assigned
+        // a recognized str_replace()/ucfirst()/ucwords() transform chain — see
+        // resolveTransformChainExpr()'s own docblock for the shapes this covers and the two
+        // independent real-world idioms that motivated generalizing it beyond one hardcoded
+        // chain. Flat/file-wide, same trade-off as $arrayLiteralVars: the concatenation that
+        // consumes it is almost always the very next statement (or, for a chain spanning several
+        // statements, the same variable reassigned from itself).
+        $transformChainVars = [];
+        // Owner class => every [literal namespace prefix (ending in `\`), transform steps] pair
+        // where that prefix was concatenated with a $transformChainVars-marked variable — see
+        // $classNameTransformTemplates' own docblock on ParseResult for the real-world shape and
+        // how ClassAnalyzer/FileAnalyzer resolve it.
+        $classNameTransformTemplates = [];
         // Function/method key => which of its own declared parameter positions is passed
         // *unchanged* (no transform, no concatenation) as the hook-tag argument to an
         // already-recognized CRON_SCHEDULE_FUNCS/HOOK_INVOKE_FUNCS call inside its own body.
@@ -444,7 +507,6 @@ final class PhpTokenParser
                         $functionDepthStack[] = $braceDepth;
                         $varTypesStack[] = $pendingParamTypes;
                         $varPendingCallStack[] = [];
-                        $functionNameStack[] = $pendingFunctionName;
                         $varLiteralAssignmentsStack[] = [];
                         $varLiteralValueStack[] = [];
                         $varAssignedFromFunctionStack[] = [];
@@ -452,6 +514,7 @@ final class PhpTokenParser
                         $literalPathFunctionKeyStack[] = $pendingLiteralPathFunctionKey;
                         $functionHasIncludeStack[] = false;
                         $functionDefIndexForBodyStack[] = $pendingFunctionDefIndex;
+                        $functionIsArrayMapClosureStack[] = $pendingFunctionIsArrayMapClosure;
                         // Deliberately NOT pushed when this scope-open is itself a closure
                         // (`$expectingClosureOpen` also true right now) — a closure's own body
                         // must resolve its hook pass-through into the *enclosing* scope's frame
@@ -465,8 +528,8 @@ final class PhpTokenParser
                         }
                         $expectingFunctionOpen = false;
                         $pendingParamTypes = [];
-                        $pendingFunctionName = null;
                         $pendingFunctionDefIndex = null;
+                        $pendingFunctionIsArrayMapClosure = false;
                         $pendingLiteralPathNodes = [];
                         $pendingLiteralPathFunctionKey = null;
                     }
@@ -519,7 +582,6 @@ final class PhpTokenParser
                             array_pop($functionDepthStack);
                             array_pop($varTypesStack);
                             array_pop($varPendingCallStack);
-                            array_pop($functionNameStack);
                             array_pop($varLiteralAssignmentsStack);
                             array_pop($varLiteralValueStack);
                             array_pop($varAssignedFromFunctionStack);
@@ -535,6 +597,7 @@ final class PhpTokenParser
                             }
                             $hasInclude = array_pop($functionHasIncludeStack);
                             $defIndex = array_pop($functionDefIndexForBodyStack);
+                            array_pop($functionIsArrayMapClosureStack);
                             if ($hasInclude && $defIndex !== null) {
                                 $d = $functionDefs[$defIndex];
                                 $functionDefs[$defIndex] = new FunctionDef(
@@ -620,6 +683,33 @@ final class PhpTokenParser
                                         }
                                     }
                                 }
+                            }
+                        }
+
+                        // "Yoast\WP\SEO\Presenters\\{$presenter}_Presenter" — a curly-brace
+                        // interpolated variable with both a prefix and a suffix. Unlike the
+                        // concatenation shape literalConcatVarAt() recognizes, this doesn't
+                        // require the variable to have gone through any recognized transform
+                        // first: WordPress SEO's own real code uses the bare closure parameter
+                        // completely unmodified — the simplest possible shape, a config value
+                        // used exactly as-is to build a class name. $transformChainVars is still
+                        // consulted first (falling through to a zero-step identity when the
+                        // variable was never tracked there), so one that *was* transformed still
+                        // resolves correctly too. See $classNameTransformTemplates' own docblock
+                        // for how ClassAnalyzer/FileAnalyzer replay the (possibly empty) steps.
+                        $interpolatedSuffix = $this->interpolatedPrefixCurlyVarSuffixAt($tokens, $i);
+                        if ($interpolatedSuffix !== null) {
+                            [$interpSuffixPrefix, $interpSuffixVarName, $interpSuffixSuffix] = $interpolatedSuffix;
+                            $interpSuffixOwnerClass = empty($classNameStack) ? null : end($classNameStack);
+                            if (
+                                $interpSuffixOwnerClass !== null
+                                && (str_ends_with($interpSuffixPrefix, '\\') || preg_match('/^[A-Z][A-Za-z0-9_]*_$/', $interpSuffixPrefix) === 1)
+                            ) {
+                                $interpSuffixChain = $transformChainVars[$interpSuffixVarName] ?? [$interpSuffixVarName, []];
+                                if (!isset($classNameTransformTemplates[$interpSuffixOwnerClass])) {
+                                    $classNameTransformTemplates[$interpSuffixOwnerClass] = [];
+                                }
+                                $classNameTransformTemplates[$interpSuffixOwnerClass][] = [$interpSuffixPrefix, $interpSuffixChain[1], $interpSuffixSuffix];
                             }
                         }
                     }
@@ -777,6 +867,50 @@ final class PhpTokenParser
                 continue;
             }
 
+            if (
+                in_array($type, [T_PUBLIC, T_PROTECTED, T_PRIVATE], true)
+                && !empty($classDepthStack) && end($classDepthStack) === $braceDepth
+            ) {
+                // private static $talaveras = array( 'rectangular', 'square', ... ); — a
+                // class-body property declaration with a flat literal array default, directly
+                // inside a class body (same depth guard as the T_CONST case above). Real-world
+                // shape (Jetpack tiled-gallery): feeds the same class-wide literal pool
+                // $classArrayKeyLiterals already collects keys/values into (see its own
+                // docblock) — later transformed into a dynamic class name by a sibling method.
+                // Tolerates an optional `static` modifier in either order this parser has
+                // evidence for; doesn't attempt a multi-property one-liner
+                // (`private $a = [...], $b = [...];`) — no evidence for that shape yet.
+                $owner = empty($classNameStack) ? null : end($classNameStack);
+                if ($owner !== null) {
+                    $propIndex = $this->peekNextMeaningfulIndex($tokens, $i);
+                    if ($propIndex !== null && is_array($tokens[$propIndex]) && $tokens[$propIndex][0] === T_STATIC) {
+                        $propIndex = $this->peekNextMeaningfulIndex($tokens, $propIndex);
+                    }
+                    if ($propIndex !== null && is_array($tokens[$propIndex]) && $tokens[$propIndex][0] === T_VARIABLE) {
+                        $eqIndex = $this->peekNextMeaningfulIndex($tokens, $propIndex);
+                        if ($eqIndex !== null && $tokens[$eqIndex] === '=') {
+                            $propArrayValues = $this->parseAnyStringLiteralArray($tokens, $eqIndex);
+                            if ($propArrayValues !== null) {
+                                if (!isset($classArrayKeyLiterals[$owner])) {
+                                    $classArrayKeyLiterals[$owner] = [];
+                                }
+                                array_push($classArrayKeyLiterals[$owner], ...$propArrayValues);
+                            }
+                            // protected $view_file_extension = '.php'; — the scalar-default
+                            // sibling of the array-default case just above. Real-world shape
+                            // (Wordfence's `wfView`): render() appends this fixed extension to a
+                            // dynamically-named view file; see
+                            // $literalPathPropertyLiteralDefaults' own declaration comment.
+                            $propLiteralDefault = $this->singleStringLiteralRhs($tokens, $eqIndex);
+                            if ($propLiteralDefault !== null) {
+                                $literalPathPropertyLiteralDefaults[$owner][substr($tokens[$propIndex][1], 1)] = $propLiteralDefault;
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
             if ($type === T_NEW || $type === T_INSTANCEOF) {
                 $ref = $this->captureClassNameAfter($tokens, $i, $currentNamespace, $useImports);
                 if ($ref !== null) {
@@ -790,6 +924,34 @@ final class PhpTokenParser
                             [$receiverFqcn, $methodName, $methodNameIndex] = $chainTarget;
                             $scopedMethodCalls[] = new ScopedMethodCall($receiverFqcn, $methodName);
                             $i = $methodNameIndex;
+                        }
+                    }
+                }
+                if ($type === T_NEW) {
+                    // `return new self( $view, $data );` — a static factory forwarding its own
+                    // argument into the constructor it wraps, no assignment at all (unlike
+                    // assignedNewClassName()'s `$var = new ClassName(...)` shape). Real-world
+                    // shape (Wordfence's `wfView::create()`): the constructor stores that
+                    // argument into a property (see captureLiteralPathPropertyAssignment()),
+                    // later read back by a *different* method's own sink. Treated exactly like
+                    // any other named/scoped wrapper call site — captureLiteralPathCall() doesn't
+                    // care that the "call" is a `new` expression rather than a plain invocation,
+                    // only that $nameIndex is immediately followed by `(`.
+                    $newClassName = $this->resolveNewExpressionClassNameAt($tokens, $i, $classNameStack, $classParentStack, $currentNamespace, $useImports);
+                    if ($newClassName !== null) {
+                        $nameIndex = $this->peekNextMeaningfulIndex($tokens, $i);
+                        if ($nameIndex !== null) {
+                            $literalPathScopeTop = count($literalPathNodeStack) - 1;
+                            $this->captureLiteralPathCall(
+                                [$newClassName . '::__construct'],
+                                $tokens,
+                                $nameIndex,
+                                $literalPathFunctionKeyStack[$literalPathScopeTop],
+                                $literalPathNodeStack[$literalPathScopeTop],
+                                false,
+                                $literalPathPropagationLinks,
+                                $literalPathInputs,
+                            );
                         }
                     }
                 }
@@ -840,24 +1002,15 @@ final class PhpTokenParser
             }
 
             // `return $template_path;` / `return apply_filters('tag', $template_path);` /
-            // `return 'literal';` inside a top-level named function — resolved against the
-            // current function scope's accumulated $varLiteralAssignmentsStack entry and folded
-            // into $functionLiteralReturns for that function's own name. See
-            // resolveFunctionCallHelperArg()/the TEMPLATE_FUNCS branch below for the other half:
-            // a get_template_part()-family call whose argument is a bare call to this function.
+            // `return 'literal';` / `return self::CONST;` inside a top-level named function OR
+            // a method — resolved against the current function scope's accumulated
+            // $varLiteralAssignmentsStack entry and folded into $functionLiteralReturns, keyed
+            // the same "Class::method" way $functionParamSuffixReturns is just below (a bare
+            // name for a top-level function, since two unrelated classes' same-named method
+            // must not collide). See resolveFunctionCallHelperArg()/the TEMPLATE_FUNCS branch
+            // below for the other half: a get_template_part()-family call whose argument is a
+            // bare call to this function/method.
             if ($type === T_RETURN) {
-                $currentFunctionName = empty($functionNameStack) ? null : end($functionNameStack);
-                if ($currentFunctionName !== null) {
-                    $varScopeTop = count($varLiteralAssignmentsStack) - 1;
-                    $literals = $this->resolveReturnLiterals($tokens, $i, $varLiteralAssignmentsStack[$varScopeTop]);
-                    if ($literals !== []) {
-                        if (!isset($functionLiteralReturns[$currentFunctionName])) {
-                            $functionLiteralReturns[$currentFunctionName] = [];
-                        }
-                        array_push($functionLiteralReturns[$currentFunctionName], ...$literals);
-                    }
-                }
-
                 // `return <ignored-prefix> . $param . 'suffix';` — e.g. wp-nested-pages'
                 // `Helpers::view($file) { return dirname(__FILE__) . '/Views/' . $file . '.php';
                 // }`. Uses $functionDefIndexForBodyStack (not $functionNameStack, which only
@@ -868,15 +1021,76 @@ final class PhpTokenParser
                 $currentDefIndex = empty($functionDefIndexForBodyStack) ? null : end($functionDefIndexForBodyStack);
                 if ($currentDefIndex !== null) {
                     $currentDef = $functionDefs[$currentDefIndex];
+                    $returnKey = $currentDef->isMethod && $currentDef->ownerClass !== null
+                        ? $currentDef->ownerClass . '::' . $currentDef->name
+                        : $currentDef->name;
+
+                    $varScopeTop = count($varLiteralAssignmentsStack) - 1;
+                    $literals = $this->resolveReturnLiterals(
+                        $tokens,
+                        $i,
+                        $varLiteralAssignmentsStack[$varScopeTop],
+                        $classConstants,
+                        empty($classNameStack) ? null : end($classNameStack),
+                        empty($classParentStack) ? null : end($classParentStack),
+                        $currentNamespace,
+                        $useImports,
+                    );
+                    if ($literals !== []) {
+                        if (!isset($functionLiteralReturns[$returnKey])) {
+                            $functionLiteralReturns[$returnKey] = [];
+                        }
+                        array_push($functionLiteralReturns[$returnKey], ...$literals);
+                    }
+
                     $suffix = $this->resolveReturnParamSuffixTemplate($tokens, $i);
                     if ($suffix !== null) {
-                        $suffixKey = $currentDef->isMethod && $currentDef->ownerClass !== null
-                            ? $currentDef->ownerClass . '::' . $currentDef->name
-                            : $currentDef->name;
-                        if (!isset($functionParamSuffixReturns[$suffixKey])) {
-                            $functionParamSuffixReturns[$suffixKey] = [];
+                        if (!isset($functionParamSuffixReturns[$returnKey])) {
+                            $functionParamSuffixReturns[$returnKey] = [];
                         }
-                        $functionParamSuffixReturns[$suffixKey][] = $suffix;
+                        $functionParamSuffixReturns[$returnKey][] = $suffix;
+                    }
+
+                    // `return $components;` / `return apply_filters('tag', $components, ...);`
+                    // where $components was built as a flat literal array — real-world shape
+                    // (Botiga): `botiga_get_default_single_product_components()` returns exactly
+                    // this, later transformed element-by-element into dynamic function names
+                    // (see $functionNameTransformTemplates' own docblock). Same key convention as
+                    // $functionLiteralReturns just above, just array-valued instead of scalar.
+                    $arrayLiterals = $this->resolveReturnArrayLiterals($tokens, $i, $anyArrayLiteralVars);
+                    if ($arrayLiterals !== []) {
+                        if (!isset($functionArrayReturns[$returnKey])) {
+                            $functionArrayReturns[$returnKey] = [];
+                        }
+                        array_push($functionArrayReturns[$returnKey], ...$arrayLiterals);
+                    }
+                }
+
+                // `return "botiga_quick_view_summary_$suffix";` inside an `array_map()` closure
+                // — the procedural (no enclosing class) counterpart to
+                // $classNameTransformTemplates, feeding FunctionAnalyzer instead of Class/
+                // FileAnalyzer. No per-function "owner" to scope the cross-product by the way
+                // $classNameTransformTemplates is (the domain-providing function and the
+                // transforming closure are two unrelated functions, not methods sharing a
+                // class) — $functionNameTransformTemplates is a flat, project-wide list instead,
+                // cross-referenced against every function's own $functionArrayReturns entry, same
+                // "coarse net" trade-off. Gated on both "inside an array_map() closure" and "the
+                // literal looks like a snake_case function-name prefix" (`ends in '_', all
+                // lowercase`) — WordPress's own near-universal naming convention for procedural
+                // helper functions, the natural counterpart to the capitalized-identifier gate
+                // $classNameTransformTemplates uses for class names.
+                $insideArrayMapClosure = !empty($functionIsArrayMapClosureStack) && end($functionIsArrayMapClosureStack);
+                if ($insideArrayMapClosure) {
+                    $returnExprIndex = $this->peekNextMeaningfulIndex($tokens, $i);
+                    $interpolated = $returnExprIndex !== null ? $this->interpolatedPrefixVarAt($tokens, $returnExprIndex) : null;
+                    if ($interpolated !== null) {
+                        [$interpPrefix, $interpVarName] = $interpolated;
+                        if (
+                            isset($transformChainVars[$interpVarName])
+                            && preg_match('/^[a-z][a-z0-9_]*_$/', $interpPrefix) === 1
+                        ) {
+                            $functionNameTransformTemplates[] = [$interpPrefix, $transformChainVars[$interpVarName][1]];
+                        }
                     }
                 }
 
@@ -902,6 +1116,22 @@ final class PhpTokenParser
                             $prefix,
                             $suffix,
                         );
+                    }
+                }
+
+                // `return [ 'admin_email' => ..., 'field_id' => ..., ... ];` — a keyed array
+                // literal returned directly (not built via repeated `$var['key'] = ...;`
+                // assignment) establishes the same "every literal key this class ever declares"
+                // domain $classArrayKeyLiterals feeds elsewhere — see its own docblock and
+                // resolveReturnedKeyedArrayLiteralKeys()'s.
+                $currentReturnOwnerClass = empty($classNameStack) ? null : end($classNameStack);
+                if ($currentReturnOwnerClass !== null) {
+                    $returnedKeys = $this->resolveReturnedKeyedArrayLiteralKeys($tokens, $i);
+                    if ($returnedKeys !== null) {
+                        if (!isset($classArrayKeyLiterals[$currentReturnOwnerClass])) {
+                            $classArrayKeyLiterals[$currentReturnOwnerClass] = [];
+                        }
+                        array_push($classArrayKeyLiterals[$currentReturnOwnerClass], ...$returnedKeys);
                     }
                 }
             }
@@ -1036,11 +1266,20 @@ final class PhpTokenParser
                 if ($def !== null) {
                     $skipNextString = true;
                 }
-                // Only a top-level (non-method) named function is ever callable via the bare
-                // `helper_fn()` shape resolveFunctionCallHelperArg() looks for at a call site —
-                // restricting to that avoids a same-named method ever being mismatched against
-                // an unrelated global function's return literals.
-                $pendingFunctionName = ($def !== null && !$insideClass) ? $def->name : null;
+                // `array_map( function ( $x ) { ... }, $arr )` — walk backward past an optional
+                // `static` modifier to check whether this closure is array_map()'s own first
+                // argument. See $functionIsArrayMapClosureStack's own declaration comment.
+                $funcPrevIndex = $this->peekPrevMeaningfulIndex($tokens, $i);
+                if ($funcPrevIndex !== null && is_array($tokens[$funcPrevIndex]) && $tokens[$funcPrevIndex][0] === T_STATIC) {
+                    $funcPrevIndex = $this->peekPrevMeaningfulIndex($tokens, $funcPrevIndex);
+                }
+                if ($funcPrevIndex !== null && $tokens[$funcPrevIndex] === '(') {
+                    $mapCallNameIndex = $this->peekPrevMeaningfulIndex($tokens, $funcPrevIndex);
+                    $pendingFunctionIsArrayMapClosure = $mapCallNameIndex !== null
+                        && is_array($tokens[$mapCallNameIndex])
+                        && in_array($tokens[$mapCallNameIndex][0], self::CLASS_NAME_TOKENS, true)
+                        && $this->shortClassName($tokens[$mapCallNameIndex][1]) === 'array_map';
+                }
                 // Every function/method/closure opens its own variable scope — including
                 // anonymous ones ($def === null for those), which need this exactly as much.
                 $expectingFunctionOpen = true;
@@ -1053,20 +1292,41 @@ final class PhpTokenParser
                 $literalPathFunctionKey = $literalPathFunctionKeyStack[$literalPathScopeTop];
                 if ($literalPathFunctionKey !== null) {
                     $literalPathNodes = $literalPathNodeStack[$literalPathScopeTop];
+                    $literalPathCurrentClass = empty($classNameStack) ? null : end($classNameStack);
+                    $literalPathCurrentParent = empty($classParentStack) ? null : end($classParentStack);
                     $this->captureLiteralPathAssignment(
                         $tokens,
                         $i,
                         $literalPathFunctionKey,
                         $currentNamespace,
                         $useImports,
-                        empty($classNameStack) ? null : end($classNameStack),
-                        empty($classParentStack) ? null : end($classParentStack),
+                        $literalPathCurrentClass,
+                        $literalPathCurrentParent,
                         $literalPathNodes,
                         $literalPathFileExistenceGuards,
                         $literalPathNodeCounter,
                         $literalPathPropagationLinks,
+                        $functionLiteralReturns,
+                        $literalPathTrackedPropertyNodes,
+                        $literalPathPropertyLiteralDefaults,
                     );
                     $literalPathNodeStack[$literalPathScopeTop] = $literalPathNodes;
+
+                    $this->captureLiteralPathPropertyAssignment(
+                        $tokens,
+                        $i,
+                        $literalPathFunctionKey,
+                        $currentNamespace,
+                        $useImports,
+                        $literalPathCurrentClass,
+                        $literalPathCurrentParent,
+                        $literalPathNodes,
+                        $literalPathFileExistenceGuards,
+                        $literalPathTrackedPropertyNodes,
+                        $literalPathPropagationLinks,
+                        $functionLiteralReturns,
+                        $literalPathPropertyLiteralDefaults,
+                    );
                 }
 
                 // $anyVar['literal'] = ...; — real-world shape (WooCommerce):
@@ -1114,6 +1374,20 @@ final class PhpTokenParser
                                     $propertyAssignedClasses[$receiverClass][$propName] = $newClass;
                                 } else {
                                     unset($propertyAssignedClasses[$receiverClass][$propName]);
+                                }
+
+                                // $this->actions = [ 'wp_ajax_npsort', 'admin_post_npBulkActions',
+                                // ... ]; — real-world shape (wp-nested-pages): a property
+                                // assigned a flat literal array feeds the same class-wide literal
+                                // pool $classArrayKeyLiterals already collects keys into (see its
+                                // own docblock) — every value here is later transformed into a
+                                // dynamic class name by a sibling method.
+                                $propArrayValues = $this->parseAnyStringLiteralArray($tokens, $afterPropIndex);
+                                if ($propArrayValues !== null) {
+                                    if (!isset($classArrayKeyLiterals[$receiverClass])) {
+                                        $classArrayKeyLiterals[$receiverClass] = [];
+                                    }
+                                    array_push($classArrayKeyLiterals[$receiverClass], ...$propArrayValues);
                                 }
                             } else {
                                 $propCallTarget = $this->findScopedCallTarget($tokens, $propNameIndex);
@@ -1211,6 +1485,28 @@ final class PhpTokenParser
                     } else {
                         unset($anyArrayLiteralVars[$value]);
                     }
+
+                    // $class = str_replace('admin_post_np', '', $action); / $class =
+                    // ucfirst(str_replace('wp_ajax_np', '', $class)); — marks $value as holding
+                    // a recognized transform chain's result, consumed by the concatenation check
+                    // just below (and, for a chain spanning several statements, by this same
+                    // check again on the next statement — see resolveTransformChainExpr()'s own
+                    // docblock).
+                    $transformChain = $this->resolveTransformChainRhs($tokens, $equalsIndex, $transformChainVars);
+                    if ($transformChain !== null && $transformChain[1] !== []) {
+                        $transformChainVars[$value] = $transformChain;
+                    } elseif (!$this->rhsIsSelfReferentialLiteralConcat($tokens, $equalsIndex, $value)) {
+                        unset($transformChainVars[$value]);
+                    }
+                    // else: `$class_name = __NAMESPACE__ . '\Widget_' . $class_name;` (Elementor)
+                    // — reassigns $value using its own prior value, concatenated onto a literal.
+                    // resolveTransformChainRhs() can't recognize this shape at all (it isn't a
+                    // bare transform-function call), but literalConcatVarAt() — checked later in
+                    // this same forward scan, once $i reaches the literal token itself — matches
+                    // it directly, provided $transformChainVars[$value] still holds the chain the
+                    // *previous* statement built. Leaving the old entry in place here (instead of
+                    // wiping it just because this statement's own RHS shape isn't a bare chain
+                    // call) is what makes that later lookup still see it.
 
                     // $var = 'literal'; — accumulated (not overwritten) into the current
                     // function scope's $varLiteralAssignmentsStack entry; see its own
@@ -1499,6 +1795,7 @@ final class PhpTokenParser
                     $definedConstants,
                     $skipStringIndices,
                     $functionCalls,
+                    $scopedMethodCallPrefixes,
                 );
                 $literalPathScopeTop = count($literalPathNodeStack) - 1;
                 $this->captureLiteralPathCall(
@@ -1647,6 +1944,7 @@ final class PhpTokenParser
                         $definedConstants,
                         $skipStringIndices,
                         $functionCalls,
+                        $scopedMethodCallPrefixes,
                     );
                     $literalPathScopeTop = count($literalPathNodeStack) - 1;
                     $this->captureLiteralPathCall(
@@ -1715,6 +2013,80 @@ final class PhpTokenParser
                     }
                 }
 
+                // 'sales_by_date' => array( ... ); — a literal array key, at *any* nesting
+                // depth, anywhere in a class body. Real-world shape (WooCommerce):
+                // `WC_Admin_Reports::get_reports()` returns a 3-level-nested array literal
+                // (`$reports['orders']['reports']['sales_by_date'] = [...]`) — deeper than
+                // $classArrayKeyLiterals' own targeted captures (a top-level `return [...]`, a
+                // `$var['key'] = ...;` assignment, a flat array assigned to `$this->prop`) can
+                // reach. Rather than tracing the exact variable-assignment/mutation/return flow
+                // through several conditionals and two `apply_filters()` hops, this simply
+                // credits every `'literal' =>` pair textually found in the same class, the same
+                // "coarse net" trade-off $classArrayKeyLiterals already makes elsewhere — noise
+                // from unrelated keys (`'title'`, `'description'`, ...) is harmless on its own,
+                // since a spurious candidate that matches no real class/function definition is
+                // simply never looked up.
+                $arrowIndex = $this->peekNextMeaningfulIndex($tokens, $i);
+                if ($arrowIndex !== null && is_array($tokens[$arrowIndex]) && $tokens[$arrowIndex][0] === T_DOUBLE_ARROW) {
+                    $arrayKeyOwnerClass = empty($classNameStack) ? null : end($classNameStack);
+                    if ($arrayKeyOwnerClass !== null) {
+                        if (!isset($classArrayKeyLiterals[$arrayKeyOwnerClass])) {
+                            $classArrayKeyLiterals[$arrayKeyOwnerClass] = [];
+                        }
+                        $classArrayKeyLiterals[$arrayKeyOwnerClass][] = $stringVal;
+                    }
+                }
+
+                // 'NestedPages\Form\Listeners\\' . $class; / 'Jetpack_Tiled_Gallery_Layout_' .
+                // ucfirst( $this->atts['type'] ); — a literal concatenated with a resolved
+                // transform chain (see literalConcatVarAt()'s own docblock for both real-world
+                // shapes). Checked here (wherever this literal appears), not gated to a bare
+                // `$var = ` assignment, since wp-nested-pages' own real assignment target is
+                // `$this->handlers[$key]->class` — an lvalue far more complex than this parser
+                // otherwise attempts to track. Two independent, alternative gates on the literal
+                // itself (a namespace separator is unambiguous on its own; a capitalized
+                // underscore-joined identifier is a *shape* heuristic, not proof — Jetpack's own
+                // literal never reaches a `new $var(...)` this parser could cross-check against,
+                // since the concatenation and the `new` are two separate statements) — see
+                // $classNameTransformTemplates' own docblock for how ClassAnalyzer/FileAnalyzer
+                // resolve either.
+                $literalConcatVar = $this->literalConcatVarAt($tokens, $i, $transformChainVars);
+                if ($literalConcatVar !== null) {
+                    [$concatLiteral, $concatChain] = $literalConcatVar;
+                    $transformOwnerClass = empty($classNameStack) ? null : end($classNameStack);
+                    if (
+                        $transformOwnerClass !== null
+                        && $concatChain[1] !== []
+                        && (str_ends_with($concatLiteral, '\\') || preg_match('/^\\\\?[A-Z][A-Za-z0-9_]*_$/', $concatLiteral) === 1)
+                    ) {
+                        if (!isset($classNameTransformTemplates[$transformOwnerClass])) {
+                            $classNameTransformTemplates[$transformOwnerClass] = [];
+                        }
+                        $classNameTransformTemplates[$transformOwnerClass][] = [$concatLiteral, $concatChain[1], ''];
+
+                        // Elementor's widget/control/element registries build the dynamic class
+                        // name from a `foreach` loop variable, not a class-body array literal:
+                        // `foreach ($build_widgets_filename as $widget_filename) { $class_name =
+                        // str_replace('-', '_', $widget_filename); $class_name = __NAMESPACE__ .
+                        // '\Widget_' . $class_name; new $class_name(); }` — $concatChain[0] is
+                        // the transform's own source variable ("$widget_filename"), and when that
+                        // name matches an actively-tracked foreach loop (see
+                        // $foreachLoopVarNameStack/$foreachLoopVarValuesStack, populated from a
+                        // local flat literal array by parseForeachLiteralArrayLoop), its concrete
+                        // values ARE this class's domain — no unrelated class-body array literal
+                        // capture is needed to cross-product against.
+                        for ($k = count($foreachLoopVarNameStack) - 1; $k >= 0; $k--) {
+                            if ($foreachLoopVarNameStack[$k] === $concatChain[0]) {
+                                if (!isset($classArrayKeyLiterals[$transformOwnerClass])) {
+                                    $classArrayKeyLiterals[$transformOwnerClass] = [];
+                                }
+                                array_push($classArrayKeyLiterals[$transformOwnerClass], ...$foreachLoopVarValuesStack[$k]);
+                                break;
+                            }
+                        }
+                    }
+                }
+
                 // A literal directly concatenated with a currently-tracked bounded for-loop
                 // variable (`'prefix_' . $i` inside `for ($i = 1; $i < 5; $i++) { ... }`) —
                 // computed once per literal and shared by both the callback-name and file-path
@@ -1768,7 +2140,68 @@ final class PhpTokenParser
                 // file-path check further below can tell whether this literal's enumeration was
                 // already consumed here, without re-deriving the same condition twice.
                 $forLoopCallbackEnumeration = ($sepEnd === null && $isCallbackShaped) ? $forLoopEnumeration : null;
-                if ($forLoopCallbackEnumeration !== null) {
+                // A `foreach`/for-loop concatenation whose own PREFIX literal already ends in a
+                // namespace separator (real-world shape, litespeed-cache:
+                // `add_action('litespeed_load_thirdparty', 'LiteSpeed\Thirdparty\\' . $cls .
+                // '::detect');` inside `foreach ($third_cls as $cls) { ... }`) is a fully-
+                // qualified string-callable whose *class* segment moves with the loop variable —
+                // $sepEnd/$isCallbackShaped above are computed from $stringVal alone (just the
+                // prefix, ending in "\\", so $callbackName there is empty and $isCallbackShaped
+                // is false), so this needs each concrete enumerated string re-split on its own
+                // rightmost '\\'/'::' independently, not the shared prefix-only split above.
+                // Mutually exclusive with $forLoopCallbackEnumeration in practice: a prefix
+                // ending in "\\"/"::" (required here) always makes $sepEnd non-null there.
+                $forLoopClassMethodEnumeration = null;
+                if ($forLoopCallbackEnumeration === null && $forLoopEnumeration !== null && $forLoopEnumeration[0] !== []) {
+                    $candidateSplits = [];
+                    foreach ($forLoopEnumeration[0] as $candidate) {
+                        $candidateSepEnd = null;
+                        $candidateSepPos = null;
+                        foreach (['\\', '::'] as $csep) {
+                            $cpos = strrpos($candidate, $csep);
+                            if ($cpos !== false) {
+                                $cend = $cpos + strlen($csep);
+                                if ($candidateSepEnd === null || $cend > $candidateSepEnd) {
+                                    $candidateSepEnd = $cend;
+                                    $candidateSepPos = $cpos;
+                                }
+                            }
+                        }
+                        if (
+                            $candidateSepEnd === null
+                            || $candidateSepPos === 0
+                            || !$this->looksLikeCallback(substr($candidate, $candidateSepEnd))
+                            || !$this->looksLikeCallback($this->shortClassName(substr($candidate, 0, $candidateSepPos)))
+                        ) {
+                            $candidateSplits = null;
+                            break;
+                        }
+                        // Real WordPress source can only end a single-quoted (or interpolation-
+                        // free double-quoted) literal in a namespace separator by doubling the
+                        // backslash (`'LiteSpeed\Thirdparty\\'` — an unescaped single trailing
+                        // backslash would instead escape the closing quote itself), which decodes
+                        // to one backslash at runtime but survives raw and doubled here, since
+                        // stripQuotes() deliberately never processes PHP escape sequences (see
+                        // its own docblock). Collapsed back to a single separator so the
+                        // reconstructed FQCN matches the real, singly-separated one every
+                        // ClassDef/$currentNamespace value in this parser already uses.
+                        $rawClassPart = substr($candidate, 0, $candidateSepPos);
+                        $classPart = preg_replace('/\\\\{2,}/', '\\', $rawClassPart) ?? $rawClassPart;
+                        $candidateSplits[] = [$classPart, substr($candidate, $candidateSepEnd)];
+                    }
+                    $forLoopClassMethodEnumeration = $candidateSplits === null ? null : [$candidateSplits, $forLoopEnumeration[1]];
+                }
+                if ($forLoopClassMethodEnumeration !== null) {
+                    [$classMethodSplits, $lastForLoopIndex] = $forLoopClassMethodEnumeration;
+                    foreach ($classMethodSplits as [$classPart, $methodPart]) {
+                        $classReferences[] = $this->shortClassName($classPart);
+                        $scopedMethodCalls[] = new ScopedMethodCall(
+                            $this->resolveFqcn($classPart, $currentNamespace, $useImports),
+                            $methodPart,
+                        );
+                    }
+                    $i = $lastForLoopIndex;
+                } elseif ($forLoopCallbackEnumeration !== null) {
                     // Real-world shape (Sydney theme): `'render_callback' =>
                     // 'sydney_partial_slider_title_' . $i` inside `for ($i = 1; $i < 5; $i++)` —
                     // enumerate every concrete name the loop actually produces instead of the
@@ -1875,7 +2308,9 @@ final class PhpTokenParser
                 // ($forLoopEnumeration); only consumed here when the callback branch didn't
                 // already claim it (a callback-shaped identifier can't also end in '.php', so in
                 // practice these two are mutually exclusive per literal, never a double-count).
-                if ($forLoopEnumeration !== null && $forLoopCallbackEnumeration === null) {
+                // Same exclusion for $forLoopClassMethodEnumeration — a "Class::method" string
+                // can't also end in '.php'.
+                if ($forLoopEnumeration !== null && $forLoopCallbackEnumeration === null && $forLoopClassMethodEnumeration === null) {
                     [$enumeratedPaths, $lastForLoopIndex] = $forLoopEnumeration;
                     foreach ($enumeratedPaths as $enumeratedPath) {
                         if (str_ends_with($enumeratedPath, '.php')) {
@@ -1982,11 +2417,14 @@ final class PhpTokenParser
             selfDispatchSuffixes: $selfDispatchSuffixes,
             pendingSelfDispatchCalls: $pendingSelfDispatchCalls,
             selfDispatchPrefixSuffixTemplates: $selfDispatchPrefixSuffixTemplates,
-            classArrayKeyLiterals: $classArrayKeyLiterals,
+            classArrayKeyLiterals: array_map(fn(array $keys): array => array_values(array_unique($keys)), $classArrayKeyLiterals),
             literalPathPropagationLinks: $literalPathPropagationLinks,
             literalPathInputs: $literalPathInputs,
             literalPathFileExistenceGuards: array_keys($literalPathFileExistenceGuards),
             hookPassThroughParams: $hookPassThroughParams,
+            classNameTransformTemplates: $classNameTransformTemplates,
+            functionArrayReturns: $functionArrayReturns,
+            functionNameTransformTemplates: $functionNameTransformTemplates,
         );
     }
 
@@ -2084,6 +2522,16 @@ final class PhpTokenParser
     }
 
     /**
+     * A property node's identity is the (class, property) pair itself, not a per-function
+     * counter like literalPathLocalNode() — it must resolve identically regardless of which
+     * method reads it (a constructor writes it, an unrelated method reads it back).
+     */
+    private function literalPathPropertyNode(string $ownerClass, string $propName): string
+    {
+        return $ownerClass . '::$' . $propName;
+    }
+
+    /**
      * Captures assignment links only when the target is a plain local or literal-keyed array
      * element and the RHS can be traced to one existing graph node. The Blocksy paths use both
      * forms (`$path` and `$args['path']`), while allowing a completely arbitrary RHS here would
@@ -2094,6 +2542,9 @@ final class PhpTokenParser
      * @param array<string,true> $fileExistenceGuards
      * @param list<LiteralPathPropagationLink> $links
      * @param array<string,string> $useImports
+     * @param array<string,list<string>> $functionLiteralReturns
+     * @param array<string,array<string,true>> $trackedProperties
+     * @param array<string,array<string,string>> $propertyLiteralDefaults
      */
     private function captureLiteralPathAssignment(
         array $tokens,
@@ -2107,6 +2558,9 @@ final class PhpTokenParser
         array $fileExistenceGuards,
         int &$counter,
         array &$links,
+        array $functionLiteralReturns = [],
+        array $trackedProperties = [],
+        array $propertyLiteralDefaults = [],
     ): void {
         $target = $this->literalPathAssignmentTarget($tokens, $variableIndex);
         if ($target === null) {
@@ -2144,6 +2598,9 @@ final class PhpTokenParser
             $currentClass,
             $currentParent,
             $functionKey,
+            $functionLiteralReturns,
+            $trackedProperties,
+            $propertyLiteralDefaults,
         );
         if ($source === null) {
             $this->invalidateLiteralPathAddress($nodes, $address);
@@ -2164,6 +2621,114 @@ final class PhpTokenParser
             fileExistenceGuardKeys: $guardKey === null ? [] : [$guardKey],
         );
         $nodes[$address] = $targetNode;
+    }
+
+    /**
+     * $variableIndex points at (what might be) the `$this` of `$this->propName = <expr>;` — a
+     * plain `=` only (no `.=`, no array-key target — no real-world evidence for either on a
+     * property yet, unlike literalPathAssignmentTarget()'s local-variable counterpart).
+     *
+     * @param list<Token> $tokens
+     * @return array{string,int}|null [property name, `=` token index]
+     */
+    private function literalPathThisPropertyAssignmentTarget(array $tokens, int $variableIndex): ?array
+    {
+        if (!is_array($tokens[$variableIndex]) || $tokens[$variableIndex][0] !== T_VARIABLE || $tokens[$variableIndex][1] !== '$this') {
+            return null;
+        }
+        $arrowIndex = $this->peekNextMeaningfulIndex($tokens, $variableIndex);
+        if ($arrowIndex === null || !is_array($tokens[$arrowIndex]) || $tokens[$arrowIndex][0] !== T_OBJECT_OPERATOR) {
+            return null;
+        }
+        $propIndex = $this->peekNextMeaningfulIndex($tokens, $arrowIndex);
+        if ($propIndex === null || !is_array($tokens[$propIndex]) || $tokens[$propIndex][0] !== T_STRING) {
+            return null;
+        }
+        $equalsIndex = $this->peekNextMeaningfulIndex($tokens, $propIndex);
+        if ($equalsIndex === null || $tokens[$equalsIndex] !== '=') {
+            return null;
+        }
+        return [$tokens[$propIndex][1], $equalsIndex];
+    }
+
+    /**
+     * `$this->propName = <expr>;` — the property-scoped counterpart to
+     * captureLiteralPathAssignment()'s local-variable tracking just above, needed for a
+     * constructor-stores-parameter-then-a-different-method-reads-it class. Real-world shape
+     * (Wordfence's `wfView`): `public function __construct( $view, $data = array() ) { ...
+     * $this->view = $view; ... }`, read back by a *different* method, `render()`. The property
+     * node is a single, stable id per (class, property) — see literalPathPropertyNode()'s own
+     * docblock — rather than a per-function counter-based local node, since it must resolve
+     * identically no matter which method reads it. Only ever marks a property "tracked" (added
+     * to $trackedProperties, consulted by literalPathNodeFromTokens()'s own `$this->` case) on a
+     * *resolved* source — an unresolvable RHS (Wordfence's own `$this->view_path = WORDFENCE_PATH
+     * . 'views';`, an opaque constant) leaves the property untracked, which
+     * literalPathNodeFromTokens() then treats as an ignorable term rather than a broken chain —
+     * see isLiteralPathIgnorablePropertyExpression()'s own docblock.
+     *
+     * @param list<Token> $tokens
+     * @param array<string,string> $nodes
+     * @param array<string,true> $fileExistenceGuards
+     * @param array<string,array<string,true>> $trackedProperties
+     * @param list<LiteralPathPropagationLink> $links
+     * @param array<string,string> $useImports
+     * @param array<string,list<string>> $functionLiteralReturns
+     * @param array<string,array<string,string>> $propertyLiteralDefaults
+     */
+    private function captureLiteralPathPropertyAssignment(
+        array $tokens,
+        int $variableIndex,
+        string $functionKey,
+        string $currentNamespace,
+        array $useImports,
+        ?string $currentClass,
+        ?string $currentParent,
+        array $nodes,
+        array $fileExistenceGuards,
+        array &$trackedProperties,
+        array &$links,
+        array $functionLiteralReturns,
+        array $propertyLiteralDefaults,
+    ): void {
+        if ($currentClass === null) {
+            return;
+        }
+        $target = $this->literalPathThisPropertyAssignmentTarget($tokens, $variableIndex);
+        if ($target === null) {
+            return;
+        }
+        [$propName, $equalsIndex] = $target;
+
+        $source = $this->resolveLiteralPathAssignmentSource(
+            $tokens,
+            $equalsIndex,
+            $nodes,
+            $currentNamespace,
+            $useImports,
+            $currentClass,
+            $currentParent,
+            $functionKey,
+            $functionLiteralReturns,
+            $trackedProperties,
+            $propertyLiteralDefaults,
+        );
+        if ($source === null) {
+            unset($trackedProperties[$currentClass][$propName]);
+            return;
+        }
+        [$sourceNode, $prefix, $suffix, $guardKey] = $source;
+        if ($guardKey !== null && !isset($fileExistenceGuards[$guardKey])) {
+            unset($trackedProperties[$currentClass][$propName]);
+            return;
+        }
+        $links[] = new LiteralPathPropagationLink(
+            $sourceNode,
+            $this->literalPathPropertyNode($currentClass, $propName),
+            $prefix,
+            $suffix,
+            fileExistenceGuardKeys: $guardKey === null ? [] : [$guardKey],
+        );
+        $trackedProperties[$currentClass][$propName] = true;
     }
 
     /**
@@ -2244,6 +2809,9 @@ final class PhpTokenParser
      * @param list<Token> $tokens
      * @param array<string,string> $nodes
      * @param array<string,string> $useImports
+     * @param array<string,list<string>> $functionLiteralReturns
+     * @param array<string,array<string,true>> $trackedProperties
+     * @param array<string,array<string,string>> $propertyLiteralDefaults
      * @return array{string,string,string,?string}|null [source node, fixed prefix, fixed suffix,
      *                                                   required file-existence guard key]
      */
@@ -2256,6 +2824,9 @@ final class PhpTokenParser
         ?string $currentClass,
         ?string $currentParent,
         string $functionKey,
+        array $functionLiteralReturns = [],
+        array $trackedProperties = [],
+        array $propertyLiteralDefaults = [],
     ): ?array {
         $rhsIndex = $this->peekNextMeaningfulIndex($tokens, $equalsIndex);
         if ($rhsIndex === null) {
@@ -2275,7 +2846,7 @@ final class PhpTokenParser
             if ($valueTokens === null) {
                 return null;
             }
-            $source = $this->resolveLiteralPathExpressionTokens($valueTokens, $nodes, true, $functionKey);
+            $source = $this->resolveLiteralPathExpressionTokens($valueTokens, $nodes, true, $functionKey, $functionLiteralReturns, $currentClass, $currentParent, $currentNamespace, $useImports, $trackedProperties, $propertyLiteralDefaults);
             if ($source !== null) {
                 return $source;
             }
@@ -2288,7 +2859,7 @@ final class PhpTokenParser
             return [$this->literalPathReturnNode($callee), '', '', null];
         }
 
-        return $this->resolveLiteralPathExpressionTokens($rhsTokens, $nodes, true, $functionKey);
+        return $this->resolveLiteralPathExpressionTokens($rhsTokens, $nodes, true, $functionKey, $functionLiteralReturns, $currentClass, $currentParent, $currentNamespace, $useImports, $trackedProperties, $propertyLiteralDefaults);
     }
 
     /**
@@ -2359,6 +2930,10 @@ final class PhpTokenParser
     /**
      * @param list<Token> $expression
      * @param array<string,string> $nodes
+     * @param array<string,list<string>> $functionLiteralReturns
+     * @param array<string,string> $useImports
+     * @param array<string,array<string,true>> $trackedProperties
+     * @param array<string,array<string,string>> $propertyLiteralDefaults
      * @return array{string,string,string,?string}|null [source node, fixed prefix, fixed suffix,
      *                                                   required file-existence guard key]
      */
@@ -2367,8 +2942,15 @@ final class PhpTokenParser
         array $nodes,
         bool $allowGuardedUnknownVariable = false,
         ?string $guardScope = null,
+        array $functionLiteralReturns = [],
+        ?string $currentClass = null,
+        ?string $currentParent = null,
+        string $currentNamespace = '',
+        array $useImports = [],
+        array $trackedProperties = [],
+        array $propertyLiteralDefaults = [],
     ): ?array {
-        $sourceNode = $this->literalPathNodeFromTokens($expression, $nodes);
+        $sourceNode = $this->literalPathNodeFromTokens($expression, $nodes, $currentClass, $trackedProperties);
         if ($sourceNode !== null) {
             return [$sourceNode, '', '', null];
         }
@@ -2379,7 +2961,7 @@ final class PhpTokenParser
         // remain deliberately unresolved.
         if ($this->literalPathFunctionNameFromTokens($expression) === 'ltrim') {
             $args = $this->literalPathCallArguments($expression);
-            $inputNode = isset($args[0]) ? $this->literalPathNodeFromTokens($args[0], $nodes) : null;
+            $inputNode = isset($args[0]) ? $this->literalPathNodeFromTokens($args[0], $nodes, $currentClass, $trackedProperties) : null;
             if ($inputNode !== null && isset($args[1]) && $this->literalPathStringLiteral($args[1]) === '/') {
                 return [$inputNode, '', '', null];
             }
@@ -2392,11 +2974,12 @@ final class PhpTokenParser
         $sourceTermIndex = null;
         $unknownVariableTerms = 0;
         foreach ($terms as $index => $term) {
-            if ($this->literalPathNodeFromTokens($term, $nodes) === null) {
+            if ($this->literalPathNodeFromTokens($term, $nodes, $currentClass, $trackedProperties) === null) {
                 if (
-                    $this->literalPathStringLiteral($term) === null
+                    $this->literalPathStringLiteralOrMethodReturn($term, $functionLiteralReturns, $currentClass, $currentParent, $currentNamespace, $useImports, $propertyLiteralDefaults) === null
                     && !$this->isLiteralPathRootDirectoryExpression($term)
                     && !$this->isLiteralPathIgnorableConstantExpression($term)
+                    && !$this->isLiteralPathIgnorablePropertyExpression($term)
                 ) {
                     if (!$this->isLiteralPathDirectVariable($term)) {
                         return null;
@@ -2414,7 +2997,7 @@ final class PhpTokenParser
             return null;
         }
 
-        $sourceNode = $this->literalPathNodeFromTokens($terms[$sourceTermIndex], $nodes);
+        $sourceNode = $this->literalPathNodeFromTokens($terms[$sourceTermIndex], $nodes, $currentClass, $trackedProperties);
         if ($sourceNode === null) {
             return null;
         }
@@ -2429,7 +3012,7 @@ final class PhpTokenParser
             : null;
         $prefix = '';
         for ($index = $sourceTermIndex - 1; $index >= 0; $index--) {
-            $literal = $this->literalPathStringLiteral($terms[$index]);
+            $literal = $this->literalPathStringLiteralOrMethodReturn($terms[$index], $functionLiteralReturns, $currentClass, $currentParent, $currentNamespace, $useImports, $propertyLiteralDefaults);
             if ($literal === null) {
                 break;
             }
@@ -2437,7 +3020,7 @@ final class PhpTokenParser
         }
         $suffix = '';
         for ($index = $sourceTermIndex + 1, $count = count($terms); $index < $count; $index++) {
-            $literal = $this->literalPathStringLiteral($terms[$index]);
+            $literal = $this->literalPathStringLiteralOrMethodReturn($terms[$index], $functionLiteralReturns, $currentClass, $currentParent, $currentNamespace, $useImports, $propertyLiteralDefaults);
             if ($literal === null) {
                 break;
             }
@@ -2450,6 +3033,92 @@ final class PhpTokenParser
             $suffix,
             $guardKey,
         ];
+    }
+
+    /**
+     * Extends literalPathStringLiteral() to also recognize a zero-arg `self::`/`static::`/
+     * `parent::`/`Foo::`/`$this->` method call whose target method (looked up in
+     * $functionLiteralReturns — the same single-pass, defined-before-use map class-constant
+     * resolution already relies on elsewhere in this parser) resolved to EXACTLY one literal
+     * return value, treating it as if that literal appeared directly in this position.
+     * Real-world shape (WPForms): `'emails/' . $this->get_slug() . '-' . $name` inside
+     * `General::get_full_template_name()`, where `General::get_slug()` (defined earlier in the
+     * same file) does `return static::TEMPLATE_SLUG;`. A method with several possible literal
+     * returns (multiple branches) is left unresolved here — this position needs one
+     * deterministic value, not a set, unlike the position `resolveLiteralPathExpressionTokens`
+     * actually tracks as the flowing dynamic node.
+     *
+     * @param list<Token> $term
+     * @param array<string,list<string>> $functionLiteralReturns
+     * @param array<string,string> $useImports
+     * @param array<string,array<string,string>> $propertyLiteralDefaults
+     */
+    private function literalPathStringLiteralOrMethodReturn(array $term, array $functionLiteralReturns, ?string $currentClass, ?string $currentParent, string $currentNamespace, array $useImports, array $propertyLiteralDefaults = []): ?string
+    {
+        $literal = $this->literalPathStringLiteral($term);
+        if ($literal !== null) {
+            return $literal;
+        }
+
+        $propName = $this->literalPathThisPropertyName($term);
+        if ($propName !== null) {
+            return $currentClass === null ? null : ($propertyLiteralDefaults[$currentClass][$propName] ?? null);
+        }
+
+        $key = $this->literalPathZeroArgMethodCallKey($term, $currentClass, $currentParent, $currentNamespace, $useImports);
+        if ($key === null) {
+            return null;
+        }
+        $returns = $functionLiteralReturns[$key] ?? [];
+        return count($returns) === 1 ? $returns[0] : null;
+    }
+
+    /**
+     * Recognizes `self::method()` / `static::method()` / `parent::method()` / `Foo::method()` /
+     * `$this->method()` — a zero-argument scoped or instance method call — and resolves it to
+     * the same `"Class::method"` key $functionLiteralReturns/$functionParamSuffixReturns use.
+     * `$this->` resolves against $currentClass, same as `self::`/`static::` — no late-static-
+     * binding fan-out across subclass overrides for any of the three (see
+     * resolveReturnLiterals()'s own scope-limitation note); `parent::` resolves against
+     * $currentParent. Returns null for anything else (an argument present, a property access,
+     * a chained call, ...).
+     *
+     * @param list<Token> $expression
+     * @param array<string,string> $useImports
+     */
+    private function literalPathZeroArgMethodCallKey(array $expression, ?string $currentClass, ?string $currentParent, string $currentNamespace, array $useImports): ?string
+    {
+        if (
+            count($expression) !== 5
+            || !is_array($expression[2]) || $expression[2][0] !== T_STRING
+            || $expression[3] !== '(' || $expression[4] !== ')'
+        ) {
+            return null;
+        }
+        $methodName = $expression[2][1];
+        $receiver = $expression[0];
+
+        if (
+            is_array($receiver) && $receiver[0] === T_VARIABLE && $receiver[1] === '$this'
+            && is_array($expression[1]) && $expression[1][0] === T_OBJECT_OPERATOR
+        ) {
+            return $currentClass === null ? null : $currentClass . '::' . $methodName;
+        }
+
+        if (
+            is_array($receiver) && (in_array($receiver[0], self::CLASS_NAME_TOKENS, true) || $receiver[0] === T_STATIC)
+            && $this->isLiteralPathScopeResolutionOperator($expression[1])
+        ) {
+            $receiverName = $receiver[0] === T_STATIC ? 'static' : $receiver[1];
+            $receiverClass = match (strtolower($receiverName)) {
+                'self', 'static' => $currentClass,
+                'parent' => $currentParent,
+                default => $this->resolveFqcn($receiverName, $currentNamespace, $useImports),
+            };
+            return $receiverClass === null ? null : $receiverClass . '::' . $methodName;
+        }
+
+        return null;
     }
 
     /**
@@ -2499,6 +3168,45 @@ final class PhpTokenParser
     }
 
     /**
+     * `$this->propName`, exactly — the 3-token shape shared by literalPathNodeFromTokens()'s own
+     * property-node case, literalPathStringLiteralOrMethodReturn()'s property-default lookup, and
+     * isLiteralPathIgnorablePropertyExpression() below, so all three recognize the identical
+     * shape rather than three independent (and possibly drifting) token checks.
+     *
+     * @param list<Token> $expression
+     */
+    private function literalPathThisPropertyName(array $expression): ?string
+    {
+        if (
+            count($expression) !== 3
+            || !is_array($expression[0]) || $expression[0][0] !== T_VARIABLE || $expression[0][1] !== '$this'
+            || !is_array($expression[1]) || $expression[1][0] !== T_OBJECT_OPERATOR
+            || !is_array($expression[2]) || $expression[2][0] !== T_STRING
+        ) {
+            return null;
+        }
+        return $expression[2][1];
+    }
+
+    /**
+     * A `$this->propName` term that literalPathNodeFromTokens() doesn't already resolve as a live
+     * node (see its own docblock — only a property this same file saw `$this->propName = ...`
+     * successfully resolve for is ever "live") and that has no known scalar literal default
+     * either is the property-access counterpart to isLiteralPathIgnorableConstantExpression()
+     * just above: a value this parser can't (and, since it's neither the flowing dynamic segment
+     * nor a literal fragment, doesn't need to) resolve. Real-world shape (Wordfence's `wfView`):
+     * `render()`'s own `$this->view_path . '/' . $view . $this->view_file_extension` — `$view` is
+     * the one live node; `$this->view_path` was set from an opaque `WORDFENCE_PATH` constant this
+     * parser never resolves, and must be ignored rather than aborting the whole expression.
+     *
+     * @param list<Token> $expression
+     */
+    private function isLiteralPathIgnorablePropertyExpression(array $expression): bool
+    {
+        return $this->literalPathThisPropertyName($expression) !== null;
+    }
+
+    /**
      * The key includes its wrapper scope to prevent two separate methods that happen to use
      * `$base . $name` from sharing a guard. Token IDs/text deliberately omit line numbers so the
      * same expression compares equal between the `file_exists()` condition and its assignment.
@@ -2519,8 +3227,9 @@ final class PhpTokenParser
     /**
      * @param list<Token> $expression
      * @param array<string,string> $nodes
+     * @param array<string,array<string,true>> $trackedProperties
      */
-    private function literalPathNodeFromTokens(array $expression, array $nodes): ?string
+    private function literalPathNodeFromTokens(array $expression, array $nodes, ?string $currentClass = null, array $trackedProperties = []): ?string
     {
         if (count($expression) === 1 && is_array($expression[0]) && $expression[0][0] === T_VARIABLE) {
             return $nodes[$expression[0][1]] ?? null;
@@ -2542,20 +3251,64 @@ final class PhpTokenParser
             }
         }
 
+        // `$this->propName` — only once *this same file* saw `$this->propName = <resolved
+        // source>;` succeed somewhere (captureLiteralPathPropertyAssignment(), tracked in
+        // $trackedProperties; see its own docblock for why this is single-pass, defined-before-
+        // use). Real-world shape (Wordfence's `wfView`): the constructor sets `$this->view =
+        // $view`; a *different* method, `render()`, later reads `$this->view` to build the
+        // include path. The node id is the property's own stable `Class::$prop` identity, not a
+        // per-function counter, since it must resolve identically no matter which method reads
+        // it. An untracked property falls through to return null here — see
+        // isLiteralPathIgnorablePropertyExpression()'s own docblock for what happens to it next.
+        $propName = $this->literalPathThisPropertyName($expression);
+        if ($propName !== null) {
+            return ($currentClass !== null && isset($trackedProperties[$currentClass][$propName]))
+                ? $this->literalPathPropertyNode($currentClass, $propName)
+                : null;
+        }
+
         // `basename( $name )` — Akismet's `Akismet::view( $name )` builds `AKISMET__PLUGIN_DIR .
         // 'views/' . basename( $name ) . '.php'` before `include`. FileAnalyzer's own referenced-
         // index already matches by basename() regardless (see its own doc comment), so this
         // transform is a no-op for matching purposes: resolves to the exact same node its inner
-        // expression would, letting the caller's literal argument still reach it. Any other
-        // wrapping function is left unresolved, same "don't guess" stance the rest of this
-        // mechanism takes.
+        // expression would, letting the caller's literal argument still reach it.
+        // `sanitize_file_name( $name )` — WPForms' own `General::get_full_template_name( $name )`
+        // reassigns `$name = \sanitize_file_name( $name );` (its own code calls it backslash-
+        // qualified, hence CLASS_NAME_TOKENS + shortClassName() below rather than a bare T_STRING
+        // check) before building the template path from it. Every real template-part name this
+        // parser ever sees here (`'header'`, `'body'`, `'style'`, ...) is already a plain
+        // lowercase slug with nothing for `sanitize_file_name()` to actually strip — same
+        // no-op-for-matching-purposes trade-off as `basename()`. Any other wrapping function is
+        // left unresolved, same "don't guess" stance the rest of this mechanism takes.
         if (
             count($expression) >= 4
-            && is_array($expression[0]) && $expression[0][0] === T_STRING && $expression[0][1] === 'basename'
+            && is_array($expression[0]) && in_array($expression[0][0], self::CLASS_NAME_TOKENS, true) && in_array($this->shortClassName($expression[0][1]), ['basename', 'sanitize_file_name'], true)
             && $expression[1] === '('
             && $expression[count($expression) - 1] === ')'
         ) {
-            return $this->literalPathNodeFromTokens(array_slice($expression, 2, -1), $nodes);
+            return $this->literalPathNodeFromTokens(array_slice($expression, 2, -1), $nodes, $currentClass, $trackedProperties);
+        }
+
+        // `preg_replace( '/\.{2,}/', '.', $name )` — Wordfence's `wfView::render()` collapses
+        // runs of dots in the view slug before building the path. Every real view slug this
+        // parser ever sees here is already a plain relative path with no consecutive dots to
+        // collapse — same no-op-for-matching-purposes trade-off as `basename()` above, extended
+        // to a 3-arg call: both the pattern and replacement must be plain literals (a computed
+        // pattern isn't attempted), and only the 3rd argument (the subject) is recursed into.
+        if (
+            count($expression) >= 6
+            && is_array($expression[0]) && in_array($expression[0][0], self::CLASS_NAME_TOKENS, true) && $this->shortClassName($expression[0][1]) === 'preg_replace'
+            && $expression[1] === '('
+            && $expression[count($expression) - 1] === ')'
+        ) {
+            $args = $this->splitTopLevelCommaArgs(array_slice($expression, 2, -1));
+            if (
+                count($args) === 3
+                && count($args[0]) === 1 && is_array($args[0][0]) && $args[0][0][0] === T_CONSTANT_ENCAPSED_STRING
+                && count($args[1]) === 1 && is_array($args[1][0]) && $args[1][0][0] === T_CONSTANT_ENCAPSED_STRING
+            ) {
+                return $this->literalPathNodeFromTokens($args[2], $nodes, $currentClass, $trackedProperties);
+            }
         }
 
         return null;
@@ -2908,7 +3661,13 @@ final class PhpTokenParser
                 $argument = [];
                 continue;
             }
-            if (!is_array($token) || $token[0] !== T_WHITESPACE) {
+            // An inline `// phpcs:ignore ...`/doc comment directly after the opening `(` (or
+            // between any two argument tokens) must not survive into $argument — real-world
+            // regression (WPForms): `wpforms_render( // phpcs:ignore ...\n\t'education/admin/
+            // did-you-know', [...] )` left a stray T_COMMENT token in front of the literal,
+            // so literalPathStringLiteral()'s own `count($tokens) === 1` exact-match check
+            // never matched and the whole chain silently failed to resolve.
+            if (!is_array($token) || ($token[0] !== T_WHITESPACE && $token[0] !== T_COMMENT && $token[0] !== T_DOC_COMMENT)) {
                 $argument[] = $token;
             }
         }
@@ -3443,6 +4202,7 @@ final class PhpTokenParser
      * @param array<string,string> $definedConstants
      * @param array<int,bool> $skipStringIndices
      * @param list<FunctionCall> $functionCalls
+     * @param list<ScopedMethodCallPrefix> $scopedMethodCallPrefixes
      */
     private function dispatchBareFunctionCall(
         string $name,
@@ -3467,7 +4227,32 @@ final class PhpTokenParser
         array &$definedConstants,
         array &$skipStringIndices,
         array &$functionCalls,
+        array &$scopedMethodCallPrefixes,
     ): void {
+        // `method_exists($this, 'generate_' . $type . '_html')` / `method_exists(__CLASS__,
+        // "get_column_{$column_name}")` — a dynamic-dispatch registry, checking whether a
+        // computed method name exists on a resolvable receiver before calling it, no array-
+        // callback shape involved at all. Confirmed recurring across the corpus: WooCommerce
+        // (5 call sites — generate_*_html, variation_bulk_action_*, format_*, set_*_query_args),
+        // Wordfence (scan_*_init, filter*), WordPress SEO (retrieve_*), WPForms
+        // (get_column_{$column_name}). method_exists()'s own second argument being built this
+        // way is a stronger, more unambiguous signal than the array-callback prefix case below —
+        // there's no "is this position even callback-related" question to answer, the function
+        // name says so directly — so no receiver-resolution restriction beyond
+        // methodExistsReceiverClass()'s own narrow, evidenced shapes is needed.
+        if ($name === 'method_exists') {
+            $receiverArg = $this->argTokensAt($tokens, $i, 0);
+            $nameArg = $this->argTokensAt($tokens, $i, 1);
+            if ($receiverArg !== null && $nameArg !== null) {
+                $receiverClass = $this->methodExistsReceiverClass($receiverArg, $currentClass, $currentNamespace, $useImports);
+                $prefixSuffix = $receiverClass !== null ? $this->methodExistsDynamicNamePrefixSuffix($nameArg) : null;
+                if ($prefixSuffix !== null) {
+                    [$prefix, $suffix] = $prefixSuffix;
+                    $scopedMethodCallPrefixes[] = new ScopedMethodCallPrefix($receiverClass, $prefix, $suffix);
+                }
+            }
+        }
+
         if (in_array($name, self::HOOK_REGISTER_FUNCS, true)) {
             $hookRegistrations[] = $this->parseHookRegistration($tokens, $i, $line, $file, $name, $varLiteralValues, $classConstants, $currentClass, $currentParent, $currentNamespace, $useImports);
             return;
@@ -4250,13 +5035,7 @@ final class PhpTokenParser
             && is_array($argTokens[1]) && $argTokens[1][0] === T_DOUBLE_COLON
             && is_array($argTokens[2]) && $argTokens[2][0] === T_STRING
         ) {
-            $receiverName = $argTokens[0][0] === T_STATIC ? 'static' : $argTokens[0][1];
-            $receiverClass = match (strtolower($receiverName)) {
-                'self', 'static' => $currentClass,
-                'parent' => $currentParent,
-                default => $this->resolveFqcn($receiverName, $currentNamespace, $useImports),
-            };
-            $value = $receiverClass !== null ? ($classConstants[$receiverClass][$argTokens[2][1]] ?? null) : null;
+            $value = $this->resolveScopedClassConstant($argTokens[0], $argTokens[2][1], $classConstants, $currentClass, $currentParent, $currentNamespace, $useImports);
             if ($value !== null) {
                 return [$value, false, $value, ''];
             }
@@ -4300,6 +5079,29 @@ final class PhpTokenParser
         }
 
         return ['', true, '', ''];
+    }
+
+    /**
+     * $receiverToken is the `self`/`static`/`parent`/class-name token immediately before `::` in
+     * a `Receiver::CONST_NAME` expression; $constName is the constant's own bare name. Resolves
+     * `self`/`static` to $currentClass, `parent` to $currentParent, and any other identifier
+     * through `resolveFqcn` against the current namespace/imports, then looks up the resolved
+     * class's literal constant value. Shared by classifyArgTokens() (a hook/template-part
+     * argument) and resolveReturnLiterals() (a bare `return self::CONST;`-style method body) so
+     * both recognize the exact same set of constant-reference shapes.
+     *
+     * @param array<string,array<string,string>> $classConstants
+     * @param array<string,string> $useImports
+     */
+    private function resolveScopedClassConstant(mixed $receiverToken, string $constName, array $classConstants, ?string $currentClass, ?string $currentParent, string $currentNamespace, array $useImports): ?string
+    {
+        $receiverName = is_array($receiverToken) && $receiverToken[0] === T_STATIC ? 'static' : (is_array($receiverToken) ? $receiverToken[1] : '');
+        $receiverClass = match (strtolower($receiverName)) {
+            'self', 'static' => $currentClass,
+            'parent' => $currentParent,
+            default => $this->resolveFqcn($receiverName, $currentNamespace, $useImports),
+        };
+        return $receiverClass !== null ? ($classConstants[$receiverClass][$constName] ?? null) : null;
     }
 
     /** @param list<Token> $tokens */
@@ -5240,6 +6042,90 @@ final class PhpTokenParser
     }
 
     /**
+     * $i points at T_RETURN. Recognizes `return array( 'key1' => ..., 'key2' => ..., ... );` /
+     * `return [ 'key1' => ..., ... ];` — every top-level element keyed by a plain string
+     * literal, each value's own shape left completely unconstrained (real-world case: WPForms'
+     * `SmartTags::smart_tags_list()`, whose values are `esc_html__(...)` calls, not literals
+     * themselves — only the keys matter to $classArrayKeyLiterals, see its own docblock).
+     * Bails (returns null) the moment any top-level element's key isn't a plain string literal
+     * (a computed/dynamic key, or an unkeyed element mixed in), or there are fewer than two
+     * elements — same "bail rather than guess" stance parseAnyStringLiteralArray takes just
+     * below.
+     *
+     * @param list<Token> $tokens
+     * @return list<string>|null
+     */
+    private function resolveReturnedKeyedArrayLiteralKeys(array $tokens, int $i): ?array
+    {
+        $j = $this->skipInsignificant($tokens, $i + 1);
+        if (!isset($tokens[$j])) {
+            return null;
+        }
+
+        if (is_array($tokens[$j]) && $tokens[$j][0] === T_ARRAY) {
+            $j = $this->skipInsignificant($tokens, $j + 1);
+            if (!isset($tokens[$j]) || $tokens[$j] !== '(') {
+                return null;
+            }
+            $close = ')';
+        } elseif ($tokens[$j] === '[') {
+            $close = ']';
+        } else {
+            return null;
+        }
+
+        $j++;
+        $keys = [];
+        $expectingKey = true;
+        $depth = 0;
+
+        while (isset($tokens[$j])) {
+            if ($expectingKey) {
+                $j = $this->skipInsignificant($tokens, $j);
+                if (!isset($tokens[$j])) {
+                    return null;
+                }
+                $t = $tokens[$j];
+
+                if ($t === $close) {
+                    return count($keys) < 2 ? null : $keys;
+                }
+
+                if (!is_array($t) || $t[0] !== T_CONSTANT_ENCAPSED_STRING) {
+                    return null;
+                }
+
+                $arrowIndex = $this->skipInsignificant($tokens, $j + 1);
+                if (!isset($tokens[$arrowIndex]) || !is_array($tokens[$arrowIndex]) || $tokens[$arrowIndex][0] !== T_DOUBLE_ARROW) {
+                    return null; // not a keyed element — bail entirely rather than guess
+                }
+
+                $keys[] = $this->stripQuotes($t[1]);
+                $j = $arrowIndex + 1;
+                $expectingKey = false;
+                continue;
+            }
+
+            // Skip the value, tracking nested bracket depth, until this element's own top-level
+            // comma or the array's own closing bracket.
+            $t = $tokens[$j];
+            if ($t === '(' || $t === '[' || $t === '{') {
+                $depth++;
+            } elseif ($t === ')' || $t === ']' || $t === '}') {
+                if ($depth === 0) {
+                    return $t === $close && count($keys) >= 2 ? $keys : null;
+                }
+                $depth--;
+            } elseif ($depth === 0 && $t === ',') {
+                $expectingKey = true;
+            }
+            $j++;
+        }
+
+        return null;
+    }
+
+    /**
      * $i points at T_FOREACH. Resolves `foreach ( $var as ... )`'s collection expression to
      * $var's tracked literal-array contents, or [] if it isn't a bare tracked variable (any other
      * shape — a method call, a property access, an inline array literal — falls through
@@ -5332,16 +6218,25 @@ final class PhpTokenParser
      *  - `return 'literal';` — the literal itself.
      *  - `return $var;` — whatever's accumulated for $var in $varLiteralAssignments (the current
      *    function scope's own copy).
+     *  - `return self::CONST;` / `return static::CONST;` / `return Foo::CONST;` — the resolved
+     *    class constant's own literal value (real-world shape, WPForms: `General::get_slug()`
+     *    does `return static::TEMPLATE_SLUG;`, late-bound per subclass — only the physical
+     *    class's own value is resolved here, no descendant fan-out for `static::`, see
+     *    $classNameTransformTemplates' sibling scope-limitation note for why that's deliberate).
      *  - `return apply_filters('tag', $var_or_literal, ...);` — the same, read from the filter's
      *    second argument (its "default value" position) — an extremely common WP idiom for
      *    exactly this "return a value, but let a filter override it" shape.
-     * Anything else (any other expression) resolves to [] — no guessing beyond these three shapes.
+     * Anything else (any other expression) resolves to [] — no guessing beyond these shapes.
+     * Called for both a top-level function's body and a method's — see $functionLiteralReturns'
+     * own docblock for the "Class::method" keying a method uses.
      *
      * @param list<Token> $tokens
      * @param array<string,list<string>> $varLiteralAssignments
+     * @param array<string,array<string,string>> $classConstants
+     * @param array<string,string> $useImports
      * @return list<string>
      */
-    private function resolveReturnLiterals(array $tokens, int $i, array $varLiteralAssignments): array
+    private function resolveReturnLiterals(array $tokens, int $i, array $varLiteralAssignments, array $classConstants = [], ?string $currentClass = null, ?string $currentParent = null, string $currentNamespace = '', array $useImports = []): array
     {
         $j = $this->skipInsignificant($tokens, $i + 1);
         if (!isset($tokens[$j]) || !is_array($tokens[$j])) {
@@ -5359,6 +6254,22 @@ final class PhpTokenParser
             return isset($tokens[$after]) && $tokens[$after] === ';' ? ($varLiteralAssignments[$t[1]] ?? []) : [];
         }
 
+        if (in_array($t[0], self::CLASS_NAME_TOKENS, true) || $t[0] === T_STATIC) {
+            $doubleColonIndex = $this->peekNextMeaningfulIndex($tokens, $j);
+            if ($doubleColonIndex !== null && is_array($tokens[$doubleColonIndex]) && $tokens[$doubleColonIndex][0] === T_DOUBLE_COLON) {
+                $constIndex = $this->peekNextMeaningfulIndex($tokens, $doubleColonIndex);
+                if ($constIndex !== null && is_array($tokens[$constIndex]) && $tokens[$constIndex][0] === T_STRING) {
+                    $after = $this->peekNextMeaningfulIndex($tokens, $constIndex);
+                    if ($after !== null && $tokens[$after] === ';') {
+                        $value = $this->resolveScopedClassConstant($t, $tokens[$constIndex][1], $classConstants, $currentClass, $currentParent, $currentNamespace, $useImports);
+                        if ($value !== null) {
+                            return [$value];
+                        }
+                    }
+                }
+            }
+        }
+
         if ($t[0] === T_STRING && $t[1] === 'apply_filters' && $this->peekNextMeaningful($tokens, $j) === '(') {
             $argTokens = $this->argTokensAt($tokens, $j, 1);
             if ($argTokens !== null && count($argTokens) === 1) {
@@ -5373,6 +6284,137 @@ final class PhpTokenParser
         }
 
         return [];
+    }
+
+    /**
+     * $i points at T_RETURN. Resolves what it hands back to a *list* of literals (an array,
+     * not a scalar) when possible:
+     *  - `return $var;` — $var's own tracked flat literal-array contents (see
+     *    $anyArrayLiteralVars/parseAnyStringLiteralArray).
+     *  - `return apply_filters('tag', $var, ...);` — same, read from the filter's own
+     *    documented "value" position.
+     * Anything else resolves to [] — no guessing beyond these two shapes. Mirrors
+     * resolveReturnLiterals()'s own two shapes, just array- instead of scalar-valued; doesn't
+     * also attempt a bare literal return (`return array(...);` directly with no intermediate
+     * variable) — no evidence for that shape yet.
+     *
+     * @param list<Token> $tokens
+     * @param array<string,list<string>> $anyArrayLiteralVars
+     * @return list<string>
+     */
+    private function resolveReturnArrayLiterals(array $tokens, int $i, array $anyArrayLiteralVars): array
+    {
+        $j = $this->skipInsignificant($tokens, $i + 1);
+        if (!isset($tokens[$j]) || !is_array($tokens[$j])) {
+            return [];
+        }
+        $t = $tokens[$j];
+
+        if ($t[0] === T_VARIABLE) {
+            $after = $this->skipInsignificant($tokens, $j + 1);
+            return isset($tokens[$after]) && $tokens[$after] === ';' ? ($anyArrayLiteralVars[$t[1]] ?? []) : [];
+        }
+
+        if (in_array($t[0], self::CLASS_NAME_TOKENS, true) && $this->shortClassName($t[1]) === 'apply_filters' && $this->peekNextMeaningful($tokens, $j) === '(') {
+            $argTokens = $this->argTokensAt($tokens, $j, 1);
+            if ($argTokens !== null && count($argTokens) === 1 && is_array($argTokens[0]) && $argTokens[0][0] === T_VARIABLE) {
+                return $anyArrayLiteralVars[$argTokens[0][1]] ?? [];
+            }
+        }
+
+        return [];
+    }
+
+    /**
+     * $quoteIndex points at (what might be) the raw `"` opening a double-quoted string.
+     * Recognizes `"literal$var"` starting exactly there — a literal text segment immediately
+     * followed by a bare interpolated variable and the closing quote, nothing else inside the
+     * string. Interpolation syntax only ever substitutes a bare variable this simply (a function
+     * call needs the `{$...}` complex form, out of scope here — no evidence for it), so unlike
+     * literalConcatVarAt()'s use of the general transform-chain resolver, matching the variable
+     * token directly is sufficient. Returns [literal, variable name], or null for anything else.
+     *
+     * @param list<Token> $tokens
+     * @return array{string, string}|null
+     */
+    private function interpolatedPrefixVarAt(array $tokens, int $quoteIndex): ?array
+    {
+        if (!isset($tokens[$quoteIndex]) || $tokens[$quoteIndex] !== '"') {
+            return null;
+        }
+        $textIndex = $quoteIndex + 1;
+        if (!isset($tokens[$textIndex]) || !is_array($tokens[$textIndex]) || $tokens[$textIndex][0] !== T_ENCAPSED_AND_WHITESPACE) {
+            return null;
+        }
+        $varIndex = $textIndex + 1;
+        if (!isset($tokens[$varIndex]) || !is_array($tokens[$varIndex]) || $tokens[$varIndex][0] !== T_VARIABLE) {
+            return null;
+        }
+        $closeQuoteIndex = $varIndex + 1;
+        if (!isset($tokens[$closeQuoteIndex]) || $tokens[$closeQuoteIndex] !== '"') {
+            return null;
+        }
+        $afterIndex = $this->peekNextMeaningfulIndex($tokens, $closeQuoteIndex);
+        if ($afterIndex === null || $tokens[$afterIndex] !== ';') {
+            return null;
+        }
+
+        return [$this->stripQuotes($tokens[$textIndex][1]), $tokens[$varIndex][1]];
+    }
+
+    /**
+     * $quoteIndex points at (what might be) the raw `"` opening a double-quoted string.
+     * Recognizes `"literal{$var}literal"` — a literal text segment, a curly-brace complex
+     * interpolation of a bare variable, then an optional trailing literal text segment before
+     * the closing quote. Real-world shape (WordPress SEO):
+     * `"Yoast\WP\SEO\Presenters\\{$presenter}_Presenter"` — the curly braces are syntactically
+     * required here specifically *because* of the suffix (a bare `$presenter_Presenter` would
+     * tokenize as one larger variable name instead of `$presenter` followed by literal text),
+     * unlike interpolatedPrefixVarAt()'s own bare-`$var`-no-suffix shape just above. Returns
+     * [prefix, variable name, suffix] (suffix `''` when the closing quote follows `}` directly),
+     * or null for anything else — wherever this literal appears, not gated to a particular
+     * statement (see literalConcatVarAt()'s own docblock for why).
+     *
+     * @param list<Token> $tokens
+     * @return array{string, string, string}|null
+     */
+    private function interpolatedPrefixCurlyVarSuffixAt(array $tokens, int $quoteIndex): ?array
+    {
+        if (!isset($tokens[$quoteIndex]) || $tokens[$quoteIndex] !== '"') {
+            return null;
+        }
+        $textIndex = $quoteIndex + 1;
+        if (!isset($tokens[$textIndex]) || !is_array($tokens[$textIndex]) || $tokens[$textIndex][0] !== T_ENCAPSED_AND_WHITESPACE) {
+            return null;
+        }
+        $curlyIndex = $textIndex + 1;
+        if (!isset($tokens[$curlyIndex]) || !is_array($tokens[$curlyIndex]) || $tokens[$curlyIndex][0] !== T_CURLY_OPEN) {
+            return null;
+        }
+        $varIndex = $curlyIndex + 1;
+        if (!isset($tokens[$varIndex]) || !is_array($tokens[$varIndex]) || $tokens[$varIndex][0] !== T_VARIABLE) {
+            return null;
+        }
+        $closeCurlyIndex = $varIndex + 1;
+        if (!isset($tokens[$closeCurlyIndex]) || $tokens[$closeCurlyIndex] !== '}') {
+            return null;
+        }
+        $afterCurlyIndex = $closeCurlyIndex + 1;
+        if (!isset($tokens[$afterCurlyIndex])) {
+            return null;
+        }
+        if ($tokens[$afterCurlyIndex] === '"') {
+            return [$tokens[$textIndex][1], $tokens[$varIndex][1], ''];
+        }
+        if (is_array($tokens[$afterCurlyIndex]) && $tokens[$afterCurlyIndex][0] === T_ENCAPSED_AND_WHITESPACE) {
+            $closeQuoteIndex = $afterCurlyIndex + 1;
+            if (!isset($tokens[$closeQuoteIndex]) || $tokens[$closeQuoteIndex] !== '"') {
+                return null;
+            }
+            return [$tokens[$textIndex][1], $tokens[$varIndex][1], $tokens[$afterCurlyIndex][1]];
+        }
+
+        return null;
     }
 
     /**
@@ -5455,6 +6497,230 @@ final class PhpTokenParser
         }
 
         return $literal;
+    }
+
+    /**
+     * $equalsIndex points at the `=` of `$var = <chain>;`, where `<chain>` is zero or more
+     * nested `str_replace('lit', 'lit', INNER)` / `ucfirst(INNER)` / `ucwords(INNER)` calls
+     * wrapped around either a bare variable or a variable already tracked in
+     * $transformChainVars (letting a chain span several statements — see its own declaration
+     * comment). Generalizes what was originally one hardcoded idiom (WPForms'
+     * `str_replace(' ', '', ucwords(str_replace('_', ' ', $x)))`) after two more real-world
+     * shapes confirmed the same general pattern recurs with different transform combinations:
+     * wp-nested-pages' `Events::setHandlers()` does `$class = str_replace('admin_post_np', '',
+     * $action); $class = ucfirst(str_replace('wp_ajax_np', '', $class));` (two chained
+     * statements, reassigning the same variable); Jetpack's tiled-gallery module does a bare
+     * `ucfirst($this->atts['type'])` with no `str_replace` at all. Requires the outer call to be
+     * the entire RHS (nothing wrapping it further) and every `str_replace()`'s first two
+     * arguments to be plain string literals — a computed search/replace pair is not attempted.
+     * Returns [ultimate source variable name, transform steps in application order — outermost
+     * call last], or null for any other shape (an unrecognized function, non-literal
+     * search/replace arguments, or bottoming out in anything but a bare variable).
+     *
+     * @param list<Token> $tokens
+     * @param array<string,array{string,list<array{string,list<string>}>}> $transformChainVars
+     * @return array{string,list<array{string,list<string>}>}|null
+     */
+    private function resolveTransformChainRhs(array $tokens, int $equalsIndex, array $transformChainVars): ?array
+    {
+        $outerIndex = $this->peekNextMeaningfulIndex($tokens, $equalsIndex);
+        if ($outerIndex === null) {
+            return null;
+        }
+        $exprTokens = $this->literalPathStatementTokens($tokens, $outerIndex);
+        if ($exprTokens === []) {
+            return null;
+        }
+        return $this->resolveTransformChainExpr($exprTokens, $transformChainVars);
+    }
+
+    /**
+     * True when `$value`'s own RHS ends in `. $value` and the expression contains a string
+     * literal somewhere before that — the shape literalConcatVarAt() matches later in the same
+     * forward token scan (real-world, Elementor: `$class_name = __NAMESPACE__ . '\Widget_' .
+     * $class_name;`). Doesn't try to resolve the RHS itself (that's literalConcatVarAt()'s job,
+     * once $i reaches the literal token); only decides whether the *previous* statement's
+     * $transformChainVars[$value] entry is still needed and must survive this one.
+     *
+     * @param list<Token> $tokens
+     */
+    private function rhsIsSelfReferentialLiteralConcat(array $tokens, int $equalsIndex, string $value): bool
+    {
+        $exprStart = $this->peekNextMeaningfulIndex($tokens, $equalsIndex);
+        if ($exprStart === null) {
+            return false;
+        }
+        $exprTokens = $this->literalPathStatementTokens($tokens, $exprStart);
+        $n = count($exprTokens);
+        if (
+            $n < 3
+            || $exprTokens[$n - 2] !== '.'
+            || !is_array($exprTokens[$n - 1])
+            || $exprTokens[$n - 1][0] !== T_VARIABLE
+            || $exprTokens[$n - 1][1] !== $value
+        ) {
+            return false;
+        }
+        foreach ($exprTokens as $token) {
+            if (is_array($token) && $token[0] === T_CONSTANT_ENCAPSED_STRING) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * @param list<Token> $tokens
+     * @param array<string,array{string,list<array{string,list<string>}>}> $transformChainVars
+     * @param bool $allowOpaqueBase When true, an innermost expression that's neither a bare
+     *   variable nor a recognized transform call still counts as a (zero-step) base rather than
+     *   failing the whole match — see literalConcatVarAt()'s own docblock for why: Jetpack's
+     *   tiled-gallery module applies the transform inline (`ucfirst($this->atts['type'])`, no
+     *   separate assignment first), and the innermost expression there is a property-array-key
+     *   read this parser has no way to identify further. The two existing callers
+     *   (resolveTransformChainRhs(), and this function's own recursive calls when the flag isn't
+     *   set) keep requiring a bare variable, since they need to identify *which* variable to key
+     *   $transformChainVars by for a chain spanning several statements.
+     * @return array{string,list<array{string,list<string>}>}|null
+     */
+    private function resolveTransformChainExpr(array $tokens, array $transformChainVars, bool $allowOpaqueBase = false): ?array
+    {
+        if (count($tokens) === 1 && is_array($tokens[0]) && $tokens[0][0] === T_VARIABLE) {
+            $varName = $tokens[0][1];
+            return $transformChainVars[$varName] ?? [$varName, []];
+        }
+
+        if (
+            count($tokens) < 4
+            || !is_array($tokens[0]) || !in_array($tokens[0][0], self::CLASS_NAME_TOKENS, true)
+            || $tokens[1] !== '(' || $tokens[count($tokens) - 1] !== ')'
+        ) {
+            return $allowOpaqueBase ? ['', []] : null;
+        }
+        $funcName = $this->shortClassName($tokens[0][1]);
+        $args = $this->splitTopLevelCommaArgs(array_slice($tokens, 2, -1));
+
+        // `sanitize_title( $x )` — real-world shape (WooCommerce): `WC_Admin_Reports::get_report()`
+        // does `$name = sanitize_title( str_replace( '_', '-', $name ) );`. Every domain value
+        // this parser ever sees here is already a clean slug (a report registry's own array key,
+        // e.g. 'sales_by_date'), with nothing for sanitize_title() to actually change once it's
+        // hyphenated — a transparent (zero-step) pass-through, not a recorded step, same no-op-
+        // for-matching-purposes trade-off as basename()/sanitize_file_name() elsewhere in this
+        // parser. Left unrecorded (rather than added as its own step type) since it contributes
+        // no character transformation to replay.
+        if ($funcName === 'sanitize_title' && count($args) === 1) {
+            return $this->resolveTransformChainExpr($args[0], $transformChainVars, $allowOpaqueBase);
+        }
+
+        if (($funcName === 'ucfirst' || $funcName === 'ucwords') && count($args) === 1) {
+            $inner = $this->resolveTransformChainExpr($args[0], $transformChainVars, $allowOpaqueBase);
+            if ($inner === null) {
+                return null;
+            }
+            [$sourceVar, $steps] = $inner;
+            $steps[] = [$funcName, []];
+            return [$sourceVar, $steps];
+        }
+
+        if ($funcName === 'str_replace' && count($args) === 3) {
+            if (count($args[0]) !== 1 || !is_array($args[0][0]) || $args[0][0][0] !== T_CONSTANT_ENCAPSED_STRING) {
+                return $allowOpaqueBase ? ['', []] : null;
+            }
+            if (count($args[1]) !== 1 || !is_array($args[1][0]) || $args[1][0][0] !== T_CONSTANT_ENCAPSED_STRING) {
+                return $allowOpaqueBase ? ['', []] : null;
+            }
+            $inner = $this->resolveTransformChainExpr($args[2], $transformChainVars, $allowOpaqueBase);
+            if ($inner === null) {
+                return null;
+            }
+            [$sourceVar, $steps] = $inner;
+            $steps[] = ['str_replace', [$this->stripQuotes($args[0][0][1]), $this->stripQuotes($args[1][0][1])]];
+            return [$sourceVar, $steps];
+        }
+
+        return $allowOpaqueBase ? ['', []] : null;
+    }
+
+    /**
+     * Splits a flat, already-whitespace-stripped token list on its own top-level commas
+     * (tracking `()`/`[]`/`{}` nesting so a nested call's own arguments aren't split too).
+     * Mirrors argTokensAt()'s depth tracking, but over a token list whose outer call's name and
+     * parens have already been stripped by the caller, rather than scanning forward from a call-
+     * name index — resolveTransformChainExpr() needs this to recurse into an arbitrary inner
+     * expression, not just read one argument at a fixed position.
+     *
+     * @param list<Token> $tokens
+     * @return list<list<Token>>
+     */
+    private function splitTopLevelCommaArgs(array $tokens): array
+    {
+        $args = [];
+        $current = [];
+        $depth = 0;
+        foreach ($tokens as $token) {
+            if ($token === '(' || $token === '[' || $token === '{') {
+                $depth++;
+            } elseif ($token === ')' || $token === ']' || $token === '}') {
+                $depth--;
+            }
+            if ($depth === 0 && $token === ',') {
+                $args[] = $current;
+                $current = [];
+                continue;
+            }
+            $current[] = $token;
+        }
+        if ($current !== [] || $args !== []) {
+            $args[] = $current;
+        }
+        return $args;
+    }
+
+    /**
+     * $literalIndex points at (what might be) a T_CONSTANT_ENCAPSED_STRING token. Recognizes
+     * `'literal' . <expr>;` starting exactly there — one string literal concatenated with
+     * exactly one expression, literal first, nothing else before the statement's own terminating
+     * `;`. `<expr>` is resolved via resolveTransformChainExpr() with `$allowOpaqueBase: true`, so
+     * it matches both a bare variable already holding a transform chain (real-world shape,
+     * wp-nested-pages: `'NestedPages\Form\Listeners\\' . $class;`, where `$class` was built
+     * across two earlier statements) and a transform applied inline with no separate assignment
+     * at all (real-world shape, Jetpack tiled-gallery: `'Jetpack_Tiled_Gallery_Layout_' .
+     * ucfirst( $this->atts['type'] );` — the innermost `$this->atts['type']` is a property-array-
+     * key read this parser has no way to identify further, hence the opaque base). Deliberately
+     * doesn't care what precedes the literal or what the whole expression is ultimately assigned
+     * to (called at the literal's own token position, not anchored to any particular `=`) —
+     * wp-nested-pages' own real assignment target is `$this->handlers[$key]->class`, an lvalue
+     * far more complex than a bare `$var =` this parser otherwise attempts to track. Returns
+     * [literal, transform chain (possibly zero steps — the caller must still check for that)],
+     * or null if nothing at all matches this shape.
+     *
+     * @param list<Token> $tokens
+     * @param array<string,array{string,list<array{string,list<string>}>}> $transformChainVars
+     * @return array{string,array{string,list<array{string,list<string>}>}}|null
+     */
+    private function literalConcatVarAt(array $tokens, int $literalIndex, array $transformChainVars): ?array
+    {
+        if (!is_array($tokens[$literalIndex]) || $tokens[$literalIndex][0] !== T_CONSTANT_ENCAPSED_STRING) {
+            return null;
+        }
+        $dotIndex = $this->peekNextMeaningfulIndex($tokens, $literalIndex);
+        if ($dotIndex === null || $tokens[$dotIndex] !== '.') {
+            return null;
+        }
+        $exprStart = $this->peekNextMeaningfulIndex($tokens, $dotIndex);
+        if ($exprStart === null) {
+            return null;
+        }
+        $exprTokens = $this->literalPathStatementTokens($tokens, $exprStart);
+        if ($exprTokens === []) {
+            return null;
+        }
+        $chain = $this->resolveTransformChainExpr($exprTokens, $transformChainVars, true);
+        if ($chain === null) {
+            return null;
+        }
+
+        return [$this->stripQuotes($tokens[$literalIndex][1]), $chain];
     }
 
     /**
@@ -5813,6 +7079,22 @@ final class PhpTokenParser
             return null;
         }
 
+        return $this->resolveNewExpressionClassNameAt($tokens, $newIndex, $classNameStack, $classParentStack, $currentNamespace, $useImports);
+    }
+
+    /**
+     * $newIndex points at the `new` keyword itself (not, unlike assignedNewClassName(), an
+     * assignment's `=`) — shared by that function and by the literal-path `new self(...)`/
+     * `new static(...)` wrapper-forwarding capture (Wordfence's `wfView::create()` does `return
+     * new self( $view, $data );`, no assignment at all).
+     *
+     * @param list<?string> $classNameStack
+     * @param list<?string> $classParentStack
+     * @param list<Token> $tokens
+     * @param array<string,string> $useImports
+     */
+    private function resolveNewExpressionClassNameAt(array $tokens, int $newIndex, array $classNameStack, array $classParentStack, string $currentNamespace, array $useImports): ?string
+    {
         $nameIndex = $this->peekNextMeaningfulIndex($tokens, $newIndex);
         if ($nameIndex === null) {
             return null;
@@ -6138,6 +7420,113 @@ final class PhpTokenParser
             }
             $literal = $this->stripQuotes($receiverEndToken[1]);
             return $literal !== '' ? $this->resolveFqcn($literal, $currentNamespace, $useImports) : null;
+        }
+
+        return null;
+    }
+
+    /**
+     * Resolves method_exists()'s first argument to a receiver class — the narrow set of shapes
+     * with real-world evidence: `$this`, `self::class`/`static::class` (both resolve to the
+     * current class — no late-static-binding fan-out, same trade-off as this parser's other
+     * self/static resolutions), `__CLASS__`, and a bare class-name string literal. Anything else
+     * (a tracked variable, a computed expression) returns null — same "don't guess" stance
+     * arrayCallbackReceiverClass() takes for its own unhandled shapes.
+     *
+     * @param list<Token> $argTokens
+     * @param array<string,string> $useImports
+     */
+    private function methodExistsReceiverClass(array $argTokens, ?string $currentClass, string $currentNamespace, array $useImports): ?string
+    {
+        if (count($argTokens) === 1 && is_array($argTokens[0])) {
+            $token = $argTokens[0];
+            if ($token[0] === T_VARIABLE && $token[1] === '$this') {
+                return $currentClass;
+            }
+            if ($token[0] === T_CLASS_C) {
+                return $currentClass;
+            }
+            if ($token[0] === T_CONSTANT_ENCAPSED_STRING) {
+                $literal = $this->stripQuotes($token[1]);
+                return $literal !== '' ? $this->resolveFqcn($literal, $currentNamespace, $useImports) : null;
+            }
+            return null;
+        }
+
+        // self::class / static::class
+        if (
+            count($argTokens) === 3
+            && is_array($argTokens[0]) && (in_array($argTokens[0][0], self::CLASS_NAME_TOKENS, true) || $argTokens[0][0] === T_STATIC)
+            && is_array($argTokens[1]) && $argTokens[1][0] === T_DOUBLE_COLON
+            && is_array($argTokens[2]) && $argTokens[2][0] === T_STRING && $argTokens[2][1] === 'class'
+        ) {
+            return $currentClass;
+        }
+
+        return null;
+    }
+
+    /**
+     * Given method_exists()'s second-argument token list (already comma/paren-bounded — see
+     * argTokensAt), recognizes a literal prefix concatenated with anything, optionally followed
+     * by a literal suffix — `'prefix' . <anything>` / `'prefix' . <anything> . 'suffix'` — or the
+     * double-quoted interpolated-string equivalent (`"prefix$anything"` /
+     * `"prefix{$anything}"` / `"prefix{$anything}suffix"`). Doesn't care what `<anything>`
+     * actually is or evaluates to — unlike the class-name-transform family elsewhere in this
+     * parser, no domain enumeration is needed here: method_exists()'s own second argument being
+     * built this way, checked against a receiver method_exists() can resolve, is itself the
+     * whole signal (see the parser's own call site for the precision-guard reasoning). Returns
+     * null for any other shape — a plain literal (already handled elsewhere), a bare variable
+     * alone, or more than one dynamic segment.
+     *
+     * @param list<Token> $argTokens
+     * @return array{string,string}|null [prefix, suffix]
+     */
+    private function methodExistsDynamicNamePrefixSuffix(array $argTokens): ?array
+    {
+        $n = count($argTokens);
+
+        if (
+            $n >= 3
+            && is_array($argTokens[0]) && $argTokens[0][0] === T_CONSTANT_ENCAPSED_STRING
+            && $argTokens[1] === '.'
+        ) {
+            $prefix = $this->stripQuotes($argTokens[0][1]);
+            if (
+                $n >= 5
+                && $argTokens[$n - 2] === '.'
+                && is_array($argTokens[$n - 1]) && $argTokens[$n - 1][0] === T_CONSTANT_ENCAPSED_STRING
+            ) {
+                return [$prefix, $this->stripQuotes($argTokens[$n - 1][1])];
+            }
+            return [$prefix, ''];
+        }
+
+        if ($n >= 4 && $argTokens[0] === '"') {
+            // "prefix$var" — exactly [", TEXT, VAR, "].
+            if (
+                $n === 4
+                && is_array($argTokens[1]) && $argTokens[1][0] === T_ENCAPSED_AND_WHITESPACE
+                && is_array($argTokens[2]) && $argTokens[2][0] === T_VARIABLE
+                && $argTokens[3] === '"'
+            ) {
+                return [$argTokens[1][1], ''];
+            }
+            // "prefix{$var}" / "prefix{$var}suffix".
+            if (
+                $n >= 6
+                && is_array($argTokens[1]) && $argTokens[1][0] === T_ENCAPSED_AND_WHITESPACE
+                && is_array($argTokens[2]) && $argTokens[2][0] === T_CURLY_OPEN
+                && is_array($argTokens[3]) && $argTokens[3][0] === T_VARIABLE
+                && $argTokens[4] === '}'
+            ) {
+                if ($n === 6 && $argTokens[5] === '"') {
+                    return [$argTokens[1][1], ''];
+                }
+                if ($n === 7 && is_array($argTokens[5]) && $argTokens[5][0] === T_ENCAPSED_AND_WHITESPACE && $argTokens[6] === '"') {
+                    return [$argTokens[1][1], $argTokens[5][1]];
+                }
+            }
         }
 
         return null;

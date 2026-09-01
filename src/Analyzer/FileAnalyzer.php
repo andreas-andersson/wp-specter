@@ -8,6 +8,7 @@ use WpSpecter\Finding\Finding;
 use WpSpecter\Finding\FindingCertainty;
 use WpSpecter\Finding\FindingType;
 use WpSpecter\Parser\PhpTokenParser;
+use WpSpecter\Support\StringTransformChain;
 
 /**
  * Flags PHP files that are never include()/require()'d, never referenced via
@@ -23,6 +24,9 @@ final class FileAnalyzer
     // "resources/views" is Roots Sage/Acorn's Blade views root — same hand-off-to-TemplateAnalyzer
     // reasoning as the other three, it's just a framework-specific convention rather than a WP one.
     private const TEMPLATE_DIRS = ['templates', 'template-parts', 'parts', 'resources/views'];
+    // See isCandidate()'s own comment on this list for why it's kept separate from
+    // TEMPLATE_DIRS above rather than folded in.
+    private const THIRD_PARTY_TEMPLATE_OVERRIDE_DIRS = ['bbpress', 'woocommerce'];
     private const BLOCK_JSON_RENDER_KEYS = ['render', 'renderCallback'];
     // Composer autoload sections that map namespaces/paths to a class loader rather than a
     // literal include() — "autoload-dev" covers test-support classes under the same scheme.
@@ -168,6 +172,34 @@ final class FileAnalyzer
             return false;
         }
 
+        // WP 6.5+ script-translation files (`{textdomain}-{locale}-{script-handle-hash}.l10n.php`,
+        // generated from a script's own .po file by `wp i18n make-json`/`@wordpress/scripts`) are
+        // a plain `return [...]` array of translated strings, loaded by WP core's own
+        // load_script_translations() purely by filename convention next to a registered script
+        // handle — never by a visible include()/require() anywhere in project code. The ".l10n.php"
+        // double extension is WP's own reserved convention (no other legitimate PHP source is
+        // ever named this way), so a bare suffix check is safe without a directory scope the way
+        // the pattern-header check below needs one. Real-world case (Advanced Custom Fields):
+        // 52 language files under lang/, 100% of the plugin's own UnusedFile findings there.
+        if (str_ends_with($file, '.l10n.php')) {
+            return false;
+        }
+
+        // webpack/`@wordpress/scripts` build-dependency manifests (`{entry}.asset.php`, one per
+        // compiled JS/CSS bundle) — a plain `return ['dependencies' => [...], 'version' => ...];`
+        // array `wp_register_script()`/`wp_set_script_translations()`-adjacent build tooling
+        // reads to wire up script dependencies and cache-busting; loaded by the theme/plugin's
+        // own bootstrap code via a dynamic path built from each compiled entry's own name (a
+        // runtime directory scan or a generated entry list), never a literal include()/require()
+        // this parser could trace to one specific file. Same reserved-double-extension shape as
+        // ".l10n.php" above — no other legitimate PHP source is ever named this way. Real-world
+        // scale (confirmed across the corpus, not one plugin's own): WooCommerce alone ships 320
+        // of these (100% of its own UnusedFile findings under assets/client/), Jetpack 466,
+        // Elementor 56.
+        if (str_ends_with($file, '.asset.php')) {
+            return false;
+        }
+
         // A file only ever loaded by Composer's autoloader as a genuine THIRD-PARTY dependency
         // (vendor/, or a composer "files" entry Composer's own bootstrap always runs
         // unconditionally) has no include()/require() call anywhere to find — it's reachable,
@@ -212,6 +244,24 @@ final class FileAnalyzer
         }
 
         foreach (self::TEMPLATE_DIRS as $dir) {
+            if (str_starts_with($relative, $dir . '/')) {
+                return false;
+            }
+        }
+
+        // Third-party plugin theme-override directories — scanned by *that plugin's* own
+        // internal template locator (bbPress's `bbp_locate_template()`, WooCommerce's
+        // `wc_locate_template()`) purely by directory-name + filename convention. The theme
+        // itself never calls into these; unlike $TEMPLATE_DIRS above, this isn't a "hand off to
+        // TemplateAnalyzer" case either — TemplateAnalyzer has no reachability check for this
+        // convention (nothing in the theme's own code ever could, by design), so these are
+        // exempted outright, the same "loaded by external convention-based scanning, never a
+        // literal include()/require()" shape Page Templates and Block Patterns already get just
+        // above. Real-world case (Kadence): all 13 files under `bbpress/` were 100% of the
+        // theme's own `UnusedFile` findings. WooCommerce's own `woocommerce/` convention is the
+        // identical, even more widely-documented shape — corroborated present (if not yet
+        // buggy, since their files already resolve some other way) in Blocksy/Neve/Sydney.
+        foreach (self::THIRD_PARTY_TEMPLATE_OVERRIDE_DIRS as $dir) {
             if (str_starts_with($relative, $dir . '/')) {
                 return false;
             }
@@ -538,6 +588,45 @@ final class FileAnalyzer
             // whether or not that particular literal was ever meant as a class reference.
             foreach ($result->functionCalls as $call) {
                 $this->referencedClassNames[$call->name] = true;
+            }
+        }
+
+        // Same cross-product ClassAnalyzer::findUnusedClasses runs for a class name synthesized
+        // via a recognized transform chain concatenated onto a fixed namespace prefix (see
+        // $classNameTransformTemplates' own docblock on ParseResult) — every literal array key
+        // or flat-array value the transform's own owner class declares anywhere (via
+        // $classArrayKeyLiterals) is transformed and credited as referenced, same-class only.
+        // Kept in step with ClassAnalyzer's version so a class this resolves as used isn't still
+        // reported as an unused *file* (real-world case: WPForms' SmartTags — its own
+        // src/SmartTags/SmartTag/*.php files, one class per file).
+        $classArrayKeyLiterals = [];
+        foreach ($parseResults as $result) {
+            foreach ($result->classArrayKeyLiterals as $ownerClass => $keys) {
+                if (!isset($classArrayKeyLiterals[$ownerClass])) {
+                    $classArrayKeyLiterals[$ownerClass] = [];
+                }
+                array_push($classArrayKeyLiterals[$ownerClass], ...$keys);
+            }
+        }
+        foreach ($parseResults as $result) {
+            foreach ($result->classNameTransformTemplates as $ownerClass => $templates) {
+                if ($templates === [] || !isset($classArrayKeyLiterals[$ownerClass])) {
+                    continue;
+                }
+                foreach ($templates as [$prefix, $steps, $suffix]) {
+                    // See ClassAnalyzer's identical version of this cross-product for why a
+                    // namespace-separator-ending prefix is dropped but any other prefix (a flat,
+                    // non-namespaced class-naming convention) must be prepended back — minus any
+                    // leading backslash, which is only the __NAMESPACE__ separator, not part of
+                    // the literal short name — and the suffix always appended.
+                    $isNamespacePrefix = str_ends_with($prefix, '\\');
+                    $reconstructPrefix = ltrim($prefix, '\\');
+                    foreach ($classArrayKeyLiterals[$ownerClass] as $arrayKey) {
+                        $transformed = StringTransformChain::apply($arrayKey, $steps);
+                        $shortName = ($isNamespacePrefix ? $transformed : $reconstructPrefix . $transformed) . $suffix;
+                        $this->referencedClassNames[$shortName] = true;
+                    }
+                }
             }
         }
     }

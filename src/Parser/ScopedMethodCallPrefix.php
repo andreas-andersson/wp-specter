@@ -15,5 +15,6 @@ final class ScopedMethodCallPrefix
     public function __construct(
         public readonly string $receiverClass,
         public readonly string $prefix,
+        public readonly string $suffix = '',
     ) {}
 }

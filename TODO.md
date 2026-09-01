@@ -62,6 +62,56 @@ scope limit that trades recall or precision for staying a single-pass, no-depend
   it through a scoped receiver. A trait method that's never called by any consumer, anywhere, is
   still correctly flagged.
 
+- [x] **A trait can call a method it never declares itself — a template-method pattern, expecting
+  whoever `use`s it to provide the real implementation — and the real override commonly lives on
+  a *concrete descendant* of the trait's direct consumer, not the consumer itself.
+  `isUsedByTraitConsumer()` above only composes when the checked method's own `$ownerClass` IS
+  the trait; it never fires here at all, since `$ownerClass` is a concrete leaf class several
+  inheritance levels below.** Found in a fresh gap-hunt, traced precisely: Elementor's
+  atomic-widgets module (`modules/atomic-widgets/`) —
+  ```php
+  trait Has_Atomic_Base {                          // has-atomic-base.php, @mixin Element_Base
+      public function render() {
+          $this->define_atomic_controls();         // never declared on this trait itself
+      }
+  }
+  abstract class Atomic_Widget_Base extends Widget_Base {
+      use Has_Atomic_Base;                         // the trait's only direct consumer
+  }
+  class Atomic_Button extends Atomic_Widget_Base {
+      public function define_atomic_controls() { ... }   // the real override — several
+  }                                                        // levels below the consumer
+  ```
+  Top 7 method names alone (`define_atomic_controls`, `get_templates`, `define_props_schema`,
+  `define_base_styles`, `get_capability`, `get_position`, `has_children`) accounted for 122 of
+  Elementor's 502 `UnusedMethod` findings.
+
+  Fixed with a new composed check, `isUsedByAncestorsTraitSelfCall()` — the mirror image of
+  `isUsedByTraitConsumer()`'s own walk direction: starting at the checked method's own
+  `$ownerClass`, climb its `extends` chain (same bounded walk `isContractMethod()` already uses),
+  and at every level visited, check whether any trait that class directly (or transitively — one
+  trait using another, via a new `traitsUsedTransitively()` helper mirroring
+  `isUsedByTraitConsumer()`'s own BFS but in the opposite direction) `use`s itself calls
+  `$this->$methodName()` internally. Needed one new piece of state alongside the existing
+  `$traitUsers` map (trait ⇒ consumers): its own inverse, `$traitsUsedByClass` (consumer ⇒
+  traits it directly `use`s), built from the same `$result->traitUsages` data in the same pass.
+
+  Verified: new `ClassAnalyzer` end-to-end regression
+  (`testDoesNotReportConcreteDescendantOverrideOfATraitsOwnUndeclaredTemplateMethod`) reproducing
+  the real 3-level shape (trait → abstract consumer → concrete override), confirmed to fail
+  without the fix — caught a real test-authoring mistake in the process: the fixture's own
+  `Atomic_Button` needed to be independently referenced (`new Atomic_Button()`), or the
+  whole-class-already-unused suppression masked the method-level result regardless of whether the
+  fix worked, a reminder to check *why* a negative control passes, not just that it does.
+  `composer check` is clean (640 PHPUnit tests, PHPStan, formatting). Traced precisely against
+  the real corpus, not just Elementor: `UnusedMethod` drops Elementor 502 → 399 (−103 — short of
+  the full 122-estimate since a few of the top 7 names turned out already resolved some other
+  way), WooCommerce 851 → 812 (−39), WPForms 216 → 207 (−9), WordPress SEO 435 → 432 (−3),
+  Contact Form 7 19 → 15 (−4), Broken Link Checker 83 → 82 (−1) — confirming this is a general
+  OOP-PHP idiom (a trait implementing a template-method pattern, consumed by an abstract base
+  with concrete leaf subclasses), not an Elementor-specific shape; full 28-project corpus
+  re-scanned with no crash and no other category regressed anywhere.
+
 - [x] **A bare `'Class::method'` callback string (no array, no receiver) resolved its trailing
   method segment but dropped the leading class segment entirely.** Real-world finding (Astra
   theme): `'render_callback' => 'Astra_Customizer_Partials::render_partial_site_title'` (the WP
@@ -243,6 +293,407 @@ scope limit that trades recall or precision for staying a single-pass, no-depend
   turns out to be common there too, not Elementor-specific), no regressions and no crashes across
   the full corpus.
 
+- [x] **A class name synthesized via the canonical snake_case-to-PascalCase idiom
+  (`str_replace(' ', '', ucwords(str_replace('_', ' ', $x)))`) concatenated onto a fixed
+  namespace prefix, then resolved dynamically (`class_exists($full_class_name)`), was invisible
+  to unused-class/-file detection.** Real-world finding (WPForms, 25 confirmed instances):
+  `SmartTags::get_smart_tag_class_name($smart_tag_name)` turns each key of
+  `smart_tags_list()`'s own returned config array (`'admin_email'`, `'field_id'`,
+  `'url_lost_password'`, ...) into `'\WPForms\SmartTags\SmartTag\' . $class_name` — the target
+  class name (`AdminEmail`, `FieldId`, `UrlLostPassword`, ...) is never spelled out as a literal
+  anywhere, so all 25 `SmartTag\*` classes and their files false-positived as unused. Fixed with
+  the same "no proof of causality, cross-product against every literal key the class ever
+  declares" trade-off `$selfDispatchPrefixSuffixTemplates`/`$classArrayKeyLiterals` already
+  accept for method-name dispatch (see the Method detection section below):
+  - `PhpTokenParser::snakeToPascalTransformSourceVar()` recognizes the exact nested-call shape
+    assigned to a variable; `literalConcatVarRhs()` then recognizes that variable concatenated
+    onto a literal ending in `\`, recorded as `$classNameTransformTemplates[ownerClass][]`.
+  - `$classArrayKeyLiterals`'s existing assignment-shape capture (`$var['literal'] = ...;`) was
+    joined by a second capture, `resolveReturnedKeyedArrayLiteralKeys()`, for a keyed array
+    literal returned directly (`return ['admin_email' => ..., ...];`) — WPForms' own
+    `smart_tags_list()` never builds its array via repeated key assignment.
+  - `ClassAnalyzer::findUnusedClasses()` and `FileAnalyzer::loadReferencedClassNames()` both
+    (kept in step, same as their existing `$calledNames`/`$referencedClassNames` fallback) cross
+    the two: every literal key the owner class declares anywhere, transformed and credited as
+    referenced. Same-class only, no descendant fan-out — the one confirmed real-world case has
+    both the transform site and the array literal on the same class.
+  Verified: wpforms-lite's unused-class count drops 29 → 4, unused-file count drops 43 → 15 (all
+  25 resolved paths independently confirmed against `smart_tags_list()`'s own keys), full corpus
+  re-scanned with no crash and byte-identical output on every other of the 27 other
+  plugins/themes.
+
+- [x] **The item above hardcoded one exact transform idiom — a corpus-wide gap-hunt turned up
+  the same general pattern (dynamic class name = a fixed namespace prefix + some string-literal
+  transform of a per-class config-array domain) recurring with *different* transform
+  combinations across 6 independent plugins** (wp-nested-pages, Jetpack, Botiga, WooCommerce,
+  WordPress SEO, and the already-logged Blocksy trait item), strong enough corroboration to
+  generalize the mechanism instead of hardcoding a second idiom alongside the first.
+  Real-world shape actually fixed (wp-nested-pages, `Form\Events::setHandlers()`, 22 confirmed
+  classes): `$this->actions = ['wp_ajax_npsort', 'admin_post_npBulkActions', ...];` (a flat
+  literal array assigned to a property, not a keyed array — a shape
+  `$classArrayKeyLiterals` didn't cover yet) `foreach`-transformed as `$class =
+  str_replace('admin_post_np', '', $action); $class = ucfirst(str_replace('wp_ajax_np', '',
+  $class));` (**two chained statements reassigning the same variable**, not one nested
+  expression) then `$this->handlers[$key]->class = 'NestedPages\Form\Listeners\\' . $class;`
+  (assigned to a property-of-an-array-element — an lvalue this parser doesn't otherwise attempt
+  to track at all). Fixed:
+  - `PhpTokenParser::resolveTransformChainExpr()` replaces the old single-idiom recognizer with a
+    general recursive one: any nesting of `str_replace('lit', 'lit', INNER)` /
+    `ucfirst(INNER)` / `ucwords(INNER)`, bottoming out at a bare variable — one already tracked
+    in `$transformChainVars` (letting the chain span several statements, reassigning itself) or a
+    fresh one. Returns the resolved step list in application order (outermost call last),
+    replayed later via the real PHP functions (`WpSpecter\Support\StringTransformChain::apply()`)
+    rather than reimplementing their semantics — shared by `ClassAnalyzer` and `FileAnalyzer` so
+    both resolve identically. `splitTopLevelCommaArgs()` (a generic depth-tracked comma splitter)
+    is the one new small helper this needed.
+  - The concatenation-detection itself (`literalConcatVarAt()`, renamed/refactored from
+    `literalConcatVarRhs()`) moved from "only inside a bare `$var = ` assignment" to wherever a
+    matching string literal appears in the token stream at all (the same general hook point
+    `resolvePrefixVarSuffixSelfDispatchTemplate`'s own self-dispatch capture already uses) —
+    required because the real assignment target here is `$this->handlers[$key]->class`, an
+    lvalue several tiers more complex than anything this parser otherwise tracks. Deliberately
+    doesn't attempt to understand *what* is being assigned; the concatenation shape alone is the
+    signal, the same "coarse net" stance the rest of this mechanism already takes.
+  - `$classArrayKeyLiterals` gained a second capture shape (alongside `$var['literal'] = ...;`
+    and a returned keyed array literal): `$this->prop = ['lit1', 'lit2', ...];` — a property
+    assigned a flat literal array — feeding the exact same class-wide domain.
+
+  Confirmed but not attempted in that same round: Jetpack's own instance
+  (`'Jetpack_Tiled_Gallery_Layout_' . ucfirst($this->atts['type'])`) applies the transform
+  *inline*, with no intermediate variable assignment at all, and its innermost expression is a
+  property-array-key access (`$this->atts['type']`) rather than a bare variable.
+
+  Verified: wp-nested-pages' unused-class count drops 22 → 1 and unused-file count drops 25 → 1
+  (the one remaining class, `RedirectsFrontEnd`, confirmed genuinely dead — zero references
+  anywhere in the corpus copy).
+
+- [x] **Jetpack's inline-transform instance, above, needed two further extensions plus a real
+  bug fix once implemented (caught by testing the reconstruction path with real, non-namespace
+  data — every prior test used a namespace-shaped prefix, which happened to mask it).**
+  - `resolveTransformChainExpr()` gained an `$allowOpaqueBase` flag: when set, an innermost
+    expression that's neither a bare variable nor a recognized transform call still counts as a
+    (zero-step) base rather than failing the whole match — letting `ucfirst( $this->atts['type']
+    )` resolve to one step even though `$this->atts['type']` itself is never identified further.
+    `literalConcatVarAt()` (the "wherever this literal appears" hook from the item above) now
+    uses this for the expression on either side of its own `.`, so a bare tracked variable and an
+    inline transform-with-opaque-base both flow through the exact same match.
+  - The domain itself needed a *third* capture shape: `private static $talaveras = array(
+    'rectangular', 'square', ... );` is a class-body property **declaration** with a flat array
+    default, not an assignment inside a method body (the two shapes `$classArrayKeyLiterals`
+    already covered). Added at the same class-body depth guard the existing `T_CONST` capture
+    already uses.
+  - **The actual bug:** the literal-ends-in-`\` gate obviously doesn't fit a flat, non-namespaced
+    class-naming convention like `Jetpack_Tiled_Gallery_Layout_*`, so a second, alternative gate
+    was added — the literal must *either* end in `\` *or* look like a capitalized, underscore-
+    joined identifier ending in `_` (`preg_match('/^[A-Z][A-Za-z0-9_]*_$/', ...)`, a shape
+    heuristic, not proof — Jetpack's own `ucfirst(...)` result never reaches a `new $var(...)`
+    this parser could cross-check against, since the concatenation and the `new` are two separate
+    statements). But `ClassAnalyzer`/`FileAnalyzer`'s own cross-product kept comparing the bare
+    *transformed value* ('Columns') against `$def->name`, never the true short name
+    ('Jetpack_Tiled_Gallery_Layout_Columns') — correct by accident for every *namespace*-prefixed
+    case (`$def->name` is already namespace-stripped, so the transformed value alone genuinely is
+    the short name there), but silently wrong for this one. Fixed by reconstructing the real
+    short name (`$isNamespacePrefix ? $transformed : $prefix . $transformed`) before comparing,
+    in both analyzers.
+
+  Verified: wpforms-lite's/wp-nested-pages' own resolutions are unaffected (both use a namespace-
+  ending prefix, so the reconstruction is a no-op for them — confirmed by the full existing suite
+  passing unchanged). Jetpack's unused-class count drops 23 → 21 (`Jetpack_Tiled_Gallery_Layout_
+  Columns`/`_Rectangle`; the other three of the five originally-flagged classes were already
+  resolved via an unrelated `extends`/direct-`new` chain in a completely different file,
+  `modules/widgets/gallery.php` — confirmed by isolating the two files that matter and diffing
+  before/after). 6 new tests (the inline-shape resolution and its "doesn't look like a class
+  name" negative case, the static-property-array-default capture, and — the ones that actually
+  caught the bug — `ClassAnalyzer`/`FileAnalyzer` end-to-end regressions using real, non-
+  namespace-prefixed data, each independently confirmed to fail without the fix by toggling it
+  off). `composer check` is clean (620 PHPUnit tests, PHPStan, formatting); full 28-project
+  corpus re-scanned with no crash and byte-identical output on every project except Jetpack, wp-
+  nested-pages, and wpforms-lite (the latter two reflecting this session's earlier, separate
+  fixes, not this one).
+
+- [x] **Botiga's own instance of the same general "dynamic name via a recognized transform"
+  pattern, above, needed a whole parallel mechanism rather than an extension of the class-name
+  one — the target is a *function*, not a class, dispatched via `call_user_func()`, and every
+  supporting piece (the domain, the transform, the scope) has a structurally different shape.**
+  Real-world code (`inc/plugins/woocommerce/features/quick-view.php` +
+  `woocommerce-template-functions.php`):
+  ```php
+  function botiga_get_default_single_product_components() {
+      $components = array( 'woocommerce_template_single_title', ..., 'botiga_divider_output' );
+      // ... conditionally $components[] = 'botiga_single_wishlist_button'; ...
+      return apply_filters( 'botiga_default_single_product_components', $components );
+  }
+  function botiga_get_quick_view_summary_components( $components = array() ) {
+      $components = array_map( function( $component ) {
+          $suffix = str_replace( 'woocommerce_template_single_', '', $component );
+          if ( $component === "woocommerce_template_single_$suffix" ) {
+              return "botiga_quick_view_summary_$suffix";
+          }
+          return $component;
+      }, $components );
+      return apply_filters( 'botiga_quick_view_product_components', $components );
+  }
+  // template-parts/content-quick-view.php:
+  foreach ( $components as $component ) {
+      if ( function_exists( $component ) ) { call_user_func( $component, $product ); }
+  }
+  ```
+  Three genuinely new mechanisms, none of them extensions of the class-name machinery above:
+  - **Domain**: `resolveReturnArrayLiterals()` — a function/method returning a flat literal array
+    (`return $var;` / `return apply_filters('tag', $var, ...);` where `$var` is tracked in
+    `$anyArrayLiteralVars`) is captured into a new `$functionArrayReturns` map, the array-valued
+    counterpart to `$functionLiteralReturns`.
+  - **Transform surface**: the result here is built via double-quoted string *interpolation*
+    (`"botiga_quick_view_summary_$suffix"`), not `.` concatenation —
+    `interpolatedPrefixVarAt()` recognizes the fixed `"`, `T_ENCAPSED_AND_WHITESPACE`,
+    `T_VARIABLE`, `"` token sequence and feeds the variable into the *same*
+    `$transformChainVars` lookup `literalConcatVarAt()` already uses, so `$suffix`'s own
+    `str_replace('woocommerce_template_single_', '', $component)` assignment needed no new
+    recognition at all.
+  - **Scope**: no owner class connects the two functions — `array_map()`'s closure runs in
+    completely procedural code. Rather than trying to prove which specific function call
+    provided the array (a much deeper, more speculative trace through `get_theme_mod()`'s own
+    default-value position), `$functionNameTransformTemplates` is a flat, **project-wide** list
+    (not owner-scoped), cross-referenced in `FunctionAnalyzer` against *every*
+    `$functionArrayReturns` entry project-wide — the same "coarse net" trade-off the class-name
+    mechanism makes, just widened from same-class to project scope, since a resolved candidate
+    that matches no real function definition is simply inert. Gated on two independent signals to
+    keep this from over-matching ordinary procedural string-building: the closure must be
+    `array_map()`'s own first argument (`$functionIsArrayMapClosureStack`, computed by walking
+    backward past an optional `static` modifier at the closure's own `function` keyword), and the
+    literal must look like a snake_case function-name prefix (`preg_match('/^[a-z][a-z0-9_]*_$/',
+    ...)`) — the lowercase, underscore-joined counterpart to the capitalized-identifier heuristic
+    Jetpack's own class-name case uses.
+
+  **Scope limitation, confirmed by tracing the real code precisely rather than estimating:** of
+  the theme's 8 `botiga_quick_view_summary_*` findings, only 6
+  (`title`/`rating`/`price`/`excerpt`/`add_to_cart`/`meta`) actually flow through this exact
+  transform — `wishlist` is appended to the domain array *conditionally*
+  (`$components[] = 'botiga_single_wishlist_button';`, not part of the initial array literal
+  this pass captures, and its value wouldn't survive the `str_replace()` guard even if it were),
+  and `share` is dispatched through an unrelated WordPress hook (`do_action(
+  'botiga_quick_view_share' )`), never through this components list at all. Both remain
+  genuinely open, unrelated gaps if ever revisited.
+
+  Verified: 4 new parser-level regressions (the array-return capture, the interpolated-transform
+  capture, and two negative cases — outside an `array_map()` closure, and a non-snake_case
+  literal) plus a `FunctionAnalyzer` end-to-end regression using the real two-function, cross-file
+  shape, confirmed to actually fail without the fix by toggling it off. `composer check` is clean
+  (625 PHPUnit tests, PHPStan, formatting). Botiga's `UnusedFunction` count drops 18 → 12
+  (exactly the 6 traced above); full 28-project corpus re-scanned with no crash and byte-
+  identical output on every project except Botiga (Jetpack/wp-nested-pages/wpforms-lite reflect
+  this session's earlier, separate fixes).
+
+- [x] **WooCommerce's own instance of the class-name-transform pattern, above, needed the domain
+  side widened rather than the transform side — its own registry is a 3-level-nested array
+  literal, deeper than any structured capture ($classArrayKeyLiterals' targeted shapes: a
+  top-level `return [...]`, a `$var['key'] = ...;` assignment, a flat array assigned to
+  `$this->prop`) can reach without tracing an actual variable-assignment/conditional-mutation/
+  return flow through two `apply_filters()` hops.** Real code
+  (`includes/admin/class-wc-admin-reports.php`):
+  ```php
+  public static function get_reports() {
+      $reports = array(
+          'orders' => array( 'title' => ..., 'reports' => array(
+              'sales_by_category' => array( 'title' => ..., 'callback' => array( __CLASS__, 'get_report' ) ),
+              // ... sales_by_date, sales_by_product, coupon_usage, downloads ...
+          ) ),
+          // ... 'customers', 'stock' the same shape ...
+      );
+      if ( wc_tax_enabled() ) { $reports['taxes'] = array( 'reports' => array( /* ... */ ) ); }
+      $reports = apply_filters( 'woocommerce_admin_reports', $reports );
+      $reports = apply_filters( 'woocommerce_reports_charts', $reports ); // BC
+      return $reports;
+  }
+  public static function get_report( $name ) {
+      $name  = sanitize_title( str_replace( '_', '-', $name ) );
+      $class = 'WC_Report_' . str_replace( '-', '_', $name );
+      include_once apply_filters( 'wc_admin_reports_path', 'reports/class-wc-report-' . $name . '.php', $name, $class );
+      if ( ! class_exists( $class ) ) { return; }
+      ( new $class() )->output_report();
+  }
+  ```
+  Rather than teaching the parser to trace that specific flow (a losing battle — the exact
+  variable name, mutation shape, and filter-hop count are all WooCommerce-specific, and a
+  different plugin's registry would use different ones), `$classArrayKeyLiterals` gained a
+  fourth, general capture: every `'literal' =>` pair found *anywhere* in a class body, at *any*
+  nesting depth, regardless of what variable holds it or whether it ever reaches a `return` at
+  all — the same "coarse net" trade-off this domain pool already makes, just no longer requiring
+  a specific structural shape to recognize. Noise from unrelated keys in the same array
+  (`'title'`, `'description'`, `'hide_title'`, `'callback'`) is harmless — a spurious transformed
+  candidate that matches no real class/function definition is simply never looked up. The
+  transform side needed one small addition: `sanitize_title()` recognized as a transparent
+  (zero-step) identity in `resolveTransformChainExpr()` — every domain value here is already a
+  clean slug with nothing for it to actually change, same reasoning as `basename()`/
+  `sanitize_file_name()` elsewhere in this parser, but as a *step* to skip over rather than a
+  node-identity wrapper.
+
+  The general capture now legitimately overlaps with the existing targeted ones for a fixture
+  that happens to match both (confirmed by two previously-passing parser tests: one started
+  reporting duplicate keys, one that asserted a "bail entirely" all-or-nothing behavior for a
+  *different*, narrower mechanism — `resolveReturnedKeyedArrayLiteralKeys()`'s own structured
+  capture still correctly bails when any key isn't a plain literal, but the new general harvest
+  doesn't share that requirement, so it now independently finds the plain-literal keys that
+  survive). Both updated to assert the new, intentional behavior rather than reverted. Duplicate
+  entries from genuine double-capture are deduplicated once per file (`array_unique`) when
+  `PhpTokenParser::parse()` builds its `ParseResult`, rather than left to accumulate.
+
+  Verified: 3 new parser-level regressions (the deep-nested harvest itself, the `sanitize_title`
+  identity step, plus the two updated pre-existing tests) and a `ClassAnalyzer` end-to-end
+  regression using the real 3-level-nested shape, confirmed to actually fail without the fix by
+  toggling it off. `composer check` is clean (628 PHPUnit tests, PHPStan, formatting).
+  WooCommerce's `UnusedClass` count drops 142 → 131 — traced precisely to 11 of the registry's 12
+  report classes (`WC_Report_Sales_By_Date` was already resolved via an unrelated direct `new
+  WC_Report_Sales_By_Date()` elsewhere in the codebase, confirmed by isolating it in the
+  before/after diff). `UnusedFile` count is unchanged (377 in both): these same files are already
+  wholesale-exempted by WooCommerce's own hand-rolled `spl_autoload_register()` directory
+  convention, an entirely separate, already-working mechanism — this fix was only ever needed on
+  the class-usage-proof side. Full 28-project corpus re-scanned with no crash and byte-identical
+  output on every project except WooCommerce (Jetpack/wp-nested-pages/wpforms-lite/Botiga reflect
+  this session's earlier, separate fixes).
+
+- [x] **WordPress SEO's own instance of the class-name-transform pattern needed a shape none of
+  the previous four fixes covered: double-quoted curly-brace complex interpolation
+  (`{$var}`) with both a prefix *and* a suffix, and — the simplest case yet — no transform
+  applied to the variable at all.** Real code (`src/integrations/front-end-integration.php`):
+  ```php
+  protected $base_presenters = [ 'Title', 'Meta_Description', 'Robots' ];
+  // ... 8 more sibling property arrays: indexing_directive_presenters, open_graph_presenters, ...
+  private function get_needed_presenters( $page_type ) {
+      $presenters = $this->get_presenters_for_page_type( $page_type ); // array_merge/array_diff
+                                                                        // across several of the
+                                                                        // properties above
+      $callback = static function ( $presenter ) {
+          return "Yoast\WP\SEO\Presenters\\{$presenter}_Presenter";
+      };
+      return \array_map( $callback, $presenters );
+  }
+  ```
+  The domain side needed nothing new: these are the same plain property declarations with flat
+  array defaults Jetpack's fix already taught this parser to capture (the `static` modifier
+  there is optional and was already skipped correctly when absent), and since all 9 sibling
+  properties live in the *same* class, `$classArrayKeyLiterals`' own flat, undifferentiated
+  per-class pool means the `array_merge`/`array_diff` chain combining them is simply irrelevant
+  to domain-collection purposes — every property's values land in one pool regardless. Two new
+  pieces on the transform side:
+  - `interpolatedPrefixCurlyVarSuffixAt()` recognizes the `"`, `T_ENCAPSED_AND_WHITESPACE`,
+    `T_CURLY_OPEN`, `T_VARIABLE`, `}`, optional `T_ENCAPSED_AND_WHITESPACE`, `"` token sequence
+    — curly braces are syntactically *required* here specifically because of the suffix (a bare
+    `$presenter_Presenter` would tokenize as one larger variable name instead of `$presenter`
+    followed by literal text). Hooked at the raw `"` token handling (not the
+    `T_CONSTANT_ENCAPSED_STRING` branch literalConcatVarAt() uses — an interpolated string never
+    produces that token at all, an early wrong-hook-point mistake caught by the very first test
+    run before it ever reached real code).
+  - Unlike every prior confirmed case, `$presenter` here is never transformed — it's the bare
+    closure parameter, used exactly as the config array declared it. `$classNameTransformTemplates`
+    grew a third tuple element (a literal suffix, always `''` for the existing `.`-concatenation
+    shape) and its consuming cross-product in `ClassAnalyzer`/`FileAnalyzer` now falls through to
+    a zero-step identity when the variable was never in `$transformChainVars` at all, rather than
+    requiring proof of a prior transform — the simplest real-world shape turned out to need the
+    *least* structure, not the most.
+
+  **Two pre-existing parser tests asserted the old 2-tuple shape and were updated (not
+  reverted) to include the new, always-present suffix element** — a mechanical, non-behavioral
+  change confirmed by the full pre-existing suite passing unchanged otherwise.
+
+  Confirmed by tracing the real code precisely, not estimating: of this class's up to 40
+  presenter names spread across 9 sibling properties, only `Meta_Author_Presenter` was actually
+  net-new — every other domain value (`Title`, `Canonical`, `Robots`, ...) turned out to already
+  be referenced literally elsewhere in this large, heavily cross-referenced codebase (e.g.
+  `integrations/third-party/web-stories.php`'s own direct reference to `Title_Presenter`),
+  confirmed by isolating the two relevant files in a standalone scan (where every presenter name
+  in the fixture resolves correctly) versus the full corpus (where only the one with no other
+  reference anywhere shows a net change) — the fix is correct and complete; the corpus's own
+  redundancy is simply larger than the original gap-hunt's rough estimate suggested.
+
+  Verified: 3 new parser-level regressions (untransformed curly interpolation, a transformed-
+  source variant proving the chain still resolves correctly through this shape, and a negative
+  case for a non-class-shaped prefix) plus a `ClassAnalyzer` end-to-end regression using the real
+  shape, confirmed to actually fail without the fix by toggling it off (the first attempt at that
+  end-to-end fixture also caught a second, independent authoring mistake — a single-element
+  domain array, below `parseAnyStringLiteralArray()`'s own two-element minimum — a reminder that
+  a fixture "looking right" isn't the same as verifying it against the real capture rules).
+  `composer check` is clean (632 PHPUnit tests, PHPStan, formatting). WordPress SEO's
+  `UnusedClass` count drops 39 → 38; full 28-project corpus re-scanned with no crash and byte-
+  identical output on every project except WordPress SEO (Jetpack/WooCommerce/wp-nested-
+  pages/wpforms-lite/Botiga reflect this session's earlier, separate fixes).
+
+- [x] **Elementor's widget/control/element registries needed two more pieces the previous five
+  class-name-transform fixes didn't cover: a `__NAMESPACE__`-prefixed concatenation whose
+  literal, one-line-later reassigns the *same* variable it's built from, and a domain sourced
+  from a `foreach` loop over a local flat array rather than any class-body array literal.** Real
+  code (`includes/managers/widgets.php`):
+  ```php
+  class Widgets_Manager {
+      public function register_widgets() {
+          $build_widgets_filename = [ 'common', 'icon-box', /* ~30 more */ ];
+          foreach ( $build_widgets_filename as $widget_filename ) {
+              $class_name = str_replace( '-', '_', $widget_filename );
+              $class_name = __NAMESPACE__ . '\Widget_' . $class_name;
+              $this->register( new $class_name() );
+          }
+      }
+  }
+  ```
+  Two bugs had to be fixed together, both exposed by this one shape:
+  - **Self-referential reassignment was silently wiping the tracked chain.** The first statement
+    (`$class_name = str_replace(...)`) correctly set `$transformChainVars['$class_name']`. But
+    the second statement's own RHS (`__NAMESPACE__ . '\Widget_' . $class_name`) isn't a bare
+    transform-function call — `resolveTransformChainRhs()` returns `null` for it, same as for any
+    genuinely unrelated reassignment — and the existing "any other RHS invalidates a previous
+    tracked type" unset logic (shared with `$varTypesStack` and every other single-assignment
+    tracker in this parser) fired and deleted the entry *before* `literalConcatVarAt()` ever got
+    a chance to read it later in the same forward scan. New `rhsIsSelfReferentialLiteralConcat()`
+    narrowly recognizes exactly this shape — RHS ends in `. $sameVar` and contains a string
+    literal somewhere before that — and skips the unset only then, leaving the entry for
+    `literalConcatVarAt()` to consume once `$i` reaches the literal token itself. Deliberately
+    narrow (not "any RHS mentioning the same variable survives") to avoid quietly preserving a
+    stale chain across an unrelated self-referencing reassignment (`$x = $x + 1;` and similar)
+    elsewhere in the corpus.
+  - **The domain isn't in any class-body array literal at all.** Every previous confirmation
+    (WPForms, wp-nested-pages, Jetpack, WooCommerce, WordPress SEO) had the transform's ultimate
+    domain sitting in a property array or a returned/keyed array literal somewhere in the same
+    class — `$classArrayKeyLiterals` was built entirely from those. Elementor's own domain
+    (`$build_widgets_filename`) is a bare local variable, never a class member, consumed only by
+    the `foreach` that drives the transform. Rather than teach `classArrayKeyLiterals` yet another
+    capture site for "a local flat array feeding a foreach," the fix reuses what this parser
+    already tracks for exactly this shape: when `literalConcatVarAt()`'s own resolved chain's
+    source variable (`$concatChain[0]`, e.g. `'$widget_filename'`) matches an actively-tracked
+    `foreach` loop (`$foreachLoopVarNameStack`/`$foreachLoopVarValuesStack`, populated from a
+    local flat literal array by `parseForeachLiteralArrayLoop` — the same machinery
+    `resolveForeachConcatenatedLiteral()` already reads elsewhere in this file), that loop's own
+    concrete values are pushed into `$classArrayKeyLiterals[$ownerClass]` directly at capture
+    time, no separate class-body array literal needed.
+
+  A third, smaller gap: the gate deciding whether a concatenated literal "looks like" a class-name
+  prefix (`str_ends_with($prefix, '\\')` for a namespace, or `^[A-Z][A-Za-z0-9_]*_$` for a flat
+  prefix like Jetpack's `Jetpack_Tiled_Gallery_Layout_`) rejected Elementor's `'\Widget_'`
+  outright — it starts with a backslash (the `__NAMESPACE__ .` separator) but doesn't end with
+  one, and doesn't start with a capital letter either. Widened to
+  `^\\?[A-Z][A-Za-z0-9_]*_$` (an optional single leading backslash). That leading backslash then
+  has to be stripped again in `ClassAnalyzer`/`FileAnalyzer`'s own short-name reconstruction
+  (`$reconstructPrefix = ltrim($prefix, '\\')`) — it's the `__NAMESPACE__` separator, never part
+  of the literal short class name itself, and reconstructing `'\Widget_' . 'Icon_Box'` verbatim
+  would produce `'\Widget_Icon_Box'`, an extra leading backslash that never matches any real
+  `$def->name`.
+
+  Verified: a new `ClassAnalyzer` end-to-end regression using the real shape (a local
+  `foreach`-driven domain, the self-referential `__NAMESPACE__` reassignment, the leading-
+  backslash prefix), confirmed to genuinely fail without each of the four pieces individually
+  (the reassignment-preservation check, the widened gate regex, the foreach-domain merge, and the
+  prefix `ltrim`) by toggling each off in turn. `composer check` is clean (633 PHPUnit tests,
+  PHPStan, formatting). Traced precisely against the real corpus rather than estimating:
+  Elementor's `UnusedClass` count drops 87 → 53 (34 widget classes, matching the original
+  gap-hunt's own estimate exactly); full 28-project corpus re-scanned with no crash and
+  byte-identical output on every other project.
+
+  This extends the class-name-transform family to six independent real-world confirmations
+  (WPForms, wp-nested-pages, Jetpack, WooCommerce, WordPress SEO, Elementor) — Elementor's own
+  `Controls_Manager::register_controls()` and `Elements_Manager` (`__NAMESPACE__ . '\Control_' .
+  $control_class_id` / `'\Element_' . $element_name`) likely share the same two mechanisms but
+  weren't separately traced; not attempted here since their own domains (`self::$controls`-style
+  registries) weren't confirmed to already be captured the way `$build_widgets_filename` is.
+
 ## Method detection
 
 - [x] **A namespaced `Class::method` callback assembled as `__NAMESPACE__ .
@@ -265,6 +716,82 @@ scope limit that trades recall or precision for staying a single-pass, no-depend
   PHPUnit tests, PHPStan, and formatting), and before/after `--type=all` scans of all 28 supplied
   plugins/themes changed only LiteSpeed Cache as described and WP Rig's separately-fixed template
   finding below.
+
+- [x] **A `foreach`-driven string-callable whose class segment is the loop variable, sandwiched
+  between a fixed namespace prefix and a fixed `::method` suffix, was invisible to the previous
+  `__NAMESPACE__ . '\Class::method'` fix — that fix only handles a single, statically-written
+  literal.** Real code (`thirdparty/entry.inc.php`):
+  ```php
+  $third_cls = array( 'Aelia_CurrencySwitcher', 'Autoptimize', /* ~20 more */ );
+  foreach ($third_cls as $cls) {
+      add_action('litespeed_load_thirdparty', 'LiteSpeed\Thirdparty\\' . $cls . '::detect');
+  }
+  ```
+  The pieces needed were already sitting side by side in this parser but never connected:
+  `resolveForeachConcatenatedLiteral()` already enumerates every concrete string a `'prefix' .
+  $loopVar . 'suffix'` concatenation produces over a tracked `foreach` domain — but the existing
+  callback-shape gate (`$isCallbackShaped`, checked once against the *prefix* literal alone,
+  before enumeration) rejects it outright: `'LiteSpeed\Thirdparty\\'` ends in a namespace
+  separator, so its own trailing segment is empty and obviously not callback-shaped, even though
+  every *enumerated* result plainly is. Fixed: a new, parallel enumeration check
+  (`$forLoopClassMethodEnumeration`) re-splits each concrete enumerated string on its own
+  rightmost `\`/`::` independently (the class segment moves with the loop variable, so the split
+  point isn't fixed the way the prefix-only check assumes), validates both the class and method
+  fragments still look identifier-shaped, and registers a `ScopedMethodCall` for each.
+
+  One more piece, exposed only by this shape: `stripQuotes()` deliberately never decodes PHP
+  escape sequences (see its own docblock), so the source's `'LiteSpeed\Thirdparty\\'` — written
+  with a doubled trailing backslash only because a single-quoted string can't otherwise end in an
+  unescaped backslash without accidentally escaping its own closing quote — is captured *raw*
+  (three backslash bytes) rather than runtime-decoded (two). Concatenated with the loop value,
+  that leaves a doubled backslash sitting in the middle of the reconstructed class name
+  (`LiteSpeed\Thirdparty\\Aelia_CurrencySwitcher`), which would never match the real, singly-
+  separated FQCN any `namespace` declaration in this parser produces. Collapsed back to one
+  separator (`preg_replace('/\\\\{2,}/', '\\', ...)`) before resolving the FQCN — a general fix
+  for this same doubled-backslash-before-string-end idiom wherever it recurs, not specific to
+  LiteSpeed.
+
+  Verified: a new parser-level regression
+  (`testForeachConcatenatedStringCallableWithNamespacePrefixAndMethodSuffixEnumeratesEachClass`)
+  and an analyzer-level regression (`testCreditsMethodCalledThroughAForeachConcatenatedStringCallable`),
+  each confirmed to fail without the fix (the enumeration-split branch and the backslash-collapse
+  independently, by toggling each off in turn). `composer check` is clean (635 PHPUnit tests,
+  PHPStan, formatting). LiteSpeed Cache's `UnusedMethod` count drops 59 → 37 (22 third-party
+  `detect()` methods, exactly matching the original gap-hunt's own estimate); full 28-project
+  corpus re-scanned with no crash and identical output on every other project.
+
+- [x] **`WP_LIST_TABLE_CONTRACT_METHODS`' curated literal list was missing one real override
+  point outright, and structurally couldn't cover another — a project-defined column key can
+  never be enumerated as a fixed name a literal list would need.** Real code (Contact Form 7's
+  `WPCF7_Contact_Form_List_Table`, `admin/includes/class-contact-forms-list-table.php`):
+  `handle_row_actions( $item, $column_name, $primary )` (`single_row_columns()`'s own per-column
+  row-actions override point — the same class's `column_title()` builds the "Edit | Duplicate |
+  Delete" links it renders under the primary column) was simply never in the list. Separately,
+  `column_title()`/`column_author()`/`column_shortcode()`/`column_date()` are WP core's own
+  `single_row_columns()` `method_exists($this, 'column_' . $column_name)` dispatch — called for
+  *whatever* column keys `get_columns()` itself returns, so no fixed set of names could ever be
+  exhaustive.
+
+  Fixed: added `handle_row_actions` to the existing literal list, and a new,
+  narrowly-scoped parallel mechanism — `BASE_CLASS_CONTRACT_METHOD_PREFIXES` (`['WP_List_Table' =>
+  ['column_']]`), checked via the same `matchesAnyPrefix()` helper `$scopedCalledPrefixes`
+  already uses elsewhere in this analyzer — for the one base class actually needing a prefix
+  match instead of a name list. `isContractMethod()`'s existing inheritance-chain walk needed no
+  changes at all; the prefix check just joins the literal-list and generated-stub checks already
+  made at each link.
+
+  Confirmed broadly applicable, not one plugin's own: grepping the full 28-project corpus for
+  `extends WP_List_Table` turns up 20 subclasses across contact-form-7, woocommerce, wpforms-lite,
+  jetpack, wordpress-seo, and both bundled Action Scheduler copies — most declaring several
+  `column_*()` overrides apiece.
+
+  Verified: extended the existing `testExcludesWpListTableContractMethods` end-to-end test with
+  both new shapes (`handle_row_actions`, `column_title`), each confirmed to fail independently
+  without its own half of the fix by toggling it off. `composer check` is clean (636 PHPUnit
+  tests, PHPStan, formatting). Traced precisely against the real corpus: `UnusedMethod` drops
+  Contact Form 7 24 → 19 (5, matching the original gap-hunt's own estimate exactly), WooCommerce
+  889 → 851 (38), WPForms 222 → 216 (6), Jetpack 328 → 325 (3); full 28-project corpus re-scanned
+  with no crash and identical output on every other project.
 
 - [x] **Contract-method exemption (`ClassAnalyzer::isContractMethod`) only checks the declaring
   class's own `extends`/`implements`, not the full inheritance chain.** Fixed: `isContractMethod`
@@ -307,6 +834,60 @@ scope limit that trades recall or precision for staying a single-pass, no-depend
   prefix match is categorically riskier than an unscoped *exact* match, since a short incidental
   prefix collides via `str_starts_with()` with huge swaths of unrelated real names, where an
   exact full-identifier collision is rare by comparison.
+
+- [x] **`method_exists($receiver, 'prefix' . $var . 'suffix')` — a dynamic-dispatch registry
+  checking whether a computed method name exists before calling it — was invisible, even though
+  it needs no array-callback shape at all: `method_exists()`'s own second argument being built
+  this way is a stronger, more unambiguous signal than the array-callback prefix case above (the
+  function name itself says this position names a real method — no "is this even callback-
+  related" question to answer).** Found in a fresh gap-hunt, confirmed recurring across the
+  corpus, not one plugin's own convention:
+  ```php
+  // WooCommerce, WC_Settings_API::generate_settings_html()
+  if ( method_exists( $this, 'generate_' . $type . '_html' ) ) { ... }
+  // WooCommerce, WC_AJAX::variation_bulk_action() — 24 variation_bulk_action_* methods
+  if ( method_exists( __CLASS__, "variation_bulk_action_$bulk_action" ) ) { ... }
+  // WordPress SEO, WPSEO_Replace_Vars — retrieve_* methods
+  if ( method_exists( $this, 'retrieve_' . $var ) ) { ... }
+  // WPForms, Views/Overview/Table.php — get_column_* methods
+  if ( method_exists( $this, "get_column_{$column_name}" ) ) { ... }
+  ```
+  Unlike the class-name-transform family elsewhere in this parser, no domain enumeration is
+  needed here at all: the check itself is the whole contract, regardless of what `$type`/
+  `$bulk_action`/`$var`/`$column_name` actually range over — crediting *every* method matching
+  the prefix(+suffix) as reachable is correct with zero further proof needed, the same
+  "co-occurrence is the signal" trade-off `ScopedMethodCallPrefix` already accepts, just from a
+  stronger, unambiguous source.
+
+  Fixed by reusing and extending the exact mechanism above rather than inventing a parallel one:
+  `ScopedMethodCallPrefix` gained an optional `$suffix` field (default `''`, so the existing
+  array-callback capture site needed no changes); a new `method_exists()` recognizer in
+  `dispatchBareFunctionCall()` resolves the first argument to a receiver (`$this`,
+  `self::class`/`static::class`, `__CLASS__`, or a bare class-name string literal — the narrow,
+  evidenced shapes; a tracked variable or computed expression is left unresolved, same "don't
+  guess" stance `arrayCallbackReceiverClass()` takes for its own unhandled cases) and the second
+  to a prefix/suffix pair (`'prefix' . <anything>` / `'prefix' . <anything> . 'suffix'`, or the
+  double-quoted interpolated equivalents `"prefix$var"` / `"prefix{$var}"` / `"prefix{$var}suffix"`
+  — new, narrowly-scoped matchers operating on the argument's own already-bounded token list,
+  distinct from the existing quote-scanning interpolation helpers built for the class-name-
+  transform family, which assume a different surrounding statement shape). `ClassAnalyzer`'s
+  `$scopedCalledPrefixes` now stores `[prefix, suffix]` pairs instead of bare prefixes, checked by
+  a new `matchesAnyPrefixSuffix()` (suffix empty means prefix-only, same as before).
+
+  Verified: 2 new parser-level regressions (the concatenation and curly-interpolation shapes,
+  each confirmed to fail without the fix) and a new `ClassAnalyzer` end-to-end regression using
+  WooCommerce's real `generate_*_html` shape, confirmed the credit is scoped to the resolved
+  receiver only — an identically-named method on an unrelated class with no matching
+  `method_exists()` call of its own still correctly reports unused. `composer check` is clean
+  (643 PHPUnit tests, PHPStan, formatting). Traced precisely against the real corpus: `UnusedMethod`
+  drops WooCommerce 812 → 759 (−53), WordPress SEO 432 → 392 (−40), WPForms 207 → 198 (−9),
+  wp-smushit 242 → 241 (−1, a new corroborating instance the original gap-hunt didn't report);
+  Wordfence's own `method_exists($this, 'scan_' . $job . '_init')` shape turned out already
+  resolved before this fix — traced to a *separate* call site, `array($this, 'scan_' .
+  $jobName)`, already covered by the existing array-callback `ScopedMethodCallPrefix` mechanism
+  above — confirming this fix adds real, non-overlapping coverage rather than double-counting an
+  already-fixed case. Full 28-project corpus re-scanned with no crash and no other category
+  regressed anywhere.
 
 - [x] **Property types weren't tracked**, unlike local variables. `$this->service = new
   My_Service(); ... $this->service->render();` (service/collaborator set in the constructor,
@@ -732,6 +1313,75 @@ entry above rather than this summary, since each one's trade-off reasoning is sp
 
 Known gaps in `FileAnalyzer` (the `files` check). Same spirit as above: documented scope limits,
 not shipped bugs.
+
+- [x] **WP 6.5+ script-translation files (`.l10n.php`) were never recognized as a convention-based
+  exemption, the same way page templates and block patterns already are.** Real-world case
+  (Advanced Custom Fields): `lang/acf-es_MX.l10n.php` and 51 sibling locale files — each a plain
+  `return ['domain'=>..., 'messages'=>[...]];` array a build tool (`wp i18n make-json`/
+  `@wordpress/scripts`) generates from a script's own `.po` file — **100% of ACF's 78
+  `UnusedFile` findings**. WP core's own `load_script_translations()` (`wp-includes/l10n.php`)
+  locates these purely by filename convention next to a registered script handle; nothing in
+  project code ever `include()`s/`require()`s one directly.
+
+  Fixed: `FileAnalyzer::isCandidate()` exempts any file whose path ends in `.l10n.php`,
+  unconditionally — no directory scope needed (unlike the block-pattern header check just below
+  it, which is deliberately restricted to `patterns/` since a bare header field isn't distinctive
+  enough on its own), since the double extension is WP's own reserved convention: no legitimate
+  PHP source file is ever named this way.
+
+  Verified: new end-to-end regression (`testScriptTranslationL10nPhpFileIsExempt`), confirmed to
+  fail without the fix. `composer check` is clean (637 PHPUnit tests, PHPStan, formatting). ACF's
+  `UnusedFile` count drops 78 → 26 (all 52 `.l10n.php` files); full 28-project corpus re-scanned
+  with no crash and identical output on every other project (no other project in the corpus ships
+  these files, though the convention itself is WP-core-wide, not ACF-specific).
+
+- [x] **webpack/`@wordpress/scripts` build-dependency manifests (`{entry}.asset.php`) — the same
+  reserved-double-extension shape as `.l10n.php` above, just not yet applied.** A fresh gap-hunt
+  turned up `woocommerce/assets/client/blocks/*.asset.php`: 237 files, each a plain `return
+  ['dependencies' => [...], 'version' => ...];` array webpack generates per compiled bundle for
+  `wp_register_script()`-adjacent tooling to read — loaded by a dynamic path built from each
+  compiled entry's own name, never a literal `include()`/`require()`. Corpus-wide grep for
+  `*.asset.php` found this convention far more widespread than the one WooCommerce directory
+  that surfaced it: **885 files across 13 of the 28 projects** — Jetpack alone ships 466,
+  Elementor 56, plus smaller counts in broken-link-checker, contact-form-7, wp-smushit, astra,
+  generatepress, hestia, kadence, neve, sage, sydney.
+
+  Fixed identically to `.l10n.php`: `FileAnalyzer::isCandidate()` exempts any file whose path
+  ends in `.asset.php`, unconditionally — no other legitimate PHP source is ever named this way.
+
+  Verified: new end-to-end regression (`testWebpackAssetPhpBuildManifestIsExempt`), confirmed to
+  fail without the fix. `composer check` is clean (639 PHPUnit tests, PHPStan, formatting).
+  Verified together with the `locate_template()` fix above in the same corpus pass (both changed
+  file candidacy, so isolating each precisely wasn't meaningful — the combined before/after is
+  the honest number): `UnusedFile` drops WooCommerce 377 → 85 (−292), Jetpack 131 → 66 (−65),
+  Elementor 1016 → 962 (−54), GeneratePress 4 → 0 (fully clear), Kadence 21 → 18 (−3); no crash
+  anywhere, no other finding category regressed on any of the 28 projects.
+
+- [x] **Third-party plugin theme-override directories (bbPress's `bbpress/`, WooCommerce's
+  `woocommerce/`) weren't recognized as a convention-based exemption or handed off to
+  TemplateAnalyzer — they fell through to the default "is this used" check with no reachability
+  signal either analyzer could ever find, since the theme itself never calls into them at all.**
+  Found in a fresh gap-hunt: bbPress's own `bbp_locate_template()` scans the *active theme's* own
+  `bbpress/` directory by filename convention, purely on the plugin's own initiative — real-world
+  case (Kadence): all 13 files under `bbpress/` (100% of the theme's own `UnusedFile` findings).
+  WooCommerce's `wc_locate_template()` scans a theme's `woocommerce/` directory the identical
+  way — present (though not yet triggering the bug, since their files already resolve some other
+  way) in Blocksy, Neve, and Sydney.
+
+  Fixed with a new, deliberately separate constant, `THIRD_PARTY_TEMPLATE_OVERRIDE_DIRS` —
+  *not* folded into the existing `TEMPLATE_DIRS` list just above, since that list's own files are
+  handed off to `TemplateAnalyzer` (which knows how to check `get_template_part()`/
+  `wc_get_template_part()`-style reachability), while these directories have no reachability
+  check either analyzer could ever run — the whole point of the convention is that the *theme*
+  never calls into them, so they're exempted outright instead, the same way Page Templates and
+  Block Patterns already are just above in `isCandidate()`.
+
+  Verified: new end-to-end regression (`testThirdPartyPluginTemplateOverrideDirectoryIsExempt`),
+  confirmed to fail without the fix. `composer check` is clean (650 PHPUnit tests, PHPStan,
+  formatting). Kadence's `UnusedFile` count drops 18 → 5 (all 13 `bbpress/` files); full
+  28-project corpus re-scanned with no crash and identical output on every other project (no
+  other project in the corpus currently has an unresolved `woocommerce/`-directory finding, but
+  the convention itself is WooCommerce-ecosystem-wide, not one theme's own).
 
 - [x] **Composer PSR-4/classmap-autoloaded files are never counted as referenced.** Fixed:
   `FileAnalyzer::loadComposerAutoloadPaths` reads the scanned target's own `composer.json`
@@ -1607,6 +2257,28 @@ way the class/method/file gaps above were found; nothing here has been fixed yet
   the other plugins have no `templates/`/`template-parts/`/`parts/` directory at all, so nothing
   to check either way) shows no crashes.
 
+- [x] **`locate_template()` — WP core's own lower-level template-file locator
+  (`wp-includes/template.php`), which `get_template_part()` and friends are themselves built on
+  — was never in `TEMPLATE_FUNCS` at all.** Found in a fresh gap-hunt: `grep`ing the full
+  28-project corpus for direct `locate_template(` call sites (not through any wrapper) turned up
+  9 different projects (sage, botiga, storefront, kadence, flynt-v2.1.2, wpforms-lite,
+  woocommerce, jetpack) — a broadly-applicable WP-core omission, not one theme's own convention.
+  Real-world shape (Kadence): `locate_template( 'template-parts/archive-title/hkb-searchbox' );`.
+
+  Fixed by simply adding `'locate_template'` to `TEMPLATE_FUNCS` as a plain entry (no stem-prefix
+  rewrite of its own, unlike `get_header`/`get_footer`/`get_sidebar` — arg 0 is already the exact
+  relative template path/slug, with or without `.php`, and `TemplateAnalyzer::normalizePath()`
+  already strips the extension either way). This one addition is free everywhere else in the
+  parser too: `isLiteralPathSinkFunction()` already reuses `isTemplateLoaderFunc()`, so
+  `locate_template()` also became a valid `LiteralPathPropagationResolver` sink for a literal
+  reaching it through a wrapper parameter, with zero additional code.
+
+  Verified: new `TemplateAnalyzerTest` regression, confirmed to fail without the fix. `composer
+  check` is clean (638 PHPUnit tests, PHPStan, formatting). Full 28-project corpus re-scanned
+  with no crash; several projects' `UnusedTemplate`/`UnusedFile` counts dropped as a direct
+  result (see the File Detection section's own `.asset.php` entry, fixed alongside this one, for
+  the combined before/after numbers — the two fixes were verified together in the same pass).
+
 ## Function detection
 
 - [x] **Namespaced/fully-qualified function calls were invisible to `FunctionAnalyzer`.** The
@@ -1754,6 +2426,62 @@ way the class/method/file gaps above were found; nothing here has been fixed yet
     cast every other constructor in this method already uses.
 
 ## Hook & template tag detection
+
+- [x] **A vendor-prefixed dependency firing a hook the host project registers a callback for was
+  architecturally invisible to `HookAnalyzer` — `FileScanner`'s vendor-directory exclusion (see
+  the File Scanning section above) happens before any analyzer ever sees the file list, so a
+  vendored dependency's own `apply_filters()`/`do_action()` call was never even parsed.** Root
+  cause is structural, not a parsing gap: vendor-exclusion is correct for "is this file/class/
+  function dead" (auditing a dependency's own internals is out of scope), but WordPress's hook
+  system is fundamentally cross-boundary — a bundled dependency firing a hook the host code
+  listens to is a normal, correct pattern, not something host-code candidacy exclusion should
+  hide from hook resolution specifically. Found in a fresh gap-hunt: Jetpack registers
+  `add_filter('jetpack_sync_home_url', ...)`/`add_filter('jetpack_sync_site_url', ...)` in its
+  own host code, genuinely fired at
+  `jetpack_vendor/automattic/jetpack-connection/src/class-urls.php:162,181`
+  (`apply_filters('jetpack_sync_home_url', $url)`) — both showed `UnmatchedHook` purely because
+  `jetpack_vendor/` is excluded from the scanned file list entirely.
+
+  Fixed with a deliberately separate, tokenizer-free path rather than widening the main scan: a
+  vendor-prefixed tree can be most of a plugin's own file count (confirmed in the corpus: Jetpack
+  ~1,250 files, wpforms-lite ~3,100 — comparable to or larger than the plugin's own first-party
+  code), and full `PhpTokenParser` tokenization exists to answer "is this project's own code
+  dead", a question genuinely out of scope for vendor code — so this needed a much cheaper way to
+  answer the one narrower question that matters: "does a literal hook tag appear as this call's
+  first argument anywhere in this file". New `FileScanner::scanVendorPrefixedFiles()` (a
+  deliberately separate directory walk from `scan()` — its own vendor-exclusion prunes those
+  directories from being visited at all, so there's nothing to bucket from the same walk without
+  restructuring it) finds every PHP file under a vendor-prefixed directory; new
+  `VendorHookInvocationScanner::scan()` runs a single `preg_match_all()` per file (no
+  `token_get_all()` at all) for `do_action`/`apply_filters`/`do_action_ref_array`/
+  `apply_filters_ref_array` calls with a literal first argument. Coarser than real parsing (a tag
+  built via concatenation, or the same text inside a comment/unrelated string, isn't
+  distinguished) — but this only ever *adds* a hook to the fired set, never fabricates a new
+  finding, so a rare false positive here just suppresses one real `UnmatchedHook` rather than
+  creating a wrong one; the same one-directional, low-stakes "coarse net" trade-off this codebase
+  already accepts throughout the class-name-transform and literal-path mechanisms.
+  `HookAnalyzer::analyze()` takes the resulting tag set as a new optional parameter, merged
+  directly into its own `$firedTags` — every existing prefix/suffix/pass-through resolution
+  layered on top of that set needed no changes at all. Wired in `Application.php`: only computed
+  when `--type` includes `hooks` (a plain filesystem walk plus a lightweight regex pass, but
+  still real work skipped when the check isn't requested), and only for a real filesystem target
+  (a pre-supplied file list has no root path to search beneath, and isn't expected to include
+  vendor code anyway).
+
+  Verified: new `VendorHookInvocationScanner` unit tests (all four invoke functions, both quote
+  styles, an unrelated function call correctly ignored, an empty file list), a new
+  `FileScannerTest` regression confirming `scanVendorPrefixedFiles()` finds exactly the inverse
+  of what `scan()` excludes, and a new `HookAnalyzerTest` regression reproducing Jetpack's real
+  shape — each confirmed to fail without its own piece. `composer check` is clean (649 PHPUnit
+  tests, PHPStan, formatting). Performance stayed reasonable despite the large vendor trees
+  involved (a plain filesystem walk plus one regex pass per file, no tokenization): Jetpack's own
+  `--type=hooks` scan completed in ~1.3s, wpforms-lite's (~3,100 vendor files) in ~1.6s,
+  WooCommerce's (the corpus's largest, ~4,000 total files) in ~4.1s. Traced precisely against the
+  real corpus, and turned out considerably broader than Jetpack alone: `UnmatchedHook` drops
+  Jetpack 174 → 95 (−79, well past the original gap-hunt's own 55-finding estimate), wpforms-lite
+  30 → 20 (−10), Hestia 46 → 41 (−5), Flynt 21 → 16 (−5), Neve 63 → 60 (−3), WooCommerce 46 → 44
+  (−2) — six projects, not one; full 28-project corpus re-scanned with no crash and no other
+  category regressed anywhere.
 
 - [x] **A hook or template-part tag held in a variable resolved to nothing** —
   `$hook = 'my_plugin_loaded'; do_action($hook);` or `get_template_part($dynamic_slug)` came back
@@ -1968,6 +2696,116 @@ either back up; don't re-discover the same evidence from scratch.
   tractability than the other three items in this family; not attempted when Sydney/WooCommerce
   were fixed.
 
+- [x] **An inline `// phpcs:ignore ...` comment directly after a call's opening `(`, before its
+  first argument, silently defeated the whole `LiteralPathPropagationResolver` chain above for
+  that call site.** Real-world finding (WPForms): `echo wpforms_render( // phpcs:ignore
+  WordPress.Security.EscapeOutput.OutputNotEscaped\n\t'education/admin/did-you-know', [...] );`
+  in `DidYouKnow.php` (and 7 sibling call sites across `lite/templates/`) — the stray comment
+  token, not a literal, ended up first in the extracted argument-0 token list, so
+  `literalPathStringLiteral()`'s own `count($tokens) === 1` exact-match check never matched and
+  the literal was invisible to the graph, despite a live `wpforms_render()` call site right
+  there. `literalPathCallArgumentTokensAt()` (the call-argument extractor feeding this whole
+  mechanism) only stripped `T_WHITESPACE` from a collected argument's tokens, not
+  `T_COMMENT`/`T_DOC_COMMENT` — fixed by stripping both, the same "insignificant" definition
+  `skipInsignificant()` already uses everywhere else in this parser. Only reproduces through the
+  real multi-hop chain (`wpforms_render()` -> `Templates::get_html()` ->
+  `Templates::include_html()` -> `require`, each hop's own `apply_filters()`-wrapped assignment
+  intact) — a single-hop wrapper resolves regardless of this bug via a different, simpler path,
+  so a minimal one-hop reproduction attempt initially (and misleadingly) suggested no bug existed
+  at all.
+  Verified: wpforms-lite's `UnusedFile` count drops 43 → 7 and `UnusedTemplate` drops 42 → 35 (the
+  same bug independently affected several other `lite/templates/` call sites carrying the same
+  inline-comment style); full 28-project corpus re-scanned with no crash and byte-identical
+  output on every other plugin/theme.
+
+- [x] **`$functionLiteralReturns` (a `return` statement's resolved literal(s)) only ever tracked
+  a top-level named function — `$functionNameStack` was `null` inside any method body, so a
+  method's own `return 'literal';`/`return self::CONST;` was invisible to it, unlike the sibling
+  `$functionParamSuffixReturns` mechanism, which already keys by `"Class::method"`. Also,
+  `resolveReturnLiterals()` itself only recognized a direct literal, a variable, or
+  `apply_filters()` — never a bare `self::`/`static::`/`Foo::CONST` return.** Real-world shape
+  motivating this (WPForms): `General::get_slug()` does `return static::TEMPLATE_SLUG;` and
+  `General::get_parent_slug()` does `return self::TEMPLATE_SLUG;`; `StripeCardTestingAlert::
+  get_parent_slug()` does `return Summary::TEMPLATE_SLUG;` (an explicit class reference). Fixed
+  two independent gaps:
+  - `resolveReturnLiterals()` gained a `self::`/`static::`/`Foo::CONST` branch, sharing the exact
+    same resolution logic `classifyArgTokens()`'s own identical branch already used (factored out
+    into `resolveScopedClassConstant()`) — `static::CONST` resolves against the *physical*
+    declaring class only, no late-static-binding fan-out across subclass overrides (same
+    documented limitation as $classNameTransformTemplates' own scope note).
+  - `$functionLiteralReturns`'s own population now uses `$functionDefIndexForBodyStack` (already
+    built for `$functionParamSuffixReturns`) instead of the now-dead `$functionNameStack`/
+    `$pendingFunctionName` (removed), keying a method by `"Class::method"` the same way.
+
+  At the time this landed, no consumer read the method-keyed entries yet (see the immediate
+  follow-up item just below, which wires one up) — verified in isolation with 5 new parser-level
+  regressions (`testMethodReturningAPlainLiteral...`, `testMethodReturningSelfClassConstant...`,
+  `testMethodReturningAnExplicitClassConstant...`,
+  `testMethodReturningAnUnresolvableClassConstantYieldsNoLiteral`,
+  `testTopLevelFunctionLiteralReturnKeyingIsUnchanged` — the last confirming the top-level-
+  function case is unaffected by the method-keying change).
+
+- [x] **`LiteralPathPropagationResolver`'s own concatenation-term classifier
+  (`resolveLiteralPathExpressionTokens`) neither recognized a method-call term nor supported more
+  than one unresolved term per statement — exactly what WPForms' own motivating chain above
+  needs.** `General::get_full_template_name()`'s `$template = 'emails/' . $this->get_slug() .
+  '-' . $name;` has *two* non-literal terms (`$this->get_slug()` and `$name`), where the existing
+  "more than one dynamic value is not a bounded path template" rule would bail entirely. Fixed by
+  teaching the term classifier a THIRD option beyond "is this a literal" / "is this the one
+  flowing node": `literalPathStringLiteralOrMethodReturn()` recognizes a zero-arg
+  `self::`/`static::`/`parent::`/`Foo::`/`$this->` method call
+  (`literalPathZeroArgMethodCallKey()`, same `"Class::method"` keying as the item above) whose
+  `$functionLiteralReturns` entry is a single deterministic literal, and substitutes it as if it
+  were a literal term directly — leaving `$name` as the sole genuinely dynamic term. Same-file,
+  single forward pass, defined-before-use (`get_slug()` is parsed before
+  `get_full_template_name()` references it) — the same "coarse net" trade-off self::/static::CONST
+  resolution already relies on elsewhere in this parser.
+
+  Two more real, narrower gaps surfaced and were fixed alongside this, both confirmed necessary
+  by direct trace against the real corpus (a synthetic reproduction missing either one silently
+  "worked" through an unrelated path and would have hidden both):
+  - `literalPathNodeFromTokens()`'s existing `basename($x)`-is-an-identity-transform allowlist
+    only matched a bare `T_STRING` function-name token. WPForms' own code calls it backslash-
+    qualified (`\sanitize_file_name( $name )`, reassigning `$name` before the concatenation above
+    even runs) — a `T_NAME_FULLY_QUALIFIED` token, invisible to the bare-`T_STRING` check, which
+    invalidated `$name`'s own tracked node before the critical line was ever reached. Fixed by
+    switching to the same `CLASS_NAME_TOKENS` + `shortClassName()` pattern
+    `literalPathFunctionNameFromTokens()` already uses elsewhere in this exact file, and added
+    `sanitize_file_name` itself to the allowlist (same no-op-for-matching-purposes reasoning as
+    `basename()` — every real template-part slug here is a plain lowercase word with nothing for
+    it to strip).
+  - Confirmed by trace, *not* fixed: `captureLiteralPathCall`'s own argument-source resolution
+    doesn't check `literalPathScopedCallTarget()` the way `resolveLiteralPathAssignmentSource`
+    does — a call argument that's itself a scoped call to an already-tracked function/method
+    (`Templates::get_html( $this->get_full_template_name( $name ) )`) doesn't link the callee's
+    return node to the outer call's own parameter node. Real-world impact turned out to be
+    limited: WPForms' actual resolution path runs through the *separate*
+    `Templates::locate( $template . '.php' )` existence-check guard inside
+    `get_full_template_name()` itself (a plain concatenation-argument call, already supported),
+    not through this specific shape — listed here as a confirmed, narrower, still-open gap rather
+    than re-investigated from scratch next time.
+
+  **Scope limitations, both pre-existing and already documented elsewhere, not reintroduced by
+  this fix:** no late-static-binding fan-out for `static::CONST`/`$this->method()` across
+  subclass overrides (`get_slug()`/`get_parent_slug()` always resolve against the *physical*
+  declaring class, `General` — see the item above); and local-variable tracking's own
+  control-flow blindness means `if ($this->plain_text) { $name .= '-plain'; }` unconditionally
+  wins over the non-plain-text case in source order, so the resolved path always carries
+  `-plain` — correctly crediting `general-body-plain.php` (which exists) but not
+  `general-header.php`/`general-footer.php`/etc. (which have no `-plain` counterpart to
+  incorrectly resolve to instead).
+
+  Verified: 4 new parser-level regressions (`testLiteralPathPropagationResolvesAMethodCallTerm
+  InAConcatenation`, `...LeavesAMethodCallTermUnresolvedWithMultipleReturns` — a method with
+  several literal-return branches is correctly left unresolved, not guessed —
+  `...TreatsSanitizeFileNameAsAnIdentityTransform`) plus one `TemplateAnalyzer` end-to-end
+  regression (`testMethodCallTermInsideAConcatenationReferencesTemplatePath`, confirmed to
+  actually fail without this fix by toggling it off). `composer check` is clean (607 PHPUnit
+  tests, PHPStan, formatting). wpforms-lite's `UnusedTemplate` count drops 35 → 34
+  (`general-body-plain.php` — the one case where every piece of this fix, the CONST-return
+  support above, and the phpcs-comment fix earlier, all line up); full 28-project corpus
+  re-scanned with no crash and byte-identical output on every other plugin/theme.
+
 - [x] **A scoped call's literal argument reached an `include`/`require` only after the callee's
   own body wrapped the parameter in a transform function (`basename($param)`) before
   concatenating a fixed prefix/suffix around it — the existing bulk-directory-loader mechanism
@@ -2001,6 +2839,68 @@ either back up; don't re-discover the same evidence from scratch.
   Verified: Akismet's `UnusedFile` count drops **14 → 0** (`bin/wp-specter scan
   ../wp-tests/plugins/akismet` reports "All clear"), no regressions and no crashes across the
   full corpus.
+
+- [x] **A literal reaching a sink only after crossing an object-construction boundary — a static
+  factory forwards its argument into a constructor via `new self(...)`, the constructor stores it
+  as a property, and a *different* method later reads that property to build the path — was
+  invisible to `LiteralPathPropagationLink`'s graph, which only knew about parameters, locals,
+  and return values.** Real-world finding (Wordfence): `wfView::create($view, $data)` (`lib/
+  wfView.php`) does `return new self($view, $data);`; the constructor does `$this->view = $view;`;
+  a wholly separate method, `render()` (called later, with no arguments of its own), does
+  `$view = preg_replace('/\.{2,}/', '.', $this->view); $view_path = $this->view_path . '/' .
+  $view . $this->view_file_extension; ... include $view_path;` — called throughout as
+  `wfView::create('scanner/text/issue-base', ...)`. **100% of the ~60 files under `views/`** were
+  flagged `UnusedFile` despite every one of them being loaded exactly this way.
+
+  Three genuinely new pieces, none of them Wordfence-specific:
+  - A property node identity (`literalPathPropertyNode()`: `Class::$prop`, stable regardless of
+    which method reads it, unlike a per-function counter-based local node) plus a new capture,
+    `captureLiteralPathPropertyAssignment()`, for `$this->prop = <expr>;` — the property-scoped
+    sibling of the existing local-variable `captureLiteralPathAssignment()`. Only ever marks a
+    property "tracked" (consulted by `literalPathNodeFromTokens()`'s own new `$this->` case) on a
+    *resolved* source; `$this->view_path = WORDFENCE_PATH . 'views';` (an opaque constant) leaves
+    `view_path` untracked. This is single-pass and defined-before-use, same limitation as every
+    other cross-statement tracking in this parser: it only resolves when the writer (the
+    constructor) is parsed before the reader (`render()`) in source order — true of every real
+    case found, but undocumented as a general guarantee.
+  - `new self(...)`/`new static(...)`/`new ClassName(...)` now feeds the same literal-path
+    wrapper-call graph any plain function/method call already does (`resolveNewExpressionClassNameAt()`
+    factored out of the existing `assignedNewClassName()` to share the self/static/parent
+    resolution logic), targeting `<Class>::__construct` — previously `T_NEW` never fed this graph
+    at all, assignment or not.
+  - An untracked `$this->prop` term (`isLiteralPathIgnorablePropertyExpression()`) is treated as
+    ignorable — contributing neither a literal fragment nor counting as the expression's one
+    dynamic segment — the property-access counterpart to the existing bare-constant/
+    `get_template_directory()` tolerances; without it, `render()`'s own `$this->view_path . '/' .
+    $view . $this->view_file_extension` has three dynamic-looking terms and the whole expression
+    (correctly, per the "more than one dynamic value" rule) refuses to resolve. Two smaller,
+    narrowly-scoped pieces make the *other* two terms resolve cleanly instead of needing that
+    tolerance themselves: `preg_replace('/\.{2,}/', '.', $x)` is now a transparent wrap (literal
+    pattern/replacement required) alongside the existing `basename()`/`sanitize_file_name()`
+    no-ops, and a class-body property declared with a single scalar string-literal default
+    (`protected $view_file_extension = '.php';`) is captured
+    (`$literalPathPropertyLiteralDefaults`) and resolved by
+    `literalPathStringLiteralOrMethodReturn()` the same way a fixed literal segment already would.
+
+  Deliberately not attempted: `wfView::create('scanner/text/issue-' . $i['type'], ...)` (two call
+  sites) — the view slug's dynamic segment is an array-element read off a foreach loop variable,
+  not a plain wrapper parameter; resolving it needs the array-element-access domain support noted
+  as a separate, distinct gap.
+
+  Verified: a new `FileAnalyzer` end-to-end regression
+  (`testStaticFactoryConstructorPropertyRenderViewLoaderReferencesFile`) reproducing the real
+  three-hop shape exactly, with a direct `LiteralPathPropagationResolver::resolve()` assertion
+  (not just the coarser basename/stem match `FileAnalyzer` itself also does) confirming the
+  resolved path carries the real `.php` extension, not just Wordfence's coarser fallback masking
+  a broken piece — each of the six new pieces (the `new self()` capture, the property-assignment
+  capture, the `$this->` node case, the ignorable-property check, the `preg_replace` wrap, and
+  the scalar-property-default capture) confirmed individually load-bearing by toggling each off
+  in turn and re-running the test. `composer check` is clean (636 PHPUnit tests, PHPStan,
+  formatting). Traced precisely against the real corpus: Wordfence's `UnusedFile` count drops
+  60 → 38 (22 files — every plain-literal `wfView::create()` call whose file wasn't already
+  referenced some other way; the remaining 38 include the ~33 array-element-access cases noted
+  above, correctly still unresolved); full 28-project corpus re-scanned with no crash and
+  identical output on every other project.
 
 - [ ] **WooCommerce's PayPal IPN handler dispatches via `payment_status_{$posted['payment_status']}`**
   (`class-wc-gateway-paypal-ipn-handler.php:76`) — genuinely unenumerable from static code alone

@@ -8,6 +8,7 @@ use WpSpecter\Finding\Finding;
 use WpSpecter\Finding\FindingCertainty;
 use WpSpecter\Finding\FindingType;
 use WpSpecter\Parser\PhpTokenParser;
+use WpSpecter\Support\StringTransformChain;
 
 final class FunctionAnalyzer
 {
@@ -92,6 +93,45 @@ final class FunctionAnalyzer
         foreach ($parseResults as $result) {
             foreach ($result->pendingReturnTypedCalls as $call) {
                 $called[$call->readMethod] = true;
+            }
+        }
+
+        // A function name synthesized via a recognized transform chain applied to a *different*
+        // function's own returned array of literals, dispatched via `call_user_func()` — the
+        // procedural (no enclosing class) counterpart to ClassAnalyzer's own
+        // $classNameTransformTemplates cross-product. Real-world shape (Botiga):
+        // `botiga_get_quick_view_summary_components()` runs `array_map()` over
+        // `botiga_get_default_single_product_components()`'s own returned array, turning
+        // `'woocommerce_template_single_title'` into `'botiga_quick_view_summary_title'` — two
+        // unrelated top-level functions, not methods sharing a class, so there's no owner to
+        // scope this by; every $functionNameTransformTemplates entry is cross-referenced against
+        // every $functionArrayReturns entry project-wide instead (see
+        // PhpTokenParser::interpolatedPrefixVarAt's own docblock for the full real-world code and
+        // the two gates — inside an `array_map()` closure, and the literal looking like a
+        // snake_case function-name prefix — that keep this from over-matching against unrelated
+        // procedural array transforms). A resolved name that never matches any real function
+        // definition is simply never looked up below; only a genuine collision could ever
+        // misfire, the same "coarse net" trade-off this project makes throughout.
+        $functionNameTransformTemplates = [];
+        foreach ($parseResults as $result) {
+            array_push($functionNameTransformTemplates, ...$result->functionNameTransformTemplates);
+        }
+        if ($functionNameTransformTemplates !== []) {
+            $functionArrayReturns = [];
+            foreach ($parseResults as $result) {
+                foreach ($result->functionArrayReturns as $key => $values) {
+                    if (!isset($functionArrayReturns[$key])) {
+                        $functionArrayReturns[$key] = [];
+                    }
+                    array_push($functionArrayReturns[$key], ...$values);
+                }
+            }
+            foreach ($functionNameTransformTemplates as [$prefix, $steps]) {
+                foreach ($functionArrayReturns as $values) {
+                    foreach ($values as $value) {
+                        $called[$prefix . StringTransformChain::apply($value, $steps)] = true;
+                    }
+                }
             }
         }
 

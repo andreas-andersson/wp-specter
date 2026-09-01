@@ -84,6 +84,26 @@ final class FileScannerTest extends TestCase
         self::assertCount(2, $result->files);
     }
 
+    public function testScanVendorPrefixedFilesFindsExactlyWhatScanExcludes(): void
+    {
+        // The exact inverse of testExcludesVendorPrefixedDirectories — used only for
+        // VendorHookInvocationScanner's cross-boundary hook-invocation scan (see its own
+        // docblock), never for the normal "is this file used" checks.
+        $this->touch('functions.php');
+        $this->touch('vendor_prefixed/twig/src/Environment.php');
+        $this->touch('vendor-prefixed/packages/Symfony/Polyfill/bootstrap.php');
+        $this->touch('jetpack_vendor/automattic/jetpack-sync/src/Module.php');
+        $this->touch('vendors/catalog.php');
+
+        $vendorFiles = $this->scanner->scanVendorPrefixedFiles($this->tmp);
+
+        self::assertCount(3, $vendorFiles);
+        foreach ($vendorFiles as $file) {
+            self::assertStringNotContainsString('functions.php', $file);
+            self::assertStringNotContainsString('vendors/catalog.php', $file);
+        }
+    }
+
     public function testIgnoreGlobsApplied(): void
     {
         $this->touch('functions.php');

@@ -9,6 +9,7 @@ use WpSpecter\Analyzer\FileAnalyzer;
 use WpSpecter\Analyzer\FunctionAnalyzer;
 use WpSpecter\Analyzer\HookAnalyzer;
 use WpSpecter\Analyzer\TemplateAnalyzer;
+use WpSpecter\Analyzer\VendorHookInvocationScanner;
 use WpSpecter\Composer\ComposerProjectDetector;
 use WpSpecter\Detector\WpModeDetector;
 use WpSpecter\Enum\WpMode;
@@ -264,6 +265,11 @@ class Application
 
         $scanner = new FileScanner();
         $allFiles = [];
+        // Only populated for a real filesystem target ($target->files === null below) — a
+        // pre-supplied file list has no root path to search beneath, and isn't expected to
+        // include vendor code anyway. See VendorHookInvocationScanner's own docblock for why
+        // this stays a plain filename list rather than going through the parser like $allFiles.
+        $allVendorFiles = [];
         foreach ($targets as $target) {
             if ($target->files !== null) {
                 $allFiles = array_merge($allFiles, $this->applyIgnoreGlobs($target->files, $config->ignoreGlobs));
@@ -274,6 +280,9 @@ class Application
                 return $this->error($scanResult->error);
             }
             $allFiles = array_merge($allFiles, $scanResult->files);
+            if ($config->wantsType('hooks')) {
+                $allVendorFiles = array_merge($allVendorFiles, $scanner->scanVendorPrefixedFiles($target->path));
+            }
         }
 
         $reporter = new TerminalReporter($config->noColor, forceTty: $config->noProgressbar ? false : null);
@@ -321,7 +330,8 @@ class Application
         }
 
         if ($config->wantsType('hooks')) {
-            $findings = array_merge($findings, (new HookAnalyzer($parser))->analyze($allFiles, $this->progressCallback($reporter, $scanTotal, $scanCompleted)));
+            $vendorFiredTags = VendorHookInvocationScanner::scan($allVendorFiles);
+            $findings = array_merge($findings, (new HookAnalyzer($parser))->analyze($allFiles, $this->progressCallback($reporter, $scanTotal, $scanCompleted), $vendorFiredTags));
             $scanCompleted += count($allFiles);
         }
 

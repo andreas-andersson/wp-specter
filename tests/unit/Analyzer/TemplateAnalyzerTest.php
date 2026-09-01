@@ -50,6 +50,21 @@ final class TemplateAnalyzerTest extends TestCase
         self::assertEmpty($findings);
     }
 
+    public function testDoesNotReportTemplatePartReferencedThroughLocateTemplate(): void
+    {
+        // Real-world shape (Kadence): `locate_template( 'template-parts/archive-title/hkb-
+        // searchbox' );` — WP core's own lower-level template-file locator, which
+        // get_template_part() and friends are themselves built on. Confirmed called directly
+        // (not through any wrapper) in 9 of the 28 corpus projects.
+        $themeDir = $this->tmp;
+        $part = $this->touch('template-parts/archive-title/hkb-searchbox.php');
+        $main = $this->writeCode("<?php locate_template( 'template-parts/archive-title/hkb-searchbox' );");
+
+        $findings = $this->analyzer->analyze([$part, $main], WpMode::Classic, $themeDir);
+
+        self::assertEmpty($findings);
+    }
+
     public function testDoesNotReportTemplatePartReferencedThroughAVariableSlug(): void
     {
         // $slug = 'template-parts/hero'; get_template_part($slug); -- the variable's last-known
@@ -242,6 +257,54 @@ include_unguarded( "admin/challenge/unguarded" );
         self::assertNotContains('embed.php', $names);
         self::assertContains('orphan.php', $names);
         self::assertContains('unguarded.php', $names);
+    }
+
+    public function testMethodCallTermInsideAConcatenationReferencesTemplatePath(): void
+    {
+        // Real-world shape (WPForms): General::get_full_template_name() builds the template
+        // slug as `'emails/' . $this->get_slug() . '-' . $name`, where get_slug() returns
+        // `static::TEMPLATE_SLUG` — a method call sitting inside a concatenation alongside the
+        // genuinely dynamic $name parameter, not a call-site literal argument. The actual
+        // connection to the require sink runs through the `Templates::locate( $template .
+        // '.php' )` existence-check guard inside get_full_template_name() itself (a plain
+        // concatenation-argument call, already-supported), not through get_content_part()'s own
+        // `Templates::get_html( $this->get_full_template_name(...) )` call — a call whose
+        // argument is itself a scoped call is a separate, not-yet-supported shape.
+        $themeDir = $this->tmp;
+        $body = $this->touch('templates/emails/general-body.php');
+        $orphan = $this->touch('templates/emails/general-orphan.php');
+        $helpers = $this->writeCode('<?php
+class General {
+    const TEMPLATE_SLUG = "general";
+    public function get_slug() {
+        return static::TEMPLATE_SLUG;
+    }
+    protected function get_full_template_name( $name ) {
+        $template = "emails/" . $this->get_slug() . "-" . $name;
+        if ( ! Templates::locate( $template . ".php" ) ) {
+            $template = "emails/" . $this->get_slug() . "-" . $name;
+        }
+        return $template;
+    }
+    protected function get_content_part( $name ) {
+        $html = $this->get_full_template_name( $name );
+        return $html;
+    }
+    public function get_content_parts() {
+        return [ "body" => $this->get_content_part( "body" ) ];
+    }
+}
+class Templates {
+    public static function locate( $template_name ) {
+        require $template_name;
+    }
+}
+');
+
+        $names = array_column($this->analyzer->analyze([$helpers, $body, $orphan], WpMode::Plugin, $themeDir), 'name');
+
+        self::assertNotContains('general-body.php', $names);
+        self::assertContains('general-orphan.php', $names);
     }
 
     public function testIncludeCountsAsReference(): void

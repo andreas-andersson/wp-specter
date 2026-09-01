@@ -6,6 +6,7 @@ namespace WpSpecter\Tests\unit\Analyzer;
 
 use PHPUnit\Framework\TestCase;
 use WpSpecter\Analyzer\FileAnalyzer;
+use WpSpecter\Analyzer\LiteralPathPropagationResolver;
 use WpSpecter\Parser\PhpTokenParser;
 
 final class FileAnalyzerTest extends TestCase
@@ -91,6 +92,39 @@ include_once \$path . '/storm.php';
         $tpl = $this->write('page-templates/no-title.php', "<?php /** Template Name: No title */\n");
 
         self::assertEmpty($this->analyzer->analyze([$tpl], $this->tmp));
+    }
+
+    public function testThirdPartyPluginTemplateOverrideDirectoryIsExempt(): void
+    {
+        // Real-world case (Kadence): bbPress's own bbp_locate_template() scans the active
+        // theme's bbpress/ directory by filename convention, never through any call the theme
+        // itself makes — all 13 of Kadence's own bbpress/ files were 100% of its UnusedFile
+        // findings. WooCommerce's woocommerce/ override directory is the identical convention.
+        $bbpress = $this->write('bbpress/content-archive-forum.php', '<?php // loaded by bbp_locate_template()');
+        $woocommerce = $this->write('woocommerce/single-product.php', '<?php // loaded by wc_locate_template()');
+
+        self::assertEmpty($this->analyzer->analyze([$bbpress, $woocommerce], $this->tmp));
+    }
+
+    public function testScriptTranslationL10nPhpFileIsExempt(): void
+    {
+        // WP 6.5+ script-translation files: WP core's own load_script_translations() finds these
+        // by filename convention next to a registered script handle, never through a visible
+        // include()/require() in project code. Real-world case (Advanced Custom Fields): 52 of
+        // these under lang/, each a plain `return [...]` array a build tool generated.
+        $l10n = $this->write('lang/acf-es_MX.l10n.php', "<?php return ['domain'=>NULL,'messages'=>[]];\n");
+
+        self::assertEmpty($this->analyzer->analyze([$l10n], $this->tmp));
+    }
+
+    public function testWebpackAssetPhpBuildManifestIsExempt(): void
+    {
+        // webpack/@wordpress/scripts build-dependency manifests: loaded via a dynamic path built
+        // from each compiled entry's own name, never a literal include()/require(). Real-world
+        // scale: WooCommerce alone ships 320 of these under assets/client/, Jetpack 466.
+        $asset = $this->write('assets/client/blocks/cart.asset.php', "<?php return array('dependencies' => array('wp-element'), 'version' => 'abc123');\n");
+
+        self::assertEmpty($this->analyzer->analyze([$asset], $this->tmp));
     }
 
     public function testConfigArrayPhpPathIsTreatedAsReference(): void
@@ -186,6 +220,72 @@ get_template_part("inc/shortcodes/variants/$variant", null);
         $caller = $this->write('plugin.php', '<?php new bootstrap();');
 
         self::assertEmpty($this->analyzer->analyze([$bootstrap, $caller], $this->tmp));
+    }
+
+    public function testClassBuiltFromSnakeToPascalCaseTransformOfAConfigArrayKeyIsExempt(): void
+    {
+        // Real-world shape (WPForms): SmartTags::get_smart_tag_class_name() turns each key of
+        // smart_tags_list()'s own returned array into a class name via the canonical
+        // snake_case-to-PascalCase idiom, then instantiates it — AdminEmail is never spelled
+        // out as a literal anywhere, only PSR-4-autoloadable. Kept in step with
+        // ClassAnalyzer's own version of this fallback.
+        $this->writeComposerJson([
+            'autoload' => ['psr-4' => ['WPForms\\' => 'src/']],
+        ]);
+        $dispatcher = $this->write('src/SmartTags/SmartTags.php', '<?php
+namespace WPForms\SmartTags;
+class SmartTags {
+    protected function smart_tags_list() {
+        return [
+            "admin_email" => "Site Administrator Email",
+            "field_id"    => "Field ID",
+        ];
+    }
+    protected function get_smart_tag_class_name( $smart_tag_name ) {
+        $class_name = str_replace( " ", "", ucwords( str_replace( "_", " ", $smart_tag_name ) ) );
+        $full_class_name = "\\\\WPForms\\\\SmartTags\\\\SmartTag\\\\" . $class_name;
+        return $full_class_name;
+    }
+}
+');
+        $target = $this->write('src/SmartTags/SmartTag/AdminEmail.php', '<?php
+namespace WPForms\SmartTags\SmartTag;
+class AdminEmail {
+    public function process() {}
+}
+');
+
+        $names = array_column($this->analyzer->analyze([$dispatcher, $target], $this->tmp), 'name');
+        self::assertNotContains('AdminEmail.php', $names);
+    }
+
+    public function testClassBuiltFromAnInlineTransformWithANonNamespacePrefixIsExempt(): void
+    {
+        // Real-world shape (Jetpack tiled-gallery), same as ClassAnalyzer's identical test —
+        // the fixed prefix ('Jetpack_Tiled_Gallery_Layout_') isn't a namespace (no trailing
+        // `\`), so it must be prepended back to the transformed value to reconstruct the real
+        // short class name ('Jetpack_Tiled_Gallery_Layout_Columns'), not matched bare
+        // ('Columns'). Kept in step with ClassAnalyzer's own version of this cross-product.
+        $this->writeComposerJson([
+            'autoload' => ['psr-4' => ['' => 'src/']],
+        ]);
+        $dispatcher = $this->write('src/Jetpack_Tiled_Gallery.php', '<?php
+class Jetpack_Tiled_Gallery {
+    private static $talaveras = array( "rectangular", "columns" );
+    public function render( $type ) {
+        $gallery_class = "Jetpack_Tiled_Gallery_Layout_" . ucfirst( $type );
+        return new $gallery_class();
+    }
+}
+');
+        $target = $this->write('src/Jetpack_Tiled_Gallery_Layout_Columns.php', '<?php
+class Jetpack_Tiled_Gallery_Layout_Columns {
+    public function build() {}
+}
+');
+
+        $names = array_column($this->analyzer->analyze([$dispatcher, $target], $this->tmp), 'name');
+        self::assertNotContains('Jetpack_Tiled_Gallery_Layout_Columns.php', $names);
     }
 
     public function testProjectAutoloadedFileWithNoReferenceIsStillReported(): void
@@ -629,6 +729,59 @@ function ocean_single_post_header_meta_template() {
         self::assertNotContains('meta-2.php', $names);
     }
 
+    public function testInlineCommentRightAfterCallOpenParenDoesNotHideTheLiteralArgument(): void
+    {
+        // Real-world regression (WPForms): `echo wpforms_render( // phpcs:ignore Standard.Rule
+        //     'education/admin/did-you-know', [], true
+        // );` — an inline phpcs-ignore comment directly after the opening `(`, before the first
+        // argument, left a stray comment token in front of the literal. The call-argument
+        // extractor feeding the literal-path-propagation graph only stripped whitespace, not
+        // comments, so the exact-one-token match for "this argument is a plain string literal"
+        // silently failed and the whole wrapper chain (wpforms_render() -> Templates::get_html()
+        // -> Templates::include_html() -> require) never resolved. Needs the real multi-hop
+        // shape — including each hop's own `apply_filters()`-wrapped assignment — to reproduce;
+        // a single-hop wrapper resolves regardless of this bug via a different, simpler path.
+        $wrapper = $this->write('inc/render.php', '<?php
+class Templates {
+    public static function locate( $template_name ) {
+        $located = "";
+        foreach ( [ dirname( __FILE__ ) . "/templates/" ] as $template_path ) {
+            if ( file_exists( $template_path . $template_name ) ) {
+                $located = $template_path . $template_name;
+                break;
+            }
+        }
+        return apply_filters( "templates_locate", $located, $template_name );
+    }
+    public static function include_html( $template_name ) {
+        $template_name .= ".php";
+        $located = apply_filters( "templates_include_html_located", self::locate( $template_name ), $template_name );
+        if ( empty( $located ) ) {
+            return;
+        }
+        require $located;
+    }
+    public static function get_html( $template_name ) {
+        ob_start();
+        self::include_html( $template_name );
+        return ob_get_clean();
+    }
+}
+function wpforms_render( $template_name ) {
+    return Templates::get_html( $template_name );
+}
+');
+        $caller = $this->write('inc/education.php', '<?php
+echo wpforms_render( // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
+    "admin/did-you-know"
+);
+');
+        $template = $this->write('inc/templates/admin/did-you-know.php', '<?php // reachable via wpforms_render()');
+
+        $names = array_column($this->analyzer->analyze([$wrapper, $caller, $template], $this->tmp), 'name');
+        self::assertNotContains('did-you-know.php', $names);
+    }
+
     public function testScopedCallWithTernaryTrackedVariableArgumentResolvesParamSuffixTemplate(): void
     {
         // Real-world finding (wp-nested-pages): `$row_view = ( $cond ) ? 'partials/row' :
@@ -715,6 +868,63 @@ load_styles( [ "name" => "global-inline", "css" => $css ] );
         self::assertNotContains('buttons.php', $names);
         self::assertNotContains('global-inline.php', $names);
         self::assertContains('orphan.php', $names);
+    }
+
+    public function testStaticFactoryConstructorPropertyRenderViewLoaderReferencesFile(): void
+    {
+        // Real-world shape (Wordfence's `wfView`): a static factory forwards its argument into
+        // `new self(...)`, the constructor stores it as a property, and a *different* method
+        // (`render()`, called later, no arguments of its own) builds the actual path and
+        // includes it. Three separate hops, none of them a plain parameter-to-sink wrapper:
+        // factory -> constructor (via `new self()`), constructor -> property (`$this->view =
+        // $view`), property -> sink (`render()`'s own concatenation, reading `$this->view`
+        // through a transparent `preg_replace()` wrap and appending a property with a scalar
+        // literal default, `.php`). `$this->view_path`'s own opaque `WORDFENCE_PATH` root is
+        // never resolved and must not block the rest of the chain.
+        $bootstrap = $this->write('lib/wfView.php', '<?php
+class wfView {
+    protected $view_path;
+    protected $view_file_extension = ".php";
+    protected $view;
+    protected $data;
+
+    public static function create($view, $data = array()) {
+        return new self($view, $data);
+    }
+
+    public function __construct($view, $data = array()) {
+        $this->view_path = WORDFENCE_PATH . "views";
+        $this->view = $view;
+        $this->data = $data;
+    }
+
+    public function render() {
+        $view = preg_replace("/\\.{2,}/", ".", $this->view);
+        $view_path = $this->view_path . "/" . $view . $this->view_file_extension;
+        if (!file_exists($view_path)) {
+            throw new Exception("missing view");
+        }
+        include $view_path;
+        return "";
+    }
+}
+echo wfView::create("scanner/text/issue-base", array("textOutput" => "x"))->render();
+');
+        $view = $this->write('views/scanner/text/issue-base.php', '<?php // loaded through wfView::create()');
+        $orphan = $this->write('views/scanner/text/orphan.php', '<?php // no fixed path reaches this');
+
+        $names = array_column($this->analyzer->analyze([$bootstrap, $view, $orphan], $this->tmp), 'name');
+
+        self::assertNotContains('issue-base.php', $names);
+        self::assertContains('orphan.php', $names);
+
+        // FileAnalyzer's own basename-and-stem index would still match 'issue-base' even without
+        // the resolved path's ".php" suffix (see its own matching code), which would let this
+        // test pass even if the property-scalar-literal-default resolution for
+        // $view_file_extension were broken. Check the resolver's own raw output directly so that
+        // piece is genuinely covered, not just accidentally subsumed by the coarser fallback.
+        $resolved = LiteralPathPropagationResolver::resolve([(new PhpTokenParser())->parse($bootstrap)]);
+        self::assertContains('/scanner/text/issue-base.php', $resolved);
     }
 
     public function testBareParameterPassedToRequireDoesNotBecomeAFileReference(): void
