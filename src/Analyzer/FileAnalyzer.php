@@ -83,6 +83,10 @@ final class FileAnalyzer
      *   extension that was tried and reverted here — see isCandidate()'s own comment on this
      *   check for why basename-as-class-name (sound for Composer's PSR-4, see
      *   isProjectAutoloadedClassUsed) doesn't hold for a hand-rolled autoloader in general.
+     *   Each entry may already be ascended above its registering file's own directory — see
+     *   ascendRelativeDir() and ParseResult::$dirnameAncestorUpLevels' own docblock (real-world
+     *   case: Broken Link Checker's autoloader lives in core/utils/ but resolves class files from
+     *   the plugin root, two levels up).
      */
     private array $autoloadRegisterExemptDirs = [];
     /**
@@ -734,7 +738,13 @@ final class FileAnalyzer
             // $autoloadRegisterExemptDirs's own docblock and isCandidate()'s use of it.
             foreach ($result->functionCalls as $call) {
                 if ($call->name === 'spl_autoload_register') {
-                    $this->autoloadRegisterExemptDirs[] = $callerRelDir;
+                    // The bootstrap file's own directory isn't always the right scope — see
+                    // ParseResult::$dirnameAncestorUpLevels' own docblock (Broken Link Checker's
+                    // autoloader climbs 2 levels above its own file via
+                    // plugin_dir_path(dirname(__DIR__)) before descending back into the resolved
+                    // class subpath). Ascend that many levels from the caller's own directory
+                    // before exempting; 0 levels (the common case) is exactly the prior behavior.
+                    $this->autoloadRegisterExemptDirs[] = $this->ascendRelativeDir($callerRelDir, $result->dirnameAncestorUpLevels);
                     break;
                 }
             }
@@ -761,6 +771,23 @@ final class FileAnalyzer
         $relative = ltrim(str_replace($rootDir, '', $file), '/');
         $dir = dirname($relative);
         return $dir === '.' ? '' : $dir;
+    }
+
+    /**
+     * Strips $levels trailing path segments from a project-relative directory (same '' -means-
+     * project-root convention as relativeDir()/isUnderDynamicLoadExemptDir()) — clamped to '' if
+     * $levels reaches or exceeds the directory's own depth, never negative/out of range.
+     */
+    private function ascendRelativeDir(string $relativeDir, int $levels): string
+    {
+        if ($levels <= 0 || $relativeDir === '') {
+            return $relativeDir;
+        }
+        $segments = explode('/', $relativeDir);
+        for ($i = 0; $i < $levels && $segments !== []; $i++) {
+            array_pop($segments);
+        }
+        return implode('/', $segments);
     }
 
     /**

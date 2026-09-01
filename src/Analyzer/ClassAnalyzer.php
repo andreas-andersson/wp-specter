@@ -99,6 +99,32 @@ final class ClassAnalyzer
         'single_row_columns', 'handle_row_actions',
     ];
 
+    // Elementor/Elementor Pro's Dynamic-Tags `Data_Tag` override points — the same "class absent
+    // from this scan" shape WP core's own curated lists above exist for, just for a widely-
+    // installed third-party page-builder platform (5M+ active installs) instead of WP core:
+    // dozens of themes/plugins ship their own dynamic-tag integrations, extending Elementor's own
+    // `Data_Tag`, which is never present in a scan of the *theme/plugin that integrates with it*
+    // (Elementor/Elementor Pro are separate plugins, not vendored) and never reflectable either
+    // (not a Composer dependency). Verified directly against free Elementor's own source
+    // (core/dynamic-tags/base-tag.php, core/dynamic-tags/data-tag.php — Elementor Pro's own
+    // `Tags\Base\Data_Tag` mirrors this same architecture): `get_name()` is Controls_Stack's own
+    // `abstract` method every Elementor "stack" (widget/control/tag) must implement;
+    // `get_title()`/`get_categories()`/`get_group()` are Base_Tag's own `abstract` methods
+    // Data_Tag doesn't provide a default for; `get_value()` is Data_Tag's own `abstract` method
+    // (its sibling abstracts, `get_content()`/`get_content_type()`, are already implemented
+    // concrete/`final` on Data_Tag itself, so NOT part of a Data_Tag subclass's own contract —
+    // deliberately left off this list); `register_controls()` is Controls_Stack's own empty-stub
+    // template method (`protected function register_controls() {}`), the same "always overridden,
+    // never called externally" shape WP_Widget's own form()/update() already get here. All of
+    // these are called only by Elementor's own tag-manager/controls-stack rendering pipeline,
+    // never by a visible name reference in the integrating theme/plugin's own code. Real-world
+    // case (Kadence theme): `Elementor_Dynamic_Colors extends \ElementorPro\Modules\DynamicTags\
+    // Tags\Base\Data_Tag` — all 6 of these methods false-flagged `UnusedMethod` (100% of that
+    // one class's own methods).
+    private const ELEMENTOR_DATA_TAG_CONTRACT_METHODS = [
+        'get_name', 'get_title', 'get_categories', 'get_group', 'get_value', 'register_controls',
+    ];
+
     // WP_List_Table::single_row_columns() dispatches each of get_columns()'s own keys to a
     // `column_{$column_name}()` method when one exists (`method_exists($this, 'column_' .
     // $column_name)`), falling back to column_default() otherwise — a project-defined column key
@@ -182,6 +208,8 @@ final class ClassAnalyzer
         'Automatic_Upgrader_Skin' => self::WP_UPGRADER_SKIN_CONTRACT_METHODS,
         'Language_Pack_Upgrader_Skin' => self::WP_UPGRADER_SKIN_CONTRACT_METHODS,
         'WP_Ajax_Upgrader_Skin' => self::WP_UPGRADER_SKIN_CONTRACT_METHODS,
+        // See ELEMENTOR_DATA_TAG_CONTRACT_METHODS' own docblock above.
+        'Data_Tag' => self::ELEMENTOR_DATA_TAG_CONTRACT_METHODS,
     ];
 
     // Base classes whose subclasses get called entirely through framework naming-convention /

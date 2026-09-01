@@ -650,8 +650,14 @@ final class PhpTokenParser
                     // narrow. A null result means the shape wasn't recognized — leave $i
                     // untouched so the token loop keeps walking through it one token at a time,
                     // exactly as it already did before this mechanism existed (including
-                    // $interpolationDepth's own brace-depth-safety tracking below).
-                    $interpResult = $this->resolveInterpolatedLoopSuffixPath($tokens, $i, $forLoopVarNameStack, $forLoopVarValuesStack);
+                    // $interpolationDepth's own brace-depth-safety tracking below). Tried against
+                    // the bounded numeric for-loop domain first, then the string-array foreach/
+                    // collect()->each() domain (Sage theme's own `"app/{$file}.php"` over
+                    // ['setup', 'filters']) — a project would need the same interpolated variable
+                    // name bound by both loop shapes at once for this order to matter, no
+                    // evidence of that ever happening.
+                    $interpResult = $this->resolveInterpolatedLoopSuffixPath($tokens, $i, $forLoopVarNameStack, $forLoopVarValuesStack)
+                        ?? $this->resolveInterpolatedLoopSuffixPath($tokens, $i, $foreachLoopVarNameStack, $foreachLoopVarValuesStack);
                     if ($interpResult !== null) {
                         [$enumeratedPaths, $lastInterpIndex] = $interpResult;
                         foreach ($enumeratedPaths as $path) {
@@ -1306,6 +1312,7 @@ final class PhpTokenParser
                         $literalPathFileExistenceGuards,
                         $literalPathNodeCounter,
                         $literalPathPropagationLinks,
+                        $literalPathInputs,
                         $functionLiteralReturns,
                         $literalPathTrackedPropertyNodes,
                         $literalPathPropertyLiteralDefaults,
@@ -1765,6 +1772,19 @@ final class PhpTokenParser
                 if ($nextNonWhitespace !== '(') {
                     // Could be a string callback — handled below via T_CONSTANT_ENCAPSED_STRING
                     continue;
+                }
+
+                // `collect(['setup', 'filters'])->each(function ($file) { ... });` (Roots/Acorn's
+                // Laravel-style fluent Collection iteration, real-world shape: Sage theme's own
+                // functions.php) — the same bounded literal-domain loop $expectingForeachLoopOpen
+                // already tracks for an ordinary `foreach ($arrayVar as $var) { ... }`, just
+                // spelled the fluent-collection way. See parseCollectEachLoop()'s own docblock.
+                if ($name === 'collect') {
+                    $collectEach = $this->parseCollectEachLoop($tokens, $i);
+                    if ($collectEach !== null) {
+                        [$pendingForeachLoopVarName, $pendingForeachLoopVarValues] = $collectEach;
+                        $expectingForeachLoopOpen = true;
+                    }
                 }
 
                 $this->dispatchBareFunctionCall(
@@ -2383,6 +2403,8 @@ final class PhpTokenParser
             }
         }
 
+        $dirnameAncestorUpLevels = $this->maxDirnameAncestorUpLevels($tokens);
+
         return new ParseResult(
             file: $file,
             // array_values(): $functionDefs is mutated by index (not just appended to) once a
@@ -2425,6 +2447,7 @@ final class PhpTokenParser
             classNameTransformTemplates: $classNameTransformTemplates,
             functionArrayReturns: $functionArrayReturns,
             functionNameTransformTemplates: $functionNameTransformTemplates,
+            dirnameAncestorUpLevels: $dirnameAncestorUpLevels,
         );
     }
 
@@ -2541,6 +2564,7 @@ final class PhpTokenParser
      * @param array<string,string> $nodes
      * @param array<string,true> $fileExistenceGuards
      * @param list<LiteralPathPropagationLink> $links
+     * @param list<LiteralPathInput> $inputs
      * @param array<string,string> $useImports
      * @param array<string,list<string>> $functionLiteralReturns
      * @param array<string,array<string,true>> $trackedProperties
@@ -2558,6 +2582,7 @@ final class PhpTokenParser
         array $fileExistenceGuards,
         int &$counter,
         array &$links,
+        array &$inputs,
         array $functionLiteralReturns = [],
         array $trackedProperties = [],
         array $propertyLiteralDefaults = [],
@@ -2601,6 +2626,8 @@ final class PhpTokenParser
             $functionLiteralReturns,
             $trackedProperties,
             $propertyLiteralDefaults,
+            $links,
+            $inputs,
         );
         if ($source === null) {
             $this->invalidateLiteralPathAddress($nodes, $address);
@@ -2812,6 +2839,8 @@ final class PhpTokenParser
      * @param array<string,list<string>> $functionLiteralReturns
      * @param array<string,array<string,true>> $trackedProperties
      * @param array<string,array<string,string>> $propertyLiteralDefaults
+     * @param list<LiteralPathPropagationLink> $links
+     * @param list<LiteralPathInput> $inputs
      * @return array{string,string,string,?string}|null [source node, fixed prefix, fixed suffix,
      *                                                   required file-existence guard key]
      */
@@ -2827,6 +2856,8 @@ final class PhpTokenParser
         array $functionLiteralReturns = [],
         array $trackedProperties = [],
         array $propertyLiteralDefaults = [],
+        array &$links = [],
+        array &$inputs = [],
     ): ?array {
         $rhsIndex = $this->peekNextMeaningfulIndex($tokens, $equalsIndex);
         if ($rhsIndex === null) {
@@ -2851,7 +2882,11 @@ final class PhpTokenParser
                 return $source;
             }
             $callee = $this->literalPathScopedCallTarget($valueTokens, $currentNamespace, $useImports, $currentClass, $currentParent);
-            return $callee === null ? null : [$this->literalPathReturnNode($callee), '', '', null];
+            if ($callee !== null) {
+                return [$this->literalPathReturnNode($callee), '', '', null];
+            }
+            $bareCallee = $this->literalPathBareCallTarget($valueTokens);
+            return $bareCallee === null ? null : [$this->literalPathReturnNode($bareCallee), '', '', null];
         }
 
         $callee = $this->literalPathScopedCallTarget($rhsTokens, $currentNamespace, $useImports, $currentClass, $currentParent);
@@ -2859,7 +2894,94 @@ final class PhpTokenParser
             return [$this->literalPathReturnNode($callee), '', '', null];
         }
 
-        return $this->resolveLiteralPathExpressionTokens($rhsTokens, $nodes, true, $functionKey, $functionLiteralReturns, $currentClass, $currentParent, $currentNamespace, $useImports, $trackedProperties, $propertyLiteralDefaults);
+        $resolved = $this->resolveLiteralPathExpressionTokens($rhsTokens, $nodes, true, $functionKey, $functionLiteralReturns, $currentClass, $currentParent, $currentNamespace, $useImports, $trackedProperties, $propertyLiteralDefaults);
+        if ($resolved !== null) {
+            return $resolved;
+        }
+
+        // `$view_path = acf_get_path("includes/admin/views/{$view_path}.php");` (Advanced Custom
+        // Fields) — a bare (unscoped) wrapper call, tried only as a last resort once nothing more
+        // precise above matched (an identity transform like ltrim(), a concatenation of literals/
+        // known nodes, ...) — see literalPathBareCallTarget()'s own docblock.
+        $bareCallee = $this->literalPathBareCallTarget($rhsTokens);
+        if ($bareCallee === null) {
+            return null;
+        }
+
+        // Synchronously link this call's own arguments into its parameter nodes using the
+        // CURRENT $nodes snapshot, rather than leaving that solely to the main loop's later,
+        // separate per-call-site capture of this exact same call (every bare call already gets
+        // that treatment once the loop's forward scan reaches its own T_STRING token). That later
+        // pass runs AFTER this assignment's caller commits `$nodes[$address] = $targetNode` below
+        // — for a self-referential wrapper call (`$view_path = acf_get_path("...{$view_path}...")`,
+        // the exact ACF shape), the address being reassigned is the SAME variable the call reads
+        // as its own argument, so waiting for that later pass would resolve the argument against
+        // its own new value instead of the value it actually held when this call was evaluated.
+        $this->captureLiteralPathCall(
+            $this->literalPathBareFunctionKeys($bareCallee, null),
+            $tokens,
+            $rhsIndex,
+            $functionKey,
+            $nodes,
+            false,
+            $links,
+            $inputs,
+        );
+
+        return [$this->literalPathReturnNode($bareCallee), '', '', null];
+    }
+
+    /**
+     * A bare (unscoped) `name(...)` call used as an assignment/return-value RHS — the fallback
+     * counterpart to literalPathScopedCallTarget() for a plain top-level function instead of a
+     * Class::/self::/parent::/static:: one. Real-world shape (Advanced Custom Fields):
+     * `$view_path = acf_get_path("includes/admin/views/{$view_path}.php");` inside
+     * `acf_get_view()` — `acf_get_path()` is an ordinary global function, not a class method, so
+     * `literalPathScopedCallTarget()` never matches it and this assignment's RHS previously
+     * resolved to nothing at all (an opaque function call is neither a known node, a literal, nor
+     * a concatenation `resolveLiteralPathExpressionTokens()` can make sense of), breaking every
+     * call site that reassigns its own parameter through this wrapper before the eventual
+     * `include`/`file_exists()` guard.
+     *
+     * Deliberately tried only as the LAST fallback, after resolveLiteralPathExpressionTokens()
+     * has already failed to resolve the RHS more precisely (a known identity transform like
+     * ltrim(), a plain concatenation of literals/tracked nodes) — this is a strictly coarser,
+     * opaque "trust the callee's own return" step, the exact same one already accepted for a
+     * scoped call just above. The call's own arguments are separately linked into the callee's
+     * parameter nodes by captureLiteralPathCall() at this same call site (every bare call already
+     * gets that treatment); this method only resolves what the call AS A WHOLE evaluates to for
+     * this assignment, not its own arguments.
+     *
+     * Scope limitation: resolves only to the bare, unqualified function name — unlike
+     * literalPathBareFunctionKeys() elsewhere, it doesn't also try a current-namespace-prefixed
+     * candidate (no real-world evidence yet of a namespaced project using this exact reassignment
+     * shape; a namespaced callee simply fails to connect here, same as before this fix, not a
+     * regression).
+     *
+     * Refuses any name PHP itself already knows as a real, loaded function
+     * (`function_exists()` — every PHP/extension builtin, `str_replace()` included) — a builtin
+     * never has a project-file body for resolveLiteralPathReturnSource() to ever populate its
+     * return node from, so treating it as an opaque pass-through would only ever be a dead-end
+     * link, never a real resolution; existing regression
+     * (testLiteralPathPropagationDoesNotTreatArbitraryTransformAsAPathTemplate) requires that an
+     * arbitrary transform like `str_replace()` stays completely unresolved, not merely
+     * unreachable, so this must return null outright rather than rely on the dead link being
+     * harmless at resolve time.
+     *
+     * @param list<Token> $tokens
+     */
+    private function literalPathBareCallTarget(array $tokens): ?string
+    {
+        if (
+            count($tokens) < 2
+            || !is_array($tokens[0])
+            || $tokens[0][0] !== T_STRING
+            || $tokens[1] !== '('
+        ) {
+            return null;
+        }
+        $name = $tokens[0][1];
+        return function_exists($name) ? null : $name;
     }
 
     /**
@@ -2908,10 +3030,22 @@ final class PhpTokenParser
     {
         $expression = [];
         $depth = 0;
+        // T_CURLY_OPEN ({$var} string interpolation) closes with a bare "}" that is NOT a
+        // code-level brace — same distinction the main token loop's own $interpolationDepth
+        // already makes (see its own comment there). Without this, a call argument containing
+        // curly-brace interpolation (`acf_get_path("...{$view_path}.php")`) hits that "}" while
+        // $depth is still 0 (T_CURLY_OPEN itself never incremented it, being an array token, not
+        // the bare '{' this loop otherwise matches) and returns [] immediately, discarding the
+        // whole statement.
+        $interpDepth = 0;
         for ($j = $startIndex; isset($tokens[$j]); $j++) {
             $token = $tokens[$j];
-            if ($token === '(' || $token === '[' || $token === '{') {
+            if ($this->isInterpolationCurlyOpen($token)) {
+                $interpDepth++;
+            } elseif ($token === '(' || $token === '[' || $token === '{') {
                 $depth++;
+            } elseif ($token === '}' && $interpDepth > 0) {
+                $interpDepth--;
             } elseif ($token === ')' || $token === ']' || $token === '}') {
                 if ($depth === 0) {
                     return [];
@@ -2925,6 +3059,12 @@ final class PhpTokenParser
             }
         }
         return $expression;
+    }
+
+    /** @param Token $token */
+    private function isInterpolationCurlyOpen(mixed $token): bool
+    {
+        return is_array($token) && ($token[0] === T_CURLY_OPEN || $token[0] === T_DOLLAR_OPEN_CURLY_BRACES);
     }
 
     /**
@@ -2953,6 +3093,28 @@ final class PhpTokenParser
         $sourceNode = $this->literalPathNodeFromTokens($expression, $nodes, $currentClass, $trackedProperties);
         if ($sourceNode !== null) {
             return [$sourceNode, '', '', null];
+        }
+
+        // `"includes/admin/views/{$view_path}.php"` (ACF's own acf_get_view() call argument) —
+        // curly-brace complex string interpolation, not `.`-concatenation at all, so
+        // literalPathConcatenationTerms() below never applies to it (no top-level `.` token to
+        // split on). Reuses the same interpolated-string parser
+        // $classNameTransformTemplates/$functionNameTransformTemplates already rely on elsewhere
+        // in this file, rather than teaching this mechanism its own separate interpolation
+        // parsing. Only the exact "prefix{$var}suffix" shape is recognized (see
+        // interpolatedPrefixCurlyVarSuffixAt's own docblock) — a bare `"$var"`/`"prefix$var"`
+        // interpolation without curly braces isn't reachable here since interpolatedPrefixVarAt()
+        // requires a trailing `;`, a statement-terminator constraint that never holds for a call
+        // argument (no real-world evidence yet for that simpler shape appearing as one).
+        if (($expression[0] ?? null) === '"') {
+            $interpolated = $this->interpolatedPrefixCurlyVarSuffixAt($expression, 0);
+            if ($interpolated !== null) {
+                [$interpPrefix, $interpVarName, $interpSuffix] = $interpolated;
+                $varNode = $nodes[$interpVarName] ?? null;
+                if ($varNode !== null) {
+                    return [$varNode, $interpPrefix, $interpSuffix, null];
+                }
+            }
         }
 
         // WPForms' locate() normalizes its input with `ltrim($template_name, '/')`. Removing
@@ -3287,6 +3449,27 @@ final class PhpTokenParser
             && $expression[count($expression) - 1] === ')'
         ) {
             return $this->literalPathNodeFromTokens(array_slice($expression, 2, -1), $nodes, $currentClass, $trackedProperties);
+        }
+
+        // `ltrim( $filename, '/' )` — ACF's own `acf_get_path( $filename )` does `ACF_PATH .
+        // ltrim( $filename, '/' )`, stripping a possible leading slash before prefixing its own
+        // path constant. Stripping a leading slash is already reflected by the analyzers' own
+        // path normalization, so this exact PHP-core call is an identity for matching purposes
+        // here too — same no-op-for-matching-purposes trade-off as basename()/sanitize_file_name()
+        // just above, but recognized as one TERM of a larger concatenation (this function is
+        // called per-term by resolveLiteralPathExpressionTokens's own loop), not just when it's
+        // the whole expression by itself (resolveLiteralPathExpressionTokens already has its own
+        // narrower whole-expression-only version of this same special case).
+        if (
+            count($expression) >= 4
+            && is_array($expression[0]) && $expression[0][0] === T_STRING && strtolower($expression[0][1]) === 'ltrim'
+            && $expression[1] === '('
+            && $expression[count($expression) - 1] === ')'
+        ) {
+            $args = $this->splitTopLevelCommaArgs(array_slice($expression, 2, -1));
+            if (count($args) === 2 && $this->literalPathStringLiteral($args[1]) === '/') {
+                return $this->literalPathNodeFromTokens($args[0], $nodes, $currentClass, $trackedProperties);
+            }
         }
 
         // `preg_replace( '/\.{2,}/', '.', $name )` — Wordfence's `wfView::render()` collapses
@@ -3634,11 +3817,26 @@ final class PhpTokenParser
 
         $currentPosition = 0;
         $depth = 0;
+        // See literalPathStatementTokens()'s identical $interpDepth comment — a curly-brace
+        // string interpolation's T_CURLY_OPEN/closing "}" must not be mistaken for a code-level
+        // bracket, or an argument containing one (`acf_get_path("...{$view_path}.php")`) hits the
+        // "}" while $depth is still 0 and this returns null, discarding the whole argument.
+        $interpDepth = 0;
         $argument = [];
         for ($index = $openParenIndex + 1; isset($tokens[$index]); $index++) {
             $token = $tokens[$index];
+            if ($this->isInterpolationCurlyOpen($token)) {
+                $interpDepth++;
+                $argument[] = $token;
+                continue;
+            }
             if ($token === '(' || $token === '[' || $token === '{') {
                 $depth++;
+                $argument[] = $token;
+                continue;
+            }
+            if ($token === '}' && $interpDepth > 0) {
+                $interpDepth--;
                 $argument[] = $token;
                 continue;
             }
@@ -4330,6 +4528,40 @@ final class PhpTokenParser
             return;
         }
 
+        // `path_join( WPCF7_PLUGIN_DIR . '/includes/swv/php/rules', $file )` where $file is built
+        // per-iteration (`sprintf('%s.php', $rule)` over `array_keys()` of a configured rule
+        // array, real-world shape: Contact Form 7's wpcf7_swv_load_rules()) — the same
+        // "a directory gets enumerated into per-file includes with no single per-file reference
+        // to find" shape glob()/scandir() already cover, just a WP-core path-joining helper
+        // instead of a filesystem directory listing. Only trusted when the second argument is NOT
+        // a plain literal (a fully-static path_join() call is an ordinary single reference,
+        // already covered elsewhere, not a bulk loader) and the first argument resolves to a
+        // fixed literal directory — see resolvePathJoinFixedPrefix()'s own docblock. Gated the
+        // same way as glob() (FileAnalyzer only trusts this when `hasIncludeStatement` is also
+        // true somewhere in the file), not on any narrower foreach/array_keys() detection — the
+        // co-occurrence itself is the (deliberately coarse) signal.
+        if ($name === 'path_join') {
+            $secondArg = $this->argTokensAt($tokens, $i, 1);
+            $firstArg = $this->argTokensAt($tokens, $i, 0);
+            if (
+                $firstArg !== null
+                && $secondArg !== null
+                && $this->literalPathStringLiteral($secondArg) === null
+                && $this->containsVariable($secondArg)
+            ) {
+                $prefix = $this->resolvePathJoinFixedPrefix($firstArg);
+                if ($prefix !== null) {
+                    [$dirLiteral, $isRootRelative] = $prefix;
+                    if ($isRootRelative) {
+                        $rootRelativeIncludeDirs[] = rtrim($dirLiteral, '/');
+                    } else {
+                        $globIncludeDirs[] = rtrim($dirLiteral, '/');
+                    }
+                }
+            }
+            return;
+        }
+
         if ($name === 'define') {
             $def = $this->parseDefineDirective($tokens, $i);
             if ($def !== null) {
@@ -4413,7 +4645,21 @@ final class PhpTokenParser
         // interpolated string — e.g. get_template_part("variants/$variant") still tells us
         // every "variants/*" file is reachable, even though the exact suffix isn't known.
         // The literal prefix doubles as the exact value when the arg isn't dynamic at all.
-        [, , $path] = $this->extractStringArgAt($tokens, $i, 0, $varLiteralValues, $classConstants, $currentClass, $currentParent, $currentNamespace, $useImports) ?? ['', true, ''];
+        [, $isDynamic, $path] = $this->extractStringArgAt($tokens, $i, 0, $varLiteralValues, $classConstants, $currentClass, $currentParent, $currentNamespace, $useImports) ?? ['', true, ''];
+
+        // locate_template() has no "slug-name" variant convention the way get_template_part()/
+        // get_header()/get_footer()/get_sidebar() do — its argument is meant to be an exact
+        // relative template path, not a slug combined with an unenumerable runtime-chosen
+        // variant. Treating a merely-adjacent literal prefix as "anything under this directory
+        // is reachable" is only justified by that documented WP convention; found via a fresh
+        // gap-hunt (Sage theme's own functions.php, before its own dedicated fix): a genuinely
+        // dynamic locate_template() argument with no other resolvable signal wrongly exempted
+        // its entire containing directory. A fully dynamic locate_template() argument now stays
+        // unresolved instead — the same conservative "no signal, don't guess" behavior
+        // parseIncludeRef() already gives a fully dynamic include.
+        if ($isDynamic && $funcName === 'locate_template') {
+            $path = '';
+        }
 
         // get_header('kiosk') loads header-kiosk.php; prefix the stem so matching works
         if ($path !== '') {
@@ -4463,6 +4709,167 @@ final class PhpTokenParser
             return null;
         }
         return $isPattern ? dirname($pattern) : rtrim($pattern, '/');
+    }
+
+    /** @param list<Token> $tokens */
+    private function containsVariable(array $tokens): bool
+    {
+        foreach ($tokens as $token) {
+            if (is_array($token) && $token[0] === T_VARIABLE) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Resolves path_join()'s first argument to a fixed literal directory: every one of its
+     * (possibly zero) `.`-concatenation terms must be either a plain string literal, a bare
+     * unresolvable named constant (isLiteralPathIgnorableConstantExpression — e.g. Contact Form
+     * 7's own `WPCF7_PLUGIN_DIR`), or get_template_directory()/get_stylesheet_directory()
+     * (isLiteralPathRootDirectoryExpression) — never a variable, which would mean this isn't a
+     * fixed prefix at all. Reuses the exact same three checks the literal-path propagation graph
+     * already relies on for the identical "ignorable absolute anchor + literal path" shape,
+     * rather than re-implementing them.
+     *
+     * A bare unresolvable constant is treated the SAME as a root-relative anchor, not the calling
+     * file's own directory — matching those checks' own established precedent throughout this
+     * parser (a `define()`d PLUGIN_DIR/THEME_DIR-style constant's value is always project-root-
+     * relative, never relative to whichever file happens to reference it).
+     *
+     * @param list<Token> $argTokens
+     * @return array{0:string,1:bool}|null [directory literal, is root-relative]
+     */
+    private function resolvePathJoinFixedPrefix(array $argTokens): ?array
+    {
+        $terms = $this->literalPathConcatenationTerms($argTokens) ?? [$argTokens];
+        $literal = '';
+        $isRootRelative = false;
+        foreach ($terms as $term) {
+            $str = $this->literalPathStringLiteral($term);
+            if ($str !== null) {
+                $literal .= $str;
+                continue;
+            }
+            if ($this->isLiteralPathRootDirectoryExpression($term) || $this->isLiteralPathIgnorableConstantExpression($term)) {
+                $isRootRelative = true;
+                continue;
+            }
+            return null;
+        }
+        return $literal === '' ? null : [$literal, $isRootRelative];
+    }
+
+    /**
+     * How many directory levels above __DIR__ a single argument-expression token list resolves
+     * to, when it's exactly `__DIR__` (0), exactly `__FILE__` (-1 — one level "finer" than
+     * __DIR__, since `dirname(__FILE__) === __DIR__`), or a `dirname(...)`/`plugin_dir_path(...)`
+     * call climbing one level above whatever its own first argument resolves to (WP core's own
+     * `plugin_dir_path()` is defined as `trailingslashit(dirname($file))` — same one-level climb,
+     * plus formatting) — recursively, so `dirname(dirname(__DIR__))` resolves to 2. `dirname()`'s
+     * own optional 2-arg literal-int form (`dirname($path, $levels)`, PHP 7.0+) climbs $levels
+     * directly instead of just one. Returns null for anything else (a literal string, a variable,
+     * a WP path constant, ...) — deliberately narrow, only the exact shapes real-world
+     * spl_autoload_register() bootstrap files were found using. See
+     * maxDirnameAncestorUpLevels()'s own docblock for why this is worth resolving at all.
+     *
+     * @param list<Token> $exprTokens
+     */
+    private function resolveDirAncestorUpLevel(array $exprTokens): ?int
+    {
+        if (count($exprTokens) === 1) {
+            $t = $exprTokens[0];
+            if (is_array($t) && $t[0] === T_DIR) {
+                return 0;
+            }
+            if (is_array($t) && $t[0] === T_FILE) {
+                return -1;
+            }
+            return null;
+        }
+
+        $first = $exprTokens[0];
+        if (!is_array($first) || $first[0] !== T_STRING) {
+            return null;
+        }
+        $calleeName = strtolower($first[1]);
+        if ($calleeName !== 'dirname' && $calleeName !== 'plugin_dir_path') {
+            return null;
+        }
+
+        $innerArg = $this->argTokensAt($exprTokens, 0, 0);
+        if ($innerArg === null) {
+            return null;
+        }
+        $innerLevel = $this->resolveDirAncestorUpLevel($innerArg);
+        if ($innerLevel === null) {
+            return null;
+        }
+
+        if ($calleeName === 'dirname') {
+            $levelsArg = $this->argTokensAt($exprTokens, 0, 1);
+            if ($levelsArg !== null && count($levelsArg) === 1 && is_array($levelsArg[0]) && $levelsArg[0][0] === T_LNUMBER) {
+                return $innerLevel + (int) $levelsArg[0][1];
+            }
+        }
+
+        return $innerLevel + 1;
+    }
+
+    /**
+     * The deepest ancestor-directory climb any `dirname(...)`/`plugin_dir_path(...)` call
+     * anywhere in this file's tokens computes from `__DIR__`/`__FILE__` (see
+     * resolveDirAncestorUpLevel) — 0 when none is found (the common case). Deliberately
+     * whole-file rather than scoped to one specific function's body: consulted only by
+     * FileAnalyzer when the same file also registers a hand-rolled `spl_autoload_register()`
+     * callback, whose own base-path computation commonly climbs above its own file's directory
+     * before descending back into the class-name-derived subpath (real-world case: Broken Link
+     * Checker's `core/utils/autoloader.php` does `plugin_dir_path(dirname(__DIR__))` to reach the
+     * plugin root two levels up before resolving `WPMUDEV_BLC\...` class names against it) —
+     * FileAnalyzer's default assumption (the autoloader's own directory IS the loaded code's
+     * scope) undercounts exactly this shape. Real-world autoloader bootstrap files are small and
+     * single-purpose, so a whole-file scan is the same "coarse but bounded" trade-off the rest of
+     * that exemption mechanism already accepts, not a new precision loss.
+     *
+     * @param list<Token> $tokens
+     */
+    private function maxDirnameAncestorUpLevels(array $tokens): int
+    {
+        $max = 0;
+        foreach ($tokens as $i => $token) {
+            if (!is_array($token) || $token[0] !== T_STRING) {
+                continue;
+            }
+            $calleeName = strtolower($token[1]);
+            if ($calleeName !== 'dirname' && $calleeName !== 'plugin_dir_path') {
+                continue;
+            }
+            if ($this->peekNextMeaningful($tokens, $i) !== '(') {
+                continue;
+            }
+
+            $arg0 = $this->argTokensAt($tokens, $i, 0);
+            if ($arg0 === null) {
+                continue;
+            }
+            $innerLevel = $this->resolveDirAncestorUpLevel($arg0);
+            if ($innerLevel === null) {
+                continue;
+            }
+
+            $level = $innerLevel + 1;
+            if ($calleeName === 'dirname') {
+                $levelsArg = $this->argTokensAt($tokens, $i, 1);
+                if ($levelsArg !== null && count($levelsArg) === 1 && is_array($levelsArg[0]) && $levelsArg[0][0] === T_LNUMBER) {
+                    $level = $innerLevel + (int) $levelsArg[0][1];
+                }
+            }
+
+            if ($level > $max) {
+                $max = $level;
+            }
+        }
+        return $max;
     }
 
     /**
@@ -5818,7 +6225,9 @@ final class PhpTokenParser
      *
      * @param list<Token> $tokens
      * @param list<string> $forLoopVarNameStack
-     * @param list<list<int>> $forLoopVarValuesStack
+     * @param list<list<int|string>> $forLoopVarValuesStack Bounded numeric for-loop values are
+     *   ints; a foreach/collect()->each() string-array domain (see parseCollectEachLoop) is
+     *   strings — plain concatenation below treats both identically.
      * @return array{list<string>, int}|null [enumerated basenames, last consumed token index —
      *   the closing '"']
      */
@@ -6196,6 +6605,90 @@ final class PhpTokenParser
         }
 
         return [$loopVarName, $values];
+    }
+
+    /**
+     * Recognizes `collect([...])->each(function ($param) { ... })` (Roots/Acorn's Laravel-style
+     * fluent Collection iteration) as a bounded literal-domain loop over a plain array of string
+     * literals — the same domain $foreachLoopVarValuesStack already tracks for an ordinary
+     * `foreach ($arrayVar as $var) { ... }`, just spelled the fluent-collection way. Real-world
+     * shape (Sage theme's own functions.php): `collect(['setup', 'filters'])->each(function
+     * ($file) { locate_template("app/{$file}.php", true, true); });` — WordPress's own
+     * `locate_template()` genuinely loads both `app/setup.php` and `app/filters.php`, but neither
+     * had any per-file reference this parser could previously find (the tool had no code
+     * recognizing `Collection`/`->each(` at all).
+     *
+     * Deliberately narrow, bailing rather than guessing at anything more complex: `collect(`
+     * followed by exactly one argument, a plain string-literal array
+     * (parseStringLiteralArrayAt — no keys, no concatenation, at least two elements); `->each(`;
+     * a bare `function ($singleParam)` closure with exactly one plain parameter (no type hint, no
+     * default value, no `use (...)`, no by-reference — no real-world evidence yet for any of
+     * those). Returns [param name, literal values] on a match, to be pushed onto the SAME
+     * $foreachLoopVarNameStack/$foreachLoopVarValuesStack an ordinary foreach uses, scoped to the
+     * closure's own body the same way (see $expectingForeachLoopOpen's own push-on-'{' site) —
+     * every downstream consumer of that domain (resolveForeachConcatenatedLiteral,
+     * resolveInterpolatedLoopSuffixPath, the classArrayKeyLiterals cross-product) works
+     * identically regardless of which loop shape actually seeded it.
+     *
+     * @param list<Token> $tokens
+     * @return array{string,list<string>}|null
+     */
+    private function parseCollectEachLoop(array $tokens, int $collectNameIndex): ?array
+    {
+        $openParenIndex = $this->skipInsignificant($tokens, $collectNameIndex + 1);
+        if (!isset($tokens[$openParenIndex]) || $tokens[$openParenIndex] !== '(') {
+            return null;
+        }
+
+        // argTokensAt() only balances '('/')' (see literalPathCallArgumentTokensAt's own
+        // docblock) — collect()'s own argument is a `[...]` array literal, whose internal
+        // element-separating commas would otherwise be mistaken for top-level argument
+        // separators, splitting one array argument into several bogus ones.
+        $argTokens = $this->literalPathCallArgumentTokensAt($tokens, $collectNameIndex, 0);
+        if ($argTokens === null || $this->literalPathCallArgumentTokensAt($tokens, $collectNameIndex, 1) !== null) {
+            return null;
+        }
+        $values = $this->parseStringLiteralArrayAt($argTokens, 0);
+        if ($values === null) {
+            return null;
+        }
+
+        $closeParenIndex = $this->findMatchingCloseParen($tokens, $openParenIndex);
+        if ($closeParenIndex === null) {
+            return null;
+        }
+
+        $j = $this->skipInsignificant($tokens, $closeParenIndex + 1);
+        if (!isset($tokens[$j]) || !is_array($tokens[$j]) || $tokens[$j][0] !== T_OBJECT_OPERATOR) {
+            return null;
+        }
+        $j = $this->skipInsignificant($tokens, $j + 1);
+        if (!isset($tokens[$j]) || !is_array($tokens[$j]) || $tokens[$j][0] !== T_STRING || strtolower($tokens[$j][1]) !== 'each') {
+            return null;
+        }
+        $j = $this->skipInsignificant($tokens, $j + 1);
+        if (!isset($tokens[$j]) || $tokens[$j] !== '(') {
+            return null;
+        }
+        $j = $this->skipInsignificant($tokens, $j + 1);
+        if (!isset($tokens[$j]) || !is_array($tokens[$j]) || $tokens[$j][0] !== T_FUNCTION) {
+            return null;
+        }
+        $j = $this->skipInsignificant($tokens, $j + 1);
+        if (!isset($tokens[$j]) || $tokens[$j] !== '(') {
+            return null;
+        }
+        $j = $this->skipInsignificant($tokens, $j + 1);
+        if (!isset($tokens[$j]) || !is_array($tokens[$j]) || $tokens[$j][0] !== T_VARIABLE) {
+            return null;
+        }
+        $paramName = $tokens[$j][1];
+        $j = $this->skipInsignificant($tokens, $j + 1);
+        if (!isset($tokens[$j]) || $tokens[$j] !== ')') {
+            return null; // a type hint, default value, or more than one parameter — not attempted
+        }
+
+        return [$paramName, $values];
     }
 
     /**
@@ -6840,7 +7333,20 @@ final class PhpTokenParser
      */
     private function parseAnyStringLiteralArray(array $tokens, int $equalsIndex): ?array
     {
-        $j = $this->skipInsignificant($tokens, $equalsIndex + 1);
+        return $this->parseStringLiteralArrayAt($tokens, $this->skipInsignificant($tokens, $equalsIndex + 1));
+    }
+
+    /**
+     * Same shape/bail rules as parseAnyStringLiteralArray(), factored out so a caller that
+     * already has the array's own starting token index (rather than the `=` before it) can reuse
+     * the exact same parsing — see parseCollectEachLoop()'s own use (`collect([...])`'s bare call
+     * argument, no `=` involved at all).
+     *
+     * @param list<Token> $tokens
+     * @return list<string>|null
+     */
+    private function parseStringLiteralArrayAt(array $tokens, int $j): ?array
+    {
         if (!isset($tokens[$j])) {
             return null;
         }

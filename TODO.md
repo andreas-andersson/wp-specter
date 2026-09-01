@@ -27,6 +27,54 @@ runs at all).
   `jetpack_vendor` hits anywhere in the corpus, and a full `--type=all` sanity pass across all 7
   plugins shows no crashes and no regressions.
 
+- [x] **A hand-rolled `spl_autoload_register()` autoloader whose base-path computation climbs
+  above its own bootstrap file's directory (via `dirname(__DIR__)`/`plugin_dir_path(dirname(...))`
+  /`dirname($path, $levels)`) was still only exempted for that file's own directory tree** — the
+  existing `$autoloadRegisterExemptDirs` exemption (added earlier) already trusted "wherever the
+  registering file lives" as the loaded code's scope, but never accounted for the common case
+  where the bootstrap file is a small utility script one or more directories away from the actual
+  class tree it resolves. Found by a fresh gap-hunting pass over the corpus: **Broken Link
+  Checker**'s `core/utils/autoloader.php` does exactly this —
+  ```php
+  function wpmudev_blc_autoloader( $class_name ) {
+      // ...
+      $plugin_path = rtrim( plugin_dir_path( dirname( __DIR__ ) ) );  // climbs 2 levels: utils -> core -> plugin root
+      $filepath = wp_normalize_path( path_join( path_join( $plugin_path, $namespace_path ), $filename ) );
+      if ( file_exists( $filepath ) ) { include_once $filepath; }
+  }
+  spl_autoload_register( 'wpmudev_blc_autoloader' );
+  ```
+  — resolving classes across ~20+ module directories (`app/admin-pages/*`, `app/http-requests/*`,
+  `app/scheduled-events/*`, ...), none of them under `core/utils/`. **Almost all of BLC's 51
+  `UnusedFile` findings were this exact shape** — every file matching the plugin's own
+  `class-{slug}.php`/`interface-{slug}.php`/`trait-{slug}.php` naming convention, loaded only
+  through this autoloader.
+
+  Fixed generally, not tied to BLC's own names: `PhpTokenParser::maxDirnameAncestorUpLevels()`
+  scans a file's tokens (once, whole-file — same "coarse but bounded" trade-off the rest of this
+  exemption already accepts) for the deepest `dirname(...)`/`plugin_dir_path(...)` climb computed
+  from `__DIR__`/`__FILE__`, handling nesting (`dirname(dirname(__DIR__))`), the single-wrap WP
+  core convention (`plugin_dir_path(X)` climbs one level above `X`, same as `dirname()`, since WP
+  core defines it as `trailingslashit(dirname($file))`), and `dirname()`'s own PHP 7.0+ 2-arg
+  literal-levels form. Recorded on `ParseResult::$dirnameAncestorUpLevels` (0 when no such
+  expression is found — the common case, unchanged from before). `FileAnalyzer` now ascends that
+  many directory segments from the `spl_autoload_register()` caller's own directory
+  (`ascendRelativeDir()`) before recording the exempt scope, instead of always using the caller's
+  own directory verbatim; 0 levels reproduces the exact prior behavior.
+
+  **Scope limitation:** only resolves the specific `dirname()`/`plugin_dir_path()`-chain shapes
+  named above — a base path built from a defined constant, a different WP helper, or any other
+  expression still falls back to the caller's own directory (0 levels), same as before this fix.
+
+  Verified: new `PhpTokenParser` unit tests (six, covering zero-climb, single `plugin_dir_path`
+  wrap, nested `dirname()`, the 2-arg levels form, the `__FILE__`-is-one-level-finer-than-`__DIR__`
+  edge case, and an unresolvable-argument no-op) and three new `FileAnalyzer` end-to-end
+  regressions (ascends correctly, doesn't leak to a sibling directory outside the ascended scope,
+  both alternate code shapes ascend identically). `composer check` is clean (659 tests, PHP-CS-
+  Fixer, PHPStan). Real-world: Broken Link Checker's `--type=files` goes from 51 findings to
+  `✓ All clear`; a full `--type=all` sanity pass across the entire 28-project corpus (13 plugins,
+  15 themes) shows no crashes and no other regressions.
+
 # Parsing / Class & Method Detection — Open Issues
 
 Known gaps in `PhpTokenParser` and the class/method-unused analysis built on top of it
@@ -1290,6 +1338,62 @@ scope limit that trades recall or precision for staying a single-pass, no-depend
   when the flag was designed, but the flag (default-on, escape hatch available) was kept as the
   agreed design rather than re-litigated after the fact.
 
+- [x] **A base class that's essentially always absent from any individual project's own scan —
+  because it belongs to a separate, widely-installed third-party platform (not WP core, but
+  comparably ubiquitous) — had no contract-method exemption at all.** `isContractMethod()`'s
+  chain walk already had two ways to resolve an ancestor: an in-scan `ClassDef`, or
+  `VendorClassReflector` (Composer-autoload reflection) — neither applies to a *separate,
+  non-Composer-vendored WordPress plugin* the scanned theme/plugin merely integrates with, the
+  exact same "never present in this scan, never reflectable" situation `BASE_CLASS_CONTRACT_METHODS`
+  already exists to solve for WP core (Walker/WP_Customize_*/WP_Upgrader_Skin/WP_List_Table —
+  none of those are ever bundled inside a scanned theme/plugin's own directory either). Found by
+  a fresh gap-hunting pass over the corpus: Kadence theme's
+  `inc/components/elementor_pro/class-elementor-dynamic-colors.php` —
+  `class Elementor_Dynamic_Colors extends \ElementorPro\Modules\DynamicTags\Tags\Base\Data_Tag`
+  — **all 6 of its own methods** (`get_name`/`get_title`/`get_group`/`get_categories`/
+  `register_controls`/`get_value`) false-flagged `UnusedMethod` (100% of that one class's own
+  methods) — genuinely dead code was indistinguishable from Elementor's own dynamic-tag override
+  contract with zero information about Elementor Pro's class hierarchy available anywhere in the
+  scan.
+
+  Confirmed the general mechanism (`isContractMethod`'s existing polymorphic/descendant-call
+  machinery) already resolves this correctly *whenever the declaring plugin is scanned alongside
+  the integrating theme* (verified with a minimal fixture: an abstract base class + subclass
+  override, scanned together vs. the subclass scanned alone) — so this genuinely isn't an
+  analysis bug when the dependency is in scope, only when it's entirely absent, which is the
+  overwhelmingly common real case (most theme/plugin scans don't also bundle every third-party
+  platform they integrate with).
+
+  Fixed the same way WP core's own absence-from-scan problem already is: a new curated
+  `ELEMENTOR_DATA_TAG_CONTRACT_METHODS` entry in `BASE_CLASS_CONTRACT_METHODS`, keyed by short
+  name (`Data_Tag`, same bare-short-name-match convention every other entry in this list already
+  uses). Verified directly against free Elementor's own (open-source, present in the corpus)
+  `core/dynamic-tags/base-tag.php`/`data-tag.php` — Elementor Pro's own `Tags\Base\Data_Tag`
+  mirrors this same architecture: `get_name()` is `Controls_Stack`'s own `abstract` method every
+  Elementor "stack" (widget/control/tag) must implement; `get_title()`/`get_categories()`/
+  `get_group()` are `Base_Tag`'s own `abstract` methods `Data_Tag` doesn't provide a default for;
+  `get_value()` is `Data_Tag`'s own `abstract` method (its sibling abstracts, `get_content()`/
+  `get_content_type()`, are already implemented concrete/`final` on `Data_Tag` itself, so
+  deliberately left off this list — not part of a `Data_Tag` subclass's own contract);
+  `register_controls()` is `Controls_Stack`'s own empty-stub template method
+  (`protected function register_controls() {}`), the same "always overridden, never called
+  externally" shape `WP_Widget`'s own `form()`/`update()` already get here.
+
+  **Scope limitation:** deliberately narrow to the exact evidenced shape (`Data_Tag`) rather than
+  speculatively curating Elementor's much larger surface (`Widget_Base`, `Group_Control_Base`,
+  `Base_Tag` extended directly, ...) without its own real-world evidence — a future gap-hunting
+  pass surfacing one of those should add its own entry the same way, not extend this one by
+  guesswork. A bare short-name match (not FQCN-verified, matching every other
+  `BASE_CLASS_CONTRACT_METHODS` entry's own existing precedent) carries the same small collision
+  risk as `Walker`/`Composer` already do — accepted here for consistency rather than special-
+  cased to a stricter check just for this one entry.
+
+  Verified: new `ClassAnalyzer` end-to-end regression
+  (`testExcludesElementorDataTagContractMethods`). `composer check` is clean (666 tests, PHP-CS-
+  Fixer, PHPStan). Real-world: Kadence's `UnusedMethod` count drops 30 → 24 (exactly the 6
+  targeted methods); a full `--type=all` sanity pass across the entire 28-project corpus shows no
+  crashes and no other regressions (no `Data_Tag`-named collisions anywhere else in the corpus).
+
 ## Suggested priority if picked back up
 
 Items checked above are done. Remaining, in rough priority order:
@@ -2082,6 +2186,243 @@ not shipped bugs.
     qualified, so only wiring the bare-name branch would have missed half the evidence.
   Verified: wp-nested-pages' unused-file count drops 30 → 25 (all 5 targeted findings gone), no
   regressions and no crashes across the full corpus.
+
+- [x] **A wrapper function's own parameter, conditionally reassigned to the result of a SEPARATE,
+  bare (unscoped) wrapper call whose argument feeds the same parameter back in via curly-brace
+  string interpolation, was not resolved at all — three independent gaps stacked in the same real
+  call chain.** Found by a fresh gap-hunting pass over the corpus: Advanced Custom Fields'
+  `acf_get_view( $view_path, $view_args )`:
+  ```php
+  function acf_get_view( $view_path = '', $view_args = array() ) {
+      if ( substr( $view_path, -4 ) !== '.php' ) {
+          $view_path = acf_get_path( "includes/admin/views/{$view_path}.php" );
+      }
+      if ( file_exists( $view_path ) ) { include $view_path; }
+  }
+  function acf_get_path( $filename = '' ) {
+      return ACF_PATH . ltrim( $filename, '/' );
+  }
+  ```
+  called as `acf_get_view('global/header')`, `acf_get_view('tools/tools')`, etc. — **all 26 of
+  ACF's `UnusedFile` findings** were files reached only through this one chain, despite every real
+  call site passing a plain literal string with no dynamic segment at all.
+
+  Three separate, independently-evidenced gaps in `PhpTokenParser`'s literal-path propagation
+  graph (`LiteralPathPropagationResolver`), each fixed generally rather than for ACF's own names:
+  1. **`dirname()`/`plugin_dir_path()`-shaped depth-tracking helpers
+     (`literalPathStatementTokens()`, `literalPathCallArgumentTokensAt()`) mistook a curly-brace
+     string interpolation's `T_CURLY_OPEN`/closing `"}"` pair for a code-level bracket
+     mismatch** — `T_CURLY_OPEN` is an array token (never equal to the bare-string `'{'` these
+     depth-trackers matched), so it never incremented their `$depth` counter, but its closing
+     `"}"` (a bare string) *did* decrement it — hitting `$depth === 0` and discarding the whole
+     statement/argument the instant any interpolated `"...{$var}..."` string appeared inside it.
+     The main token loop already solves this exact problem for its own top-level brace-depth
+     tracking via a dedicated `$interpolationDepth` counter (see its own comment) — these two
+     standalone helpers just never got the same treatment. Fixed with a shared
+     `isInterpolationCurlyOpen()` check and a mirrored `$interpDepth` counter in each.
+  2. **A bare (unscoped) wrapper call was never recognized as an assignment/return-value
+     pass-through at all** — `resolveLiteralPathAssignmentSource()`'s callee resolution only ever
+     tried `literalPathScopedCallTarget()` (`Class::`/`self::`/`parent::`/`static::`), so
+     `$view_path = acf_get_path(...)` resolved to nothing, the same "opaque, arguments handled
+     separately" treatment a scoped call already gets — but restricted to a name PHP itself
+     doesn't already know as a real, loaded function (`function_exists()`): a genuine PHP/
+     extension builtin can never have a project-file body for its own return statement to
+     populate, so treating one as a pass-through would only ever be a dead-end graph node —
+     confirmed against the existing `str_replace()` regression
+     (`testLiteralPathPropagationDoesNotTreatArbitraryTransformAsAPathTemplate`), which must keep
+     failing to resolve.
+  3. **A curly-brace-interpolated call argument (`"prefix{$var}suffix"`) was never recognized as a
+     literal-path expression at all** — `resolveLiteralPathExpressionTokens()`/
+     `literalPathConcatenationTerms()` only ever understood `.`-concatenation, and this shape has
+     no top-level `.` token to split on (it's a single interpolated-string token sequence).
+     `interpolatedPrefixCurlyVarSuffixAt()` already existed (built for the unrelated class-name-
+     transform mechanism) and matches this exact shape — reused directly rather than teaching a
+     second, separate interpolation parser.
+  4. **A self-referential reassignment (the same variable read as the wrapper call's own
+     argument) resolved the argument against the variable's NEW value instead of the value it
+     held when the call was evaluated**, once (1)-(3) above made resolution possible at all —
+     `captureLiteralPathAssignment()` commits `$nodes[$address] = $targetNode` immediately, before
+     the main loop's forward scan ever reaches the RHS call's own token to run the ordinary
+     per-call-site argument capture that every bare call already gets — for a self-referential
+     wrapper call, that later capture read the *already-reassigned* node. Fixed by having
+     `resolveLiteralPathAssignmentSource()` synchronously invoke that same argument capture
+     itself, using the still-current (pre-reassignment) node snapshot, before returning. The
+     later, now-redundant capture still fires too (using the reassigned node) — a harmless
+     dead-end/duplicate link, bounded by the resolver's existing `MAX_LINK_HOPS`, not a
+     correctness issue (confirmed: it never produces an extra *resolved* path that matches a real
+     file, only extra unreachable or longer/repeated-affix graph noise).
+
+  **Scope limitation:** the bare-call fallback resolves only to the unqualified function name —
+  it doesn't also try a current-namespace-prefixed candidate the way
+  `literalPathBareFunctionKeys()` does elsewhere (no real-world evidence yet of a namespaced
+  project using this exact shape). A handful of ACF's own `acf_get_view()` call sites remain
+  correctly unresolved for an unrelated, harder reason: a *dynamic* first path segment from a
+  property value (`acf_get_view( $this->post_type . '/basic-settings' )`) — genuinely
+  unenumerable without inferring every value `$post_type` takes across the class hierarchy, not a
+  literal call-site argument at all, so out of scope here.
+
+  Verified: 4 new parser-level regressions (interpolated-argument linking, the full self-
+  referential chain end-to-end, a real-PHP-builtin negative case, plus the pre-existing
+  arbitrary-transform regression staying green) and one new `FileAnalyzer` end-to-end regression
+  reproducing the exact ACF shape. `composer check` is clean (663 tests, PHP-CS-Fixer, PHPStan).
+  Real-world: Advanced Custom Fields' `--type=files` count drops 26 → 10 (every plain-literal
+  `acf_get_view()` call site resolves; the 10 remaining are the dynamic-property-prefix case
+  above, plus two unrelated genuinely-dead classes); a full `--type=all` sanity pass across the
+  entire 28-project corpus shows no crashes and no other regressions.
+
+- [x] **A directory built from a plugin-root constant and enumerated per-item via `path_join()`
+  (rather than a filesystem `glob()`/`scandir()` listing) had no bulk-loader recognition at
+  all.** Found by a fresh gap-hunting pass over the corpus: Contact Form 7's
+  `wpcf7_swv_load_rules()`:
+  ```php
+  function wpcf7_swv_available_rules() {
+      $rules = array( 'required' => '...RequiredRule', 'email' => '...EmailRule', /* ~24 entries */ );
+      return apply_filters( 'wpcf7_swv_available_rules', $rules );
+  }
+  function wpcf7_swv_load_rules() {
+      foreach ( array_keys( wpcf7_swv_available_rules() ) as $rule ) {
+          $file = sprintf( '%s.php', $rule );
+          $path = path_join( WPCF7_PLUGIN_DIR . '/includes/swv/php/rules', $file );
+          if ( file_exists( $path ) ) { include_once $path; }
+      }
+  }
+  ```
+  **24 of CF7's 47 `UnusedFile` findings** were every file under `includes/swv/php/rules/`,
+  reached only through this loop.
+
+  Fixed generally rather than for CF7's own names or the specific `array_keys()`/`sprintf()`
+  shape that happens to enumerate the domain: `path_join()` (a common WP-core path-joining
+  helper, the same "curated, framework-level convention" carve-out `plugin_dir_path()` already
+  gets) joins a fixed prefix with a per-iteration dynamic component reaching an include — the
+  same "a directory gets enumerated into per-file includes with no single per-file reference to
+  find" co-occurrence signal `glob()`/`scandir()` already cover, just a different enumeration
+  mechanism. `PhpTokenParser::resolvePathJoinFixedPrefix()` resolves `path_join()`'s first
+  argument to a fixed literal directory only when every one of its `.`-concatenation terms is a
+  plain string literal, a bare unresolvable named constant, or
+  get_template_directory()/get_stylesheet_directory() — reusing the exact same three checks the
+  literal-path propagation graph already relies on for the identical "ignorable absolute anchor +
+  literal path" shape, rather than a fourth reimplementation. Only trusted when the SECOND
+  argument is not a plain literal (a fully-static `path_join()` call is an ordinary single
+  reference, not a bulk loader) — deliberately not gated on any narrower `foreach`/`array_keys()`
+  detection at all, since the co-occurrence itself (a non-literal second argument reaching a
+  resolvable fixed first argument, file existence checked, then included) is already the coarse,
+  bounded signal, matching this project's established design philosophy throughout.
+
+  A bare unresolvable constant here (e.g. `WPCF7_PLUGIN_DIR`) is treated as project-root-relative,
+  not relative to the file that mentions it — matching the SAME established precedent the
+  literal-path graph's own "ignorable constant" recognition already follows (a `define()`d
+  PLUGIN_DIR/THEME_DIR-style constant's value is always project-root-relative). Getting this
+  wrong silently defeats the exemption entirely (the resolved directory would never match any
+  real file, rather than falsely matching the wrong one) — worth calling out since it's an easy
+  mistake to make when adding a new anchor-recognizing call site.
+
+  **Scope limitation:** only resolves the fixed *directory* — it does not attempt to enumerate
+  which specific files exist for which keys (unlike `glob()`, there's no directory listing to
+  read), so this is a wholesale directory exemption, not a per-file exact-path resolution. Also
+  found, but out of THIS gap's scope: CF7's own `modules/` directory is loaded through a
+  *different*, still-unfixed wrapper (`wpcf7_include_module_file( $path )`, a single-hop literal-
+  path-propagation case built from a local variable holding a constant rather than a concatenation
+  term the graph's existing "ignorable constant" recognition matches) — listed here only so a
+  future pass doesn't re-discover it from scratch; it accounts for the rest of CF7's remaining
+  `UnusedFile` findings.
+
+  Verified: two new `FileAnalyzer` end-to-end regressions (bulk-exempts the real shape and
+  correctly resolves it as project-root- rather than caller-relative; a fully-static `path_join()`
+  call does NOT exempt anything). `composer check` is clean (665 tests, PHP-CS-Fixer, PHPStan).
+  Real-world: Contact Form 7's `--type=files` count drops 47 → 24 (every file under
+  `includes/swv/php/rules/` resolves; the remaining 24 are the separate `modules/` gap above); a
+  full `--type=all` sanity pass across the entire 28-project corpus shows no crashes and no other
+  regressions.
+
+- [x] **`collect([...])->each(closure)` (Laravel/Acorn's fluent Collection iteration) had zero
+  recognition as a bounded literal-domain loop — the tool had no code recognizing
+  `Collection`/`->each(` at all**, unlike an ordinary `foreach ($arrayVar as $var) { ... }`, which
+  this parser already tracks. Found by a fresh gap-hunting pass over the corpus: Sage theme's own
+  `functions.php` —
+  ```php
+  collect(['setup', 'filters'])
+      ->each(function ($file) {
+          if (! locate_template($file = "app/{$file}.php", true, true)) {
+              wp_die(/* ... */);
+          }
+      });
+  ```
+  — both `app/setup.php` and `app/filters.php` are genuinely loaded by WP core's own
+  `locate_template()`, but neither had any per-file reference this parser could previously find.
+
+  Fixed generally, not tied to Sage's own file names: `PhpTokenParser::parseCollectEachLoop()`
+  recognizes `collect(` immediately followed by a plain string-literal array (no keys, no
+  concatenation, at least two elements — the exact same `parseStringLiteralArrayAt()` bail rules
+  an ordinary `foreach` over a literal array already uses; factored out of
+  `parseAnyStringLiteralArray()` so both share one implementation), then `->each(`, then a bare
+  `function ($singleParam)` closure with exactly one plain parameter. On a match, the closure's
+  own parameter is pushed onto the SAME `$foreachLoopVarNameStack`/`$foreachLoopVarValuesStack` an
+  ordinary foreach already populates, scoped to the closure's own body the same way — every
+  downstream consumer of that domain (the interpolated-string path enumeration used here,
+  concatenated-literal enumeration, the `classArrayKeyLiterals` cross-product) works identically
+  regardless of which loop shape actually seeded it, with no changes needed anywhere else.
+  `resolveInterpolatedLoopSuffixPath()`'s own call site (previously only fed the bounded-for-loop
+  domain — Astra's numbered icon files) now also tries the foreach/collect domain, which is what
+  actually resolves Sage's own `"app/{$file}.php"` curly-interpolation shape.
+
+  Found and fixed as a **pre-existing, unrelated bug** along the way (surfaced only while writing
+  this fix's own tests, not present in the real Sage corpus finding itself): `argTokensAt()`
+  doesn't track `[`/`]` bracket depth at all (documented and deliberate — see
+  `literalPathCallArgumentTokensAt()`'s own docblock), so calling it on `collect(['setup',
+  'filters'])`'s single array argument split it into two bogus arguments at the array's own
+  internal comma. Fixed by using `literalPathCallArgumentTokensAt()` (which already tracks
+  `(`/`[`/`{` all three) instead, for this call site only — not a behavior change anywhere
+  `argTokensAt()` is already used correctly today.
+
+  **Scope limitation:** bails (no enumeration, not a crash) on anything beyond the exact
+  evidenced shape — a typed/defaulted/multi-parameter closure, `use (...)`, a keyed or
+  concatenation-built array, `collect()` fed a variable instead of a literal array inline. Also
+  surfaced, but confirmed **separate and pre-existing** (not touched by this fix): a
+  template-loader call whose literal argument is *itself* unresolvably interpolated (no
+  reassignment, no tracked bounded variable — a shape this fix's own test fixtures accidentally
+  exercised before being corrected to match Sage's real code) made `parseTemplateRef()` fall back
+  to treating a directory-ish text prefix (e.g. `"app/"` from `"app/{$x}.php"`) as broadly
+  "referenced," a wholesale-directory match far coarser than a single resolved file — since fixed,
+  see the entry directly below.
+
+  Verified: 5 new `PhpTokenParser` unit tests (basic enumeration, the exact real reassignment-in-
+  argument shape, a keyed-array negative, a multi-parameter-closure negative) and one new
+  `FileAnalyzer` end-to-end regression reproducing Sage's real code verbatim (with a genuine
+  orphan file confirming this doesn't over-exempt the directory). `composer check` is clean (671
+  tests, PHP-CS-Fixer, PHPStan). Real-world: Sage theme's `--type=files` goes from 1 finding to
+  `✓ All clear`; a full `--type=all` sanity pass across the entire 28-project corpus shows no
+  crashes and no other regressions.
+
+- [x] **`locate_template()` got the same "a merely dynamic argument's literal prefix still
+  signals every file under it is reachable" treatment `get_template_part()`/`get_header()`/
+  `get_footer()`/`get_sidebar()` deliberately get — but unlike those, `locate_template()` has no
+  documented "slug-name" variant convention to justify it.** `get_template_part("variants/
+  $variant")` genuinely does mean "any `variants/*.php` file might load depending on runtime
+  context" — a real, documented WP convention. `locate_template()` is a lower-level, generic
+  "find and load the first existing path from a candidate list" function with no such
+  convention; its argument is meant to be an exact relative template path. Found while fixing the
+  `collect()->each()` gap directly above: a `locate_template()` call with a genuinely dynamic
+  argument and no other resolvable signal (no bounded loop/closure-parameter domain, no
+  reassignment) wrongly exempted its *entire containing directory* — e.g. `locate_template(
+  "app/{$file}.php")` with `$file` untracked silently hid every other file under `app/`, not just
+  ones a bounded loop actually enumerates.
+
+  Fixed: `parseTemplateRef()` now discards the resolved value when the argument classified as
+  dynamic AND the calling function is specifically `locate_template` — the same conservative "no
+  signal, don't guess" behavior `parseIncludeRef()` already gives a fully dynamic `include`.
+  `get_template_part`/`get_header`/`get_footer`/`get_sidebar`'s own coarse-prefix behavior is
+  completely unchanged (still exactly the `isDynamic` flag being ignored for those, as before).
+
+  Verified: new `PhpTokenParser` unit test (a `locate_template()` call resolves to an empty path
+  instead of the coarse prefix) and a new `FileAnalyzer` end-to-end regression (an orphaned
+  sibling file under the same prefix is still correctly reported). The pre-existing
+  `get_template_part()` variant-prefix regression stays green, confirming no behavior change for
+  the functions that DO have real evidence for this treatment. `composer check` is clean (673
+  tests, PHP-CS-Fixer, PHPStan). A full `--type=all` sanity pass across the entire 28-project
+  corpus shows no crashes and identical finding counts everywhere (no current real-world project
+  in the corpus happens to hit this exact shape outside Sage, whose own finding was already
+  resolved by the `collect()->each()` fix above) — a forward-looking correctness fix, not a
+  count-changing one in this corpus.
 
 # Function, Hook & Template Detection — Open Issues
 

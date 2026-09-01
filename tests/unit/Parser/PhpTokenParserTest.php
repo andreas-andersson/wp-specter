@@ -380,6 +380,24 @@ get_template_part("inc/shortcodes/gk-card-list/variants/$variant", null);
         self::assertSame('inc/shortcodes/gk-card-list/variants/', $result->templateRefs[0]->path);
     }
 
+    public function testLocateTemplateInterpolatedStringDoesNotKeepLiteralPrefix(): void
+    {
+        // Unlike get_template_part()/get_header()/get_footer()/get_sidebar() (see the coarse
+        // literal-prefix-as-reachability-signal test just above), locate_template() has no
+        // "slug-name" variant convention — its argument is meant to be an exact relative
+        // template path, not a slug combined with an unenumerable runtime-chosen variant.
+        // Real-world regression surfaced while gap-hunting Sage theme's own functions.php: a
+        // genuinely dynamic locate_template() argument with no other resolvable signal was
+        // wrongly treated as "anything under this directory is reachable" (`"app/"` from
+        // `"app/{$file}.php"` where $file isn't a tracked bounded variable), silently exempting
+        // every other file under app/ too, not just the ones a bounded loop actually enumerates.
+        $result = $this->parse('<?php
+locate_template("app/{$file}.php", true, true);
+');
+        self::assertCount(1, $result->templateRefs);
+        self::assertSame('', $result->templateRefs[0]->path);
+    }
+
     public function testFullyDynamicIncludeSkipped(): void
     {
         $result = $this->parse('<?php
@@ -443,6 +461,58 @@ $images = glob(__DIR__ . "/images/*.jpg");
 ');
         self::assertSame(['/images'], $result->globIncludeDirs);
         self::assertFalse($result->hasIncludeStatement);
+    }
+
+    public function testDirnameAncestorUpLevelsIsZeroWithNoAncestorClimb(): void
+    {
+        $result = $this->parse('<?php
+$path = __DIR__ . "/inc/foo.php";
+');
+        self::assertSame(0, $result->dirnameAncestorUpLevels);
+    }
+
+    public function testDirnameAncestorUpLevelsCountsASinglePluginDirPathWrap(): void
+    {
+        // Real-world shape (Broken Link Checker): plugin_dir_path(dirname(__DIR__)) climbs 2
+        // levels total — 1 from the inner dirname(__DIR__), 1 more from plugin_dir_path() itself
+        // (WP core defines it as trailingslashit(dirname($file))).
+        $result = $this->parse('<?php
+$path = plugin_dir_path( dirname( __DIR__ ) );
+');
+        self::assertSame(2, $result->dirnameAncestorUpLevels);
+    }
+
+    public function testDirnameAncestorUpLevelsCountsNestedDirnameCalls(): void
+    {
+        $result = $this->parse('<?php
+$path = dirname( dirname( __DIR__ ) );
+');
+        self::assertSame(2, $result->dirnameAncestorUpLevels);
+    }
+
+    public function testDirnameAncestorUpLevelsUsesDirnameLevelsArgument(): void
+    {
+        $result = $this->parse('<?php
+$path = dirname( __DIR__, 3 );
+');
+        self::assertSame(3, $result->dirnameAncestorUpLevels);
+    }
+
+    public function testDirnameAncestorUpLevelsTreatsFileAsOneLevelFinerThanDir(): void
+    {
+        // dirname(__FILE__) === __DIR__ — a single wrap around __FILE__ climbs 0 levels, not 1.
+        $result = $this->parse('<?php
+$path = dirname( __FILE__ );
+');
+        self::assertSame(0, $result->dirnameAncestorUpLevels);
+    }
+
+    public function testDirnameAncestorUpLevelsIgnoresUnresolvableArgument(): void
+    {
+        $result = $this->parse('<?php
+$path = dirname( $some_var );
+');
+        self::assertSame(0, $result->dirnameAncestorUpLevels);
     }
 
     public function testReportsCorrectLineNumbers(): void
@@ -1545,6 +1615,62 @@ for ($i = 0; $i < 3; $i++) {
         self::assertEmpty($result->phpPathStrings);
     }
 
+    public function testCollectEachEnumeratesEveryPhpPathString(): void
+    {
+        // Real-world shape (Sage theme's own functions.php): `collect(['setup', 'filters'])
+        // ->each(function ($file) { locate_template("app/{$file}.php", true, true); });` — Roots/
+        // Acorn's Laravel-style fluent Collection iteration, the same bounded literal-domain loop
+        // an ordinary `foreach` already gets, just spelled the fluent-collection way. Neither
+        // "app/setup.php" nor "app/filters.php" had any per-file reference before this.
+        $result = $this->parse('<?php
+collect(["setup", "filters"])
+    ->each(function ($file) {
+        locate_template("app/{$file}.php", true, true);
+    });
+');
+        self::assertSame(['app/setup.php', 'app/filters.php'], $result->phpPathStrings);
+    }
+
+    public function testCollectEachWithReassignmentInsideCallArgumentStillEnumerates(): void
+    {
+        // Sage's actual real-world code reassigns the closure parameter as a side effect of the
+        // locate_template() call argument itself (`locate_template($file = "app/{$file}.php",
+        // true, true)`) — must resolve identically to the simpler direct-argument shape above.
+        $result = $this->parse('<?php
+collect(["setup", "filters"])
+    ->each(function ($file) {
+        if (! locate_template($file = "app/{$file}.php", true, true)) {
+            wp_die($file);
+        }
+    });
+');
+        self::assertSame(['app/setup.php', 'app/filters.php'], $result->phpPathStrings);
+    }
+
+    public function testCollectEachWithoutStringLiteralArrayIsNotEnumerated(): void
+    {
+        // Not the recognized shape at all (a keyed array) — must leave the loop variable
+        // completely untracked, no enumeration, no crash.
+        $result = $this->parse('<?php
+collect(["a" => "setup", "b" => "filters"])
+    ->each(function ($file) {
+        locate_template("app/{$file}.php");
+    });
+');
+        self::assertEmpty($result->phpPathStrings);
+    }
+
+    public function testCollectEachWithMultipleClosureParametersIsNotEnumerated(): void
+    {
+        $result = $this->parse('<?php
+collect(["setup", "filters"])
+    ->each(function ($file, $index) {
+        locate_template("app/{$file}.php");
+    });
+');
+        self::assertEmpty($result->phpPathStrings);
+    }
+
     public function testUnboundedForLoopDoesNotEnumerateConcatenatedLiterals(): void
     {
         // A non-canonical for-loop (non-literal bound) must leave the loop variable completely
@@ -2257,6 +2383,91 @@ class General {
         ));
         self::assertCount(1, $pathLinks);
         self::assertSame('emails/general-', $pathLinks[0]->prefix);
+    }
+
+    public function testCurlyInterpolatedCallArgumentLinksIntoCalleeParameterNode(): void
+    {
+        // "prefix{$var}suffix" is curly-brace complex string interpolation, not `.`
+        // concatenation — a call argument built this way (real-world shape, ACF's own
+        // acf_get_view() calling acf_get_path()) previously produced no link at all: the
+        // argument-extraction depth-tracker mistook the interpolation's T_CURLY_OPEN/"}" pair for
+        // a real code-level bracket mismatch and discarded the whole argument.
+        $result = $this->parse('<?php
+function outer( $name ) {
+    inner( "prefix/{$name}.php" );
+}
+function inner( $path ) {}
+');
+        $link = null;
+        foreach ($result->literalPathPropagationLinks as $candidate) {
+            if ($candidate->prefix === 'prefix/' && $candidate->suffix === '.php') {
+                $link = $candidate;
+            }
+        }
+        self::assertNotNull($link);
+        self::assertSame('outer#param:0', $link->fromNode);
+        self::assertSame('inner#param:0', $link->toNode);
+    }
+
+    public function testSelfReassigningBareWrapperCallResolvesThroughItsOwnArgument(): void
+    {
+        // The exact ACF shape: a function conditionally reassigns its own parameter to the result
+        // of a SEPARATE bare (unscoped) wrapper call whose sole argument is that same parameter,
+        // fed back in via curly-brace interpolation. This exercises two things together: (1) a
+        // bare call being recognized at all as an assignment RHS pass-through (previously only a
+        // scoped Class::/self::/parent::/static:: call was), and (2) that call's own argument
+        // being linked using the value the parameter held BEFORE the reassignment, not after —
+        // the reassignment must not silently clobber the node before this same statement's own
+        // call site is captured against it.
+        $result = $this->parse('<?php
+function acf_get_view( $view_path ) {
+    $view_path = acf_get_path( "views/{$view_path}.php" );
+    include $view_path;
+}
+function acf_get_path( $filename ) {
+    return ACF_PATH . $filename;
+}
+');
+        // The call site is deliberately captured twice (once synchronously against the pre-
+        // reassignment node, from the *correct* value; once more by the main loop's own generic
+        // per-call-site capture once it reaches this same call's token later in the statement,
+        // by then using the *already-reassigned* node) — the second is harmless duplicate noise
+        // (a dead-end/mismatched extra link the resolver never needs), not a regression, so this
+        // asserts the correct link EXISTS rather than that it's the only one.
+        $argumentLinkFromOriginalParam = null;
+        $sinkLink = null;
+        foreach ($result->literalPathPropagationLinks as $candidate) {
+            if ($candidate->toNode === 'acf_get_path#param:0' && $candidate->fromNode === 'acf_get_view#param:0') {
+                $argumentLinkFromOriginalParam = $candidate;
+            }
+            if ($candidate->isSink) {
+                $sinkLink = $candidate;
+            }
+        }
+        self::assertNotNull($argumentLinkFromOriginalParam, 'the call argument must link from the ORIGINAL parameter node, not only the reassigned one');
+        self::assertSame('views/', $argumentLinkFromOriginalParam->prefix);
+        self::assertSame('.php', $argumentLinkFromOriginalParam->suffix);
+        self::assertNotNull($sinkLink);
+    }
+
+    public function testBareCallToARealPhpFunctionIsNotTreatedAsAPathWrapper(): void
+    {
+        // function_exists() distinguishes a project-defined wrapper (never already loaded) from
+        // a genuine PHP/extension builtin, which can never have a project-file body for its own
+        // return statement to populate — trim() is used here instead of
+        // testLiteralPathPropagationDoesNotTreatArbitraryTransformAsAPathTemplate's str_replace()
+        // to cover a distinct builtin, not re-assert the same one.
+        $result = $this->parse('<?php
+function wrap( $name ) {
+    $path = trim( $name );
+    require $path;
+}
+wrap( "inc/orphan" );
+');
+        self::assertEmpty(array_filter(
+            $result->literalPathPropagationLinks,
+            fn($link) => $link->isSink,
+        ));
     }
 
     public function testLiteralPathPropagationDoesNotTreatArbitraryTransformAsAPathTemplate(): void

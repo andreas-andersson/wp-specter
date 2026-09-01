@@ -250,6 +250,13 @@ final class ParseResult
      *                                           `array_map()` closure, and the literal looks like
      *                                           a snake_case function-name prefix) that keep this
      *                                           narrow.
+     * @param int $dirnameAncestorUpLevels The deepest ancestor-directory climb any
+     *                                           `dirname(...)`/`plugin_dir_path(...)` call in
+     *                                           this file computes from `__DIR__`/`__FILE__` —
+     *                                           see PhpTokenParser::maxDirnameAncestorUpLevels().
+     *                                           0 when none found. Consulted only by
+     *                                           FileAnalyzer, only for a file that also registers
+     *                                           a hand-rolled spl_autoload_register() callback.
      */
     public function __construct(
         public readonly string $file,
@@ -288,6 +295,7 @@ final class ParseResult
         public readonly array $classNameTransformTemplates = [],
         public readonly array $functionArrayReturns = [],
         public readonly array $functionNameTransformTemplates = [],
+        public readonly int $dirnameAncestorUpLevels = 0,
         public readonly ?string $error = null,
     ) {}
 }

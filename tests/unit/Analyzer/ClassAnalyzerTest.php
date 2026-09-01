@@ -844,6 +844,37 @@ class My_Upgrader_Skin extends Plugin_Installer_Skin {
         self::assertContains('truly_unused_skin', $unusedMethods);
     }
 
+    public function testExcludesElementorDataTagContractMethods(): void
+    {
+        // Real-world finding (Kadence theme): Elementor_Dynamic_Colors extends
+        // \ElementorPro\Modules\DynamicTags\Tags\Base\Data_Tag — Elementor/Elementor Pro is a
+        // separate plugin, never present as a project ClassDef or reflectable vendor class in a
+        // scan of just the theme that integrates with it (same "class absent from this scan"
+        // shape WP core's own curated lists above exist for). All 6 of these are called only by
+        // Elementor's own tag-manager/controls-stack rendering pipeline, never by a visible name
+        // reference in the theme's own code.
+        $file = $this->write('<?php
+class My_Dynamic_Tag extends \ElementorPro\Modules\DynamicTags\Tags\Base\Data_Tag {
+    public function get_name() { return "my-tag"; }
+    public function get_title() { return "My Tag"; }
+    public function get_categories() { return []; }
+    public function get_group() { return "site"; }
+    protected function get_value( array $options = [] ) { return "value"; }
+    protected function register_controls() {}
+    public function truly_unused_tag(): void {}
+}
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('get_name', $unusedMethods);
+        self::assertNotContains('get_title', $unusedMethods);
+        self::assertNotContains('get_categories', $unusedMethods);
+        self::assertNotContains('get_group', $unusedMethods);
+        self::assertNotContains('get_value', $unusedMethods);
+        self::assertNotContains('register_controls', $unusedMethods);
+        self::assertContains('truly_unused_tag', $unusedMethods);
+    }
+
     public function testExcludesWalkerContractMethodsWhenBaseClassNameHasWrongCase(): void
     {
         // Real-world regression found in bootscore's own navwalker: `extends Walker_Nav_menu`

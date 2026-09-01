@@ -424,6 +424,50 @@ PHP);
         return $this->write('vendor/composer/' . $filename, $code);
     }
 
+    public function testCollectEachLoopResolvesEveryTemplateFile(): void
+    {
+        // Real-world shape (Sage theme's own functions.php, verbatim): Roots/Acorn's fluent
+        // Collection ->each() iterating a plain literal array of theme-file basenames, each one
+        // located via WP core's own locate_template() — the loop variable is reassigned as a
+        // side effect of the call argument itself (`locate_template($file = "app/{$file}.php",
+        // ...)`). Both files are genuinely loaded; neither had any per-file reference before this
+        // (the tool had no code recognizing Collection/->each() at all).
+        $bootstrap = $this->write('functions.php', '<?php
+collect(["setup", "filters"])
+    ->each(function ($file) {
+        if (! locate_template($file = "app/{$file}.php", true, true)) {
+            wp_die($file);
+        }
+    });
+');
+        $setup = $this->write('app/setup.php', '<?php // loaded by the collect()->each() loop above');
+        $filters = $this->write('app/filters.php', '<?php // loaded by the collect()->each() loop above');
+        $orphan = $this->write('app/orphan.php', '<?php // not part of the enumerated domain');
+
+        $names = array_column($this->analyzer->analyze([$bootstrap, $setup, $filters, $orphan], $this->tmp), 'name');
+        self::assertNotContains('setup.php', $names);
+        self::assertNotContains('filters.php', $names);
+        self::assertContains('orphan.php', $names);
+    }
+
+    public function testLocateTemplateWithUnresolvableDynamicArgumentDoesNotExemptWholeDirectory(): void
+    {
+        // Real-world regression surfaced while gap-hunting Sage theme's own functions.php:
+        // locate_template() has no "slug-name" variant convention the way get_template_part()
+        // does, so a genuinely dynamic argument (here $file is never assigned/bounded anywhere)
+        // must not treat its literal prefix as "anything under this directory is reachable" —
+        // that would silently hide a genuinely orphaned sibling file under the same prefix.
+        $bootstrap = $this->write('functions.php', '<?php
+function load_something($file) {
+    locate_template("app/{$file}.php", true, true);
+}
+');
+        $orphan = $this->write('app/orphan.php', '<?php // must still be reported unused');
+
+        $names = array_column($this->analyzer->analyze([$bootstrap, $orphan], $this->tmp), 'name');
+        self::assertContains('orphan.php', $names);
+    }
+
     public function testGlobLoopBulkIncludeExemptsSubdirectory(): void
     {
         $bootstrap = $this->write('functions.php', '<?php
@@ -478,6 +522,54 @@ foreach (glob(__DIR__ . "/inc/*.php") as $f) {
         $unrelated = $this->write('inc-legacy/orphan.php', '<?php // different directory entirely');
 
         $names = array_column($this->analyzer->analyze([$bootstrap, $unrelated], $this->tmp), 'name');
+        self::assertContains('orphan.php', $names);
+    }
+
+    public function testPathJoinLoopBulkIncludeExemptsProjectRootRelativeDirectory(): void
+    {
+        // Real-world shape (Contact Form 7's wpcf7_swv_load_rules()): a fixed directory built
+        // from a plugin-root constant + literal segment via path_join(), joined per-iteration
+        // with a dynamic filename (sprintf('%s.php', $rule) over array_keys() of a configured
+        // rule array) — no per-file include()/require() reference for the index to find, the
+        // same "directory enumerated into per-file includes" shape glob()/scandir() already
+        // cover, just a WP-core path-joining helper instead of a filesystem listing. The
+        // constant makes this project-ROOT-relative, not relative to the file that mentions it
+        // (WPCF7_PLUGIN_DIR names the plugin's own root, not includes/swv/'s own directory).
+        $bootstrap = $this->write('includes/swv/swv.php', '<?php
+function wpcf7_swv_available_rules() {
+    return array("required" => "RequiredRule", "email" => "EmailRule");
+}
+function wpcf7_swv_load_rules() {
+    foreach (array_keys(wpcf7_swv_available_rules()) as $rule) {
+        $file = sprintf("%s.php", $rule);
+        $path = path_join(WPCF7_PLUGIN_DIR . "/includes/swv/php/rules", $file);
+        if (file_exists($path)) {
+            include_once $path;
+        }
+    }
+}
+');
+        $rule = $this->write('includes/swv/php/rules/required.php', '<?php // loaded by the path_join loop above');
+        $unrelated = $this->write('includes/swv/orphan.php', '<?php // outside the exempted directory');
+
+        $names = array_column($this->analyzer->analyze([$bootstrap, $rule, $unrelated], $this->tmp), 'name');
+        self::assertNotContains('required.php', $names);
+        self::assertContains('orphan.php', $names);
+    }
+
+    public function testPathJoinWithLiteralSecondArgumentIsNotTreatedAsABulkLoader(): void
+    {
+        // path_join() with a plain literal second argument is an ordinary single reference, not
+        // a per-iteration bulk loader — must not exempt the whole directory.
+        $bootstrap = $this->write('includes/functions.php', '<?php
+$path = path_join(WPCF7_PLUGIN_DIR . "/includes/swv/php/rules", "required.php");
+if (file_exists($path)) {
+    include_once $path;
+}
+');
+        $orphan = $this->write('includes/swv/php/rules/orphan.php', '<?php // not proven reachable');
+
+        $names = array_column($this->analyzer->analyze([$bootstrap, $orphan], $this->tmp), 'name');
         self::assertContains('orphan.php', $names);
     }
 
@@ -927,6 +1019,39 @@ echo wfView::create("scanner/text/issue-base", array("textOutput" => "x"))->rend
         self::assertContains('/scanner/text/issue-base.php', $resolved);
     }
 
+    public function testSelfReassigningBareWrapperCallWithCurlyInterpolatedArgumentResolvesLiteralPath(): void
+    {
+        // Real-world shape (Advanced Custom Fields): acf_get_view()'s own parameter is
+        // conditionally reassigned to the result of a SEPARATE bare (non-scoped) wrapper function,
+        // acf_get_path(), whose sole argument is the SAME parameter fed back through curly-brace
+        // string interpolation ("...{$view_path}..."), not concatenation. acf_get_path() itself
+        // strips a leading slash via ltrim() before prefixing an unresolvable path constant.
+        // Neither the self-reassignment through a bare (unscoped) call, nor the curly-brace
+        // interpolated argument, were previously recognized at all — the whole chain silently
+        // failed to resolve for every call site (26/26 real ACF findings before this fix).
+        $bootstrap = $this->write('includes/api/api-helpers.php', '<?php
+function acf_get_view( $view_path = "", $view_args = array() ) {
+    if ( substr( $view_path, -4 ) !== ".php" ) {
+        $view_path = acf_get_path( "includes/admin/views/{$view_path}.php" );
+    }
+    if ( file_exists( $view_path ) ) {
+        include $view_path;
+    }
+}
+function acf_get_path( $filename = "" ) {
+    return ACF_PATH . ltrim( $filename, "/" );
+}
+acf_get_view( "global/header" );
+');
+        $view = $this->write('includes/admin/views/global/header.php', '<?php // loaded through acf_get_view()');
+        $orphan = $this->write('includes/admin/views/global/orphan.php', '<?php // no fixed path reaches this');
+
+        $names = array_column($this->analyzer->analyze([$bootstrap, $view, $orphan], $this->tmp), 'name');
+
+        self::assertNotContains('header.php', $names);
+        self::assertContains('orphan.php', $names);
+    }
+
     public function testBareParameterPassedToRequireDoesNotBecomeAFileReference(): void
     {
         // A literal argument alone is insufficient: without a fixed prefix/suffix construction,
@@ -1193,6 +1318,63 @@ function my_autoload( $class_name ) {
 
         $names = array_column($this->analyzer->analyze([$bootstrap, $unrelated], $this->tmp), 'name');
         self::assertContains('orphan.php', $names);
+    }
+
+    public function testSplAutoloadRegisterAscendsAncestorDirectoryComputedViaPluginDirPathDirname(): void
+    {
+        // Real-world finding (Broken Link Checker): the autoloader bootstrap lives in
+        // core/utils/, but computes its base path via plugin_dir_path(dirname(__DIR__)) —
+        // climbing 2 levels above its own directory (utils -> core -> plugin root) before
+        // descending back into the class-name-derived subpath. The prior "caller's own
+        // directory tree" default (app/core/utils/ here) would miss app/module/foo.php entirely.
+        $bootstrap = $this->write('app/core/utils/autoloader.php', '<?php
+function my_autoloader( $class_name ) {
+    $plugin_path = plugin_dir_path( dirname( __DIR__ ) );
+    require $plugin_path . strtolower( $class_name ) . ".php";
+}
+spl_autoload_register( "my_autoloader" );
+');
+        $component = $this->write('app/module/foo.php', '<?php // loaded by the ascended autoloader above');
+        $unrelated = $this->write('admin/orphan.php', '<?php // outside the ascended scope entirely');
+
+        $names = array_column($this->analyzer->analyze([$bootstrap, $component, $unrelated], $this->tmp), 'name');
+        self::assertNotContains('foo.php', $names);
+        self::assertContains('orphan.php', $names);
+    }
+
+    public function testSplAutoloadRegisterAscendsWithNestedDirnameCalls(): void
+    {
+        // Same 2-level climb as above, spelled as nested dirname(dirname(__DIR__)) instead of
+        // plugin_dir_path() — confirms the recursive nesting itself is resolved, not just the
+        // plugin_dir_path() single-wrap shape.
+        $bootstrap = $this->write('app/core/utils/autoloader.php', '<?php
+function my_autoloader( $class_name ) {
+    $plugin_path = dirname( dirname( __DIR__ ) );
+    require $plugin_path . "/" . strtolower( $class_name ) . ".php";
+}
+spl_autoload_register( "my_autoloader" );
+');
+        $component = $this->write('app/module/foo.php', '<?php // loaded by the ascended autoloader above');
+
+        $names = array_column($this->analyzer->analyze([$bootstrap, $component], $this->tmp), 'name');
+        self::assertNotContains('foo.php', $names);
+    }
+
+    public function testSplAutoloadRegisterAscendsWithDirnameLevelsArgument(): void
+    {
+        // Same 2-level climb again, via dirname()'s own PHP 7.0+ 2-arg form (`dirname($path,
+        // $levels)`) instead of nesting/plugin_dir_path().
+        $bootstrap = $this->write('app/core/utils/autoloader.php', '<?php
+function my_autoloader( $class_name ) {
+    $plugin_path = dirname( __DIR__, 2 );
+    require $plugin_path . "/" . strtolower( $class_name ) . ".php";
+}
+spl_autoload_register( "my_autoloader" );
+');
+        $component = $this->write('app/module/foo.php', '<?php // loaded by the ascended autoloader above');
+
+        $names = array_column($this->analyzer->analyze([$bootstrap, $component], $this->tmp), 'name');
+        self::assertNotContains('foo.php', $names);
     }
 
     public function testNoComposerJsonDoesNotBreakAnalysis(): void
