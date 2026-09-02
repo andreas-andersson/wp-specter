@@ -1394,6 +1394,153 @@ scope limit that trades recall or precision for staying a single-pass, no-depend
   targeted methods); a full `--type=all` sanity pass across the entire 28-project corpus shows no
   crashes and no other regressions (no `Data_Tag`-named collisions anywhere else in the corpus).
 
+- [x] **`Widget_Base`, named explicitly in the `Data_Tag` item above as future scope, turned up
+  with real-world evidence.** Same "class absent from this scan" situation, for Elementor's widget
+  base class instead of its dynamic-tags one. Found by a fresh gap-hunting pass over 5 newly-added
+  corpus plugins: circumflex-booking's `ElementorBookingWidget extends \Elementor\Widget_Base` —
+  **all 7 of its own methods** (`get_name`/`get_title`/`get_icon`/`get_categories`/`get_keywords`/
+  `get_script_depends`/`get_style_depends`) false-flagged `UnusedMethod` (100% of that one class's
+  own methods).
+
+  Fixed the same way: a new curated `ELEMENTOR_WIDGET_BASE_CONTRACT_METHODS` entry in
+  `BASE_CLASS_CONTRACT_METHODS`, keyed by short name (`Widget_Base`). Verified directly against
+  free Elementor's own source (present in the corpus): `get_name()` is `Controls_Stack`'s own
+  `abstract` method (same one `Data_Tag`'s contract already lists); `get_title()`/
+  `get_script_depends()`/`get_style_depends()` are `Element_Base`'s own concrete override-point
+  stubs (each returns an empty default, documented for subclasses to replace); `get_icon()`/
+  `get_keywords()`/`get_categories()` are `Widget_Base`'s own concrete override-point stubs the
+  same way. `render()` — the same "always overridden, never called externally" shape as
+  `register_controls()` on `Data_Tag` — was deliberately left off: verified it's already rescued
+  without it, incidentally, by the unscoped `array($this, 'render')` callback-name pool
+  (circumflex-booking's own admin pages and shortcode/block classes each register their own
+  unrelated `render()` the same coarse-net way), so adding it here would have been untested
+  guesswork rather than evidence-driven.
+
+  **Scope limitation:** same as `Data_Tag`'s own — narrow to the exact evidenced shape rather than
+  speculatively curating Elementor's larger surface (`Group_Control_Base`, `Base_Tag` extended
+  directly, `Controls_Stack` extended directly, ...).
+
+  Verified: new `ClassAnalyzer` end-to-end regression
+  (`testExcludesElementorWidgetBaseContractMethods`). `composer check` is clean (680 tests,
+  PHP-CS-Fixer, PHPStan). Real-world: circumflex-booking's `UnusedMethod` count drops 16 → 6 (7 of
+  those from this fix, the other 3 from the WP-CLI item below); a full `--type=all` sanity pass
+  across the entire corpus turned up a **second, independent real-world instance**: WPForms
+  Lite ships its own `src/Integrations/Elementor/Widget.php` Elementor integration, whose
+  `UnusedMethod` count drops 198 → 195 (`get_name`/`get_icon`/`get_script_depends` — the other 4
+  of its own overrides were already rescued some other way, same as `render()` above). No crashes,
+  no other regressions anywhere else in the corpus.
+
+- [x] **WP-CLI's `add_command()` reflection-dispatch exemption (see the earlier `WP_CLI` item
+  above) only recognized a class *name* as the second argument — a ready-made command *instance*,
+  or the whole call reached indirectly through an aliased callable variable, both fell through
+  unresolved.** Found by a fresh gap-hunting pass over 5 newly-added corpus plugins:
+  circumflex-booking's `CliRegistrar` —
+  ```php
+  $callback = array( 'WP_CLI', 'add_command' );
+  if ( is_callable( $callback ) ) {
+      $callback( 'circumflex-booking database', new DatabaseCommand( $this->database ) );
+  }
+  ```
+  — a defensive idiom (guard the whole registration behind `is_callable()` rather than reference
+  `WP_CLI::add_command` as a literal scoped call, in case the class isn't loaded) that stacked
+  *both* gaps at once: the second argument is `new DatabaseCommand(...)`, not a string/`::class`,
+  and the receiver is `$callback(...)`, not a literal `WP_CLI::add_command(...)`. `migrate()`/
+  `integrity()`/`reset()` (WP-CLI subcommand methods) all false-flagged `UnusedMethod`.
+
+  Fixed both pieces, since this one real case needed them together to resolve end-to-end:
+  1. `secondArgStringLiteral()` (used by `recordWpCliAddCommandDispatch()`) gained a third
+     accepted shape alongside the existing string-literal/`::class` ones — `new Foo(...)`, reading
+     the literal identifier right after `new` the same way `captureClassNameAfter()` does
+     elsewhere in this parser. `new $var(...)`/`new (expr)()` are still left unresolved (the
+     separate "Dynamic instantiation" item's own documented scope, not specific to this call
+     site).
+  2. The main token loop's existing bare-variable-use branch now also checks
+     `$anyArrayLiteralVars` (already tracking any variable holding a flat array of plain string
+     literals, for a different consumer — foreach-loop/return-array resolution) for a two-element
+     hit immediately followed by an invocation of that same variable, and routes it through the
+     *exact same* `recordWpCliAddCommandDispatch()` a literal `WP_CLI::add_command(...)` call
+     already uses — that function itself still gates on the receiver/method pair actually being
+     `('WP_CLI', 'add_command')`, so this is safe to try for any two-element aliased callable, not
+     just a WP-CLI one, with no separate class/method resolution logic needed.
+
+  **Scope limitation:** the aliased-callable-variable resolution is a single forward,
+  non-branching, "last assignment wins" lookup (same trade-off as every other flat variable-
+  tracking map in this parser) — reassigning the same variable to something else between the
+  `array('WP_CLI', 'add_command')` assignment and the call invalidates the earlier entry, same as
+  `$varTypesStack`'s own documented behavior. No attempt to resolve a variable holding a class
+  *instance* as `add_command()`'s second argument (only a literal `new X(...)` right there in the
+  call) — not evidenced anywhere in the corpus; would need its own real-world case before adding.
+
+  Verified: four new `PhpTokenParser` unit tests (the `new X(...)` shape, its `new $var()`
+  non-match, the aliased-callable-variable shape, and its non-WP_CLI-pair non-match) plus two new
+  `ClassAnalyzer` end-to-end regressions
+  (`testCreditsEveryPublicMethodOfAClassRegisteredWithWpCliAddCommandViaNewInstance`,
+  `...ThroughAnAliasedWpCliCallableVariable`). `composer check` is clean (680 tests, PHP-CS-Fixer,
+  PHPStan). Real-world: circumflex-booking's `UnusedMethod` count drops by 3 from this fix (the
+  other 7 of its 16 → 6 drop are the `Widget_Base` item above); a full `--type=all` sanity pass
+  across the entire corpus shows no crashes and no other regressions (no other project in the
+  corpus uses either the `new X(...)` or aliased-callable-variable shape for `add_command()`).
+
+- [x] **A class declaring `__call`/`__callStatic` can forward to any of its own sibling methods
+  by a name computed at runtime — no fixed method name exists to check, the exact same shape
+  `$reflectionDispatchedClassNames` (WP-CLI's own `add_command()` item, above) already exists
+  for, just triggered by the class's own magic-method declaration instead of an external call
+  site.** Found by a fresh gap-hunting pass over 5 newly-added corpus themes: silverstorm's
+  `Hooks` class —
+  ```php
+  class Hooks {
+      public static function add_action( $tag, $cb, $priority = 10, $args = 1 ) { ... }
+      public static function add_filter( $tag, $cb, $priority = 10, $args = 1 ) { ... }
+      public static function __callStatic( $name, $arguments ) {
+          if ( strpos( $name, 'prefixed_' ) === 0 ) {
+              $name = str_replace( 'prefixed_', '', $name );
+              $arguments[0] = Theme::prefix( $arguments[0] );
+              return call_user_func_array( array( __CLASS__, $name ), $arguments );
+          }
+      }
+  }
+  ```
+  — every real call site is `Hooks::prefixed_add_action(...)`, which has no literal
+  `prefixed_add_action` method anywhere; PHP routes it through `__callStatic`, which strips the
+  prefix and dispatches to `add_action` by a name only known at runtime. `add_action`/
+  `add_filter` both false-flagged `UnusedMethod`. Confirmed the gap is specifically the magic-
+  dispatch blind spot, not a general miss on this class: a control method reached by its literal
+  name (`add_wp_ajax`) was correctly *not* flagged, and a genuinely dead sibling (`identity`,
+  unreachable even through the magic method's own transform) was correctly flagged before this
+  fix — see the scope limitation below for what happens to it after.
+
+  Fixed: a new `$classesWithMagicDispatch` map in `findUnusedMethods()` (built the same way as
+  the other merged-across-files maps there), populated from any `FunctionDef` whose name is
+  `__call` or `__callStatic`, keyed by `$ownerClass`. Any method whose owner class is in that set
+  is exempt — the same whole-class effect `$reflectionDispatchedClassNames` already has, just
+  triggered by the class's own declaration. Deliberately whole-class (every other method exempt,
+  not just ones textually matching the magic method's own transform), rather than parsing the
+  transform out of the magic method's own body (the project already has `StringTransformChain`-
+  style machinery that could, in principle, do this narrower match) — this idiom (facade/
+  prefixed-wrapper classes, fluent builders, ORM magic accessors, deprecated BC-shim classes) is
+  common enough in general PHP that the narrower match isn't worth the added complexity without
+  its own evidenced need. `isMagicMethod()` already exempted `__call`/`__callStatic` themselves
+  from ever being reported — this only widens the exemption to their *sibling* methods.
+
+  **Scope limitation:** a genuinely dead sibling method (never reachable, even through the magic
+  method's own transform) is now masked the same as a real one — confirmed directly on `Hooks`'
+  own real-world sibling `identity()`, truly unused by every other check, which this exemption now
+  also hides. Accepted for the same reason the coarse net elsewhere in this project is: a false
+  negative here is strictly safer than the false positive it replaces.
+
+  Verified: three new `ClassAnalyzer` end-to-end regressions
+  (`testExemptsSiblingMethodsOfAClassDeclaringCallStatic`,
+  `testExemptsSiblingMethodsOfAClassDeclaringCall`,
+  `testMagicDispatchExemptionDoesNotLeakToUnrelatedClasses`). `composer check` is clean (683
+  tests, PHP-CS-Fixer, PHPStan). Real-world impact turned out much larger than the one motivating
+  case: silverstorm's `UnusedMethod` count drops 15 → 12 (as expected — 2 real fixes, `identity`
+  incidentally masked per the scope limitation above), but a full `--type=all` sanity pass across
+  the entire corpus found this idiom is common in major plugins too — **jetpack -86** (several
+  deprecated BC-shim classes under `modules/custom-post-types/`, e.g. `Nova_Restaurant`'s own
+  `__call`/`__callStatic` forwarding every deprecated method to its replacement package),
+  **wp-smushit -45**, **woocommerce -14**, **wordpress-seo -10**, **colibri-wp -5**,
+  **advanced-custom-fields -1**. No crashes and no other regressions anywhere in the corpus.
+
 ## Suggested priority if picked back up
 
 Items checked above are done. Remaining, in rough priority order:

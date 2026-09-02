@@ -1723,6 +1723,58 @@ namespace Elementor\Core\Experiments;
         self::assertContains('Elementor\Core\Experiments\WP_CLI', $result->reflectionDispatchedClassNames);
     }
 
+    public function testWpCliAddCommandAcceptsANewInstanceAsSecondArgument(): void
+    {
+        // Real-world shape (circumflex-booking): `WP_CLI::add_command('circumflex-booking
+        // database', new DatabaseCommand($this->database))` — a ready-made command object
+        // instead of a class name, equally idiomatic WP-CLI usage.
+        $result = $this->parse('<?php
+namespace Circumflex\Booking;
+WP_CLI::add_command( "circumflex-booking database", new DatabaseCommand( $this->database ) );
+');
+        self::assertContains('Circumflex\Booking\DatabaseCommand', $result->reflectionDispatchedClassNames);
+    }
+
+    public function testWpCliAddCommandViaNewInstanceIgnoresDynamicClassName(): void
+    {
+        // `new $var()` right after the second comma is left unresolved — same "only trust the
+        // simplest literal shape" stance as everywhere else in this method; see the "Dynamic
+        // instantiation" TODO item.
+        $result = $this->parse('<?php
+$class = "DatabaseCommand";
+WP_CLI::add_command( "circumflex-booking database", new $class() );
+');
+        self::assertSame([], $result->reflectionDispatchedClassNames);
+    }
+
+    public function testWpCliAddCommandIsRecognizedThroughAnAliasedCallableVariable(): void
+    {
+        // Real-world shape (circumflex-booking): `$callback = array('WP_CLI', 'add_command'); if
+        // (is_callable($callback)) { $callback('circumflex-booking database', new
+        // DatabaseCommand($this->database)); }` — a defensive idiom that avoids referencing
+        // `WP_CLI::add_command` as a literal scoped call at all, guarding the whole registration
+        // behind is_callable() in case the WP-CLI class isn't loaded.
+        $result = $this->parse('<?php
+namespace Circumflex\Booking;
+$callback = array( "WP_CLI", "add_command" );
+if ( is_callable( $callback ) ) {
+    $callback( "circumflex-booking database", new DatabaseCommand( $this->database ) );
+}
+');
+        self::assertContains('Circumflex\Booking\DatabaseCommand', $result->reflectionDispatchedClassNames);
+    }
+
+    public function testAliasedCallableVariableIgnoresANonWpCliPair(): void
+    {
+        // recordWpCliAddCommandDispatch() itself gates on the receiver/method pair actually being
+        // ('WP_CLI', 'add_command') — any other two-element aliased callable must be a no-op here.
+        $result = $this->parse('<?php
+$callback = array( "Some_Other_Class", "some_method" );
+$callback( "whatever", new My_Class() );
+');
+        self::assertSame([], $result->reflectionDispatchedClassNames);
+    }
+
     public function testPropertyAssignedNewClassIsTrackedAndConsultedFromAnotherMethod(): void
     {
         // $this->service = new My_Service() in the constructor, read via $this->service->render()

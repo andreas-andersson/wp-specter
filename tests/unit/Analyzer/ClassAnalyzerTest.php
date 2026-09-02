@@ -875,6 +875,38 @@ class My_Dynamic_Tag extends \ElementorPro\Modules\DynamicTags\Tags\Base\Data_Ta
         self::assertContains('truly_unused_tag', $unusedMethods);
     }
 
+    public function testExcludesElementorWidgetBaseContractMethods(): void
+    {
+        // Real-world finding (circumflex-booking): ElementorBookingWidget extends
+        // \Elementor\Widget_Base — Elementor is a separate plugin, never present as a project
+        // ClassDef or reflectable vendor class in a scan of just the plugin that integrates with
+        // it (same "class absent from this scan" shape as Data_Tag above). All 7 of these are
+        // called only by Elementor's own widget-manager registration/rendering pipeline, never by
+        // a visible name reference in the plugin's own code.
+        $file = $this->write('<?php
+class My_Widget extends \Elementor\Widget_Base {
+    public function get_name(): string { return "my_widget"; }
+    public function get_title(): string { return "My Widget"; }
+    public function get_icon(): string { return "eicon-code"; }
+    public function get_categories(): array { return ["general"]; }
+    public function get_keywords(): array { return ["my"]; }
+    public function get_script_depends(): array { return ["my-script"]; }
+    public function get_style_depends(): array { return ["my-style"]; }
+    public function truly_unused_widget_method(): void {}
+}
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('get_name', $unusedMethods);
+        self::assertNotContains('get_title', $unusedMethods);
+        self::assertNotContains('get_icon', $unusedMethods);
+        self::assertNotContains('get_categories', $unusedMethods);
+        self::assertNotContains('get_keywords', $unusedMethods);
+        self::assertNotContains('get_script_depends', $unusedMethods);
+        self::assertNotContains('get_style_depends', $unusedMethods);
+        self::assertContains('truly_unused_widget_method', $unusedMethods);
+    }
+
     public function testExcludesWalkerContractMethodsWhenBaseClassNameHasWrongCase(): void
     {
         // Real-world regression found in bootscore's own navwalker: `extends Walker_Nav_menu`
@@ -2212,6 +2244,65 @@ class My_Class {
         self::assertEmpty(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod));
     }
 
+    // ── __call/__callStatic magic-dispatch sibling methods ─────────────────────────────────
+
+    public function testExemptsSiblingMethodsOfAClassDeclaringCallStatic(): void
+    {
+        // Real-world finding (silverstorm theme): `Hooks::prefixed_add_action(...)` has no
+        // literal `prefixed_add_action` method anywhere — PHP routes it through `__callStatic`,
+        // which strips the `prefixed_` prefix and dispatches to `add_action` by a name only known
+        // at runtime (`call_user_func_array(array(__CLASS__, $name), $arguments)`).
+        $file = $this->write('<?php
+class Hooks {
+    public static function add_action($tag, $cb, $priority = 10, $args = 1) {}
+    public static function add_filter($tag, $cb, $priority = 10, $args = 1) {}
+    public static function __callStatic($name, $arguments) {
+        if (strpos($name, "prefixed_") === 0) {
+            $name = str_replace("prefixed_", "", $name);
+            return call_user_func_array([__CLASS__, $name], $arguments);
+        }
+    }
+}
+Hooks::prefixed_add_action("init", "my_callback");
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('add_action', $unusedMethods);
+        self::assertNotContains('add_filter', $unusedMethods);
+    }
+
+    public function testExemptsSiblingMethodsOfAClassDeclaringCall(): void
+    {
+        // Same shape as __callStatic above, for the instance-method magic dispatcher instead.
+        $file = $this->write('<?php
+class Facade {
+    public function real_method($x) {}
+    public function __call($name, $arguments) {
+        return call_user_func_array([$this, "real_" . $name], $arguments);
+    }
+}
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('real_method', $unusedMethods);
+    }
+
+    public function testMagicDispatchExemptionDoesNotLeakToUnrelatedClasses(): void
+    {
+        $file = $this->write('<?php
+class Hooks {
+    public static function add_action($tag, $cb) {}
+    public static function __callStatic($name, $arguments) {}
+}
+class Not_A_Facade {
+    public function truly_unused() {}
+}
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertContains('truly_unused', $unusedMethods);
+    }
+
     // ── dynamic concatenated callback prefixes ──────────────────────────────────────────────
 
     public function testCreditsMethodMatchedByADynamicConcatenatedCallbackPrefix(): void
@@ -2362,6 +2453,59 @@ class Manager {
         $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
         self::assertNotContains('Wp_Cli', $unusedClasses);
         self::assertNotContains('run', $unusedMethods);
+    }
+
+    public function testCreditsEveryPublicMethodOfAClassRegisteredWithWpCliAddCommandViaNewInstance(): void
+    {
+        // Real-world finding (circumflex-booking): `WP_CLI::add_command('circumflex-booking
+        // database', new DatabaseCommand($this->database))` — a ready-made command object
+        // instead of a class name, equally idiomatic WP-CLI usage.
+        $file = $this->write('<?php
+class DatabaseCommand {
+    public function __construct($db) {}
+    public function migrate($args, $assoc_args) {}
+    public function reset($args, $assoc_args) {}
+}
+class Registrar {
+    private $database;
+    public function register() {
+        WP_CLI::add_command( "circumflex-booking database", new DatabaseCommand( $this->database ) );
+    }
+}
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('migrate', $unusedMethods);
+        self::assertNotContains('reset', $unusedMethods);
+    }
+
+    public function testCreditsEveryPublicMethodOfAClassRegisteredThroughAnAliasedWpCliCallableVariable(): void
+    {
+        // Real-world finding (circumflex-booking): `$callback = array('WP_CLI', 'add_command');
+        // if (is_callable($callback)) { $callback('circumflex-booking database', new
+        // DatabaseCommand($this->database)); }` — a defensive idiom that avoids referencing
+        // `WP_CLI::add_command` as a literal scoped call at all, guarding the whole registration
+        // behind is_callable() in case the WP-CLI class isn't loaded.
+        $file = $this->write('<?php
+class DatabaseCommand {
+    public function __construct($db) {}
+    public function migrate($args, $assoc_args) {}
+    public function reset($args, $assoc_args) {}
+}
+class Registrar {
+    private $database;
+    public function register() {
+        $callback = array( "WP_CLI", "add_command" );
+        if ( is_callable( $callback ) ) {
+            $callback( "circumflex-booking database", new DatabaseCommand( $this->database ) );
+        }
+    }
+}
+');
+        $findings = $this->analyzer->analyze([$file], suppressUnusedClassMethods: false);
+        $unusedMethods = array_column(array_filter($findings, fn($f) => $f->type === FindingType::UnusedMethod), 'name');
+        self::assertNotContains('migrate', $unusedMethods);
+        self::assertNotContains('reset', $unusedMethods);
     }
 
     // ── property-type tracking ──────────────────────────────────────────────────────────────

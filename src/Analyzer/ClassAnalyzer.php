@@ -125,6 +125,39 @@ final class ClassAnalyzer
         'get_name', 'get_title', 'get_categories', 'get_group', 'get_value', 'register_controls',
     ];
 
+    // Elementor's `Widget_Base` override points — the same "class absent from this scan" shape as
+    // ELEMENTOR_DATA_TAG_CONTRACT_METHODS just above, for the widget base class instead of the
+    // dynamic-tags one; previously left out on purpose (see that constant's own TODO.md entry,
+    // which named `Widget_Base` explicitly as future scope rather than speculatively curating it
+    // without real-world evidence). Verified directly against free Elementor's own source
+    // (includes/base/widget-base.php, includes/base/controls-stack.php,
+    // includes/base/element-base.php — all present in the corpus): `get_name()` is
+    // Controls_Stack's own `abstract` method every "stack" must implement (same one
+    // ELEMENTOR_DATA_TAG_CONTRACT_METHODS already lists); `get_title()`/`get_script_depends()`/
+    // `get_style_depends()` are Element_Base's own concrete override-point stubs (each returns an
+    // empty default, documented "@access public" for subclasses to replace);
+    // `get_icon()`/`get_keywords()`/`get_categories()` are Widget_Base's own concrete
+    // override-point stubs the same way. All seven are called only by Elementor's own
+    // widget-manager registration/rendering pipeline (reflection/polymorphism after
+    // `$widgets_manager->register(new My_Widget())`), never by a visible name reference in the
+    // integrating theme/plugin's own code. Real-world case (circumflex-booking):
+    // `ElementorBookingWidget extends \Elementor\Widget_Base` — all 7 of these methods
+    // false-flagged `UnusedMethod` (100% of that one class's own methods).
+    //
+    // `render()` — Controls_Stack's own empty-stub template method, the same shape as
+    // `register_controls()` above — is deliberately NOT listed here: verified it's already
+    // rescued without it, incidentally, by the unscoped `array($this, 'render')` callback-name
+    // pool (circumflex-booking's own admin pages and shortcode/block classes each register their
+    // own unrelated `render()` the same way, crediting the bare name 'render' project-wide the
+    // same "coarse net" way isThisArrayCallbackReceiverAt's whole pool already works). Left this
+    // deliberately narrow rather than adding an entry that happens to be redundant here — a
+    // project without that coincidental name collision would still need it, so `render` may be
+    // worth adding on a future confirmed real-world false positive instead of speculatively now.
+    private const ELEMENTOR_WIDGET_BASE_CONTRACT_METHODS = [
+        'get_name', 'get_title', 'get_icon', 'get_categories', 'get_keywords',
+        'get_script_depends', 'get_style_depends',
+    ];
+
     // WP_List_Table::single_row_columns() dispatches each of get_columns()'s own keys to a
     // `column_{$column_name}()` method when one exists (`method_exists($this, 'column_' .
     // $column_name)`), falling back to column_default() otherwise — a project-defined column key
@@ -210,6 +243,8 @@ final class ClassAnalyzer
         'WP_Ajax_Upgrader_Skin' => self::WP_UPGRADER_SKIN_CONTRACT_METHODS,
         // See ELEMENTOR_DATA_TAG_CONTRACT_METHODS' own docblock above.
         'Data_Tag' => self::ELEMENTOR_DATA_TAG_CONTRACT_METHODS,
+        // See ELEMENTOR_WIDGET_BASE_CONTRACT_METHODS' own docblock above.
+        'Widget_Base' => self::ELEMENTOR_WIDGET_BASE_CONTRACT_METHODS,
     ];
 
     // Base classes whose subclasses get called entirely through framework naming-convention /
@@ -728,6 +763,51 @@ final class ClassAnalyzer
             }
         }
 
+        // A class declaring `__call`/`__callStatic` can forward to any of its own sibling
+        // methods by a name computed at runtime (a prefix-strip, a case change, ...) — the exact
+        // same "no fixed method name exists to check" shape $reflectionDispatchedClassNames above
+        // already exists for WP-CLI's own reflection dispatch, just triggered by the class's own
+        // declaration instead of an external call site. Real-world shape (silverstorm theme):
+        // ```
+        // class Hooks {
+        //     public static function add_action( $tag, $cb, $priority = 10, $args = 1 ) { ... }
+        //     public static function __callStatic( $name, $arguments ) {
+        //         if ( strpos( $name, 'prefixed_' ) === 0 ) {
+        //             $name = str_replace( 'prefixed_', '', $name );
+        //             $arguments[0] = Theme::prefix( $arguments[0] );
+        //             return call_user_func_array( array( __CLASS__, $name ), $arguments );
+        //         }
+        //     }
+        // }
+        // ```
+        // — every real call site is `Hooks::prefixed_add_action(...)`, which has no literal
+        // `prefixed_add_action` method anywhere; PHP routes it through `__callStatic`, which
+        // strips the prefix and dispatches to `add_action` by a name only known at runtime.
+        // `add_action`/`add_filter` both false-flagged `UnusedMethod`. Deliberately whole-class
+        // (every other method exempt, not just ones textually matching the magic method's own
+        // transform) — the same coarse "no per-method contract to check" trade-off
+        // $reflectionDispatchedClassNames already accepts, and this idiom (facade/prefixed-
+        // wrapper classes, fluent builders, ORM magic accessors) is common enough in general PHP
+        // that trying to parse the transform out of the magic method's own body for a narrower
+        // match isn't worth the added complexity without its own evidenced need. Trade-off:
+        // a genuinely dead sibling method (never reachable, even through the magic method's own
+        // transform) is masked the same as a real one — confirmed on Hooks' own real-world
+        // sibling `identity()`, truly unused by every check including this one, which this
+        // exemption now also hides. Accepted for the same reason the coarse net elsewhere in
+        // this project is: a false negative here is strictly safer than the false positive it
+        // replaces, and the class is small enough in practice that eyeballing it once still
+        // catches genuinely dead siblings a tool miss wouldn't.
+        // `isMagicMethod()` above already exempts `__call`/`__callStatic` themselves from ever
+        // being reported — this only widens the exemption to their *sibling* methods.
+        $classesWithMagicDispatch = [];
+        foreach ($parseResults as $result) {
+            foreach ($result->functionDefs as $def) {
+                if ($def->isMethod && $def->ownerClass !== null && ($def->name === '__call' || $def->name === '__callStatic')) {
+                    $classesWithMagicDispatch[$def->ownerClass] = true;
+                }
+            }
+        }
+
         // trait name => list of classes/traits whose body directly `use`s it (see TraitUsage /
         // the T_USE handling in PhpTokenParser). A trait's own methods are never called on the
         // trait itself — only through whatever `use`s it — so isUsedByTraitConsumer() walks this
@@ -764,6 +844,7 @@ final class ClassAnalyzer
                     || isset($called[$def->name])
                     || isset($scopedCalled[$def->ownerClass ?? ''][$def->name])
                     || isset($reflectionDispatchedClassNames[strtolower($def->ownerClass ?? '')])
+                    || isset($classesWithMagicDispatch[$def->ownerClass ?? ''])
                     || $this->matchesAnyPrefixSuffix($def->name, $scopedCalledPrefixes[$def->ownerClass ?? ''] ?? [])
                     || self::isFullyExemptClass($def->ownerClass, $classDefsByName)
                     || $this->isContractMethod($def->name, $def->ownerClass, $classDefsByName, $reflector)

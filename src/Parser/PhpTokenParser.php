@@ -1574,6 +1574,39 @@ final class PhpTokenParser
                         }
                     }
 
+                    // $callback = array('WP_CLI', 'add_command'); if (is_callable($callback)) {
+                    // $callback('circumflex-booking database', new DatabaseCommand(...)); } —
+                    // the exact same WP-CLI reflection-dispatch shape
+                    // recordWpCliAddCommandDispatch() already recognizes for a direct
+                    // `WP_CLI::add_command(...)` call, just reached through a locally-aliased
+                    // callable-array variable instead of a literal scoped call — a defensive
+                    // idiom plugins use to guard a WP-CLI registration behind is_callable()
+                    // rather than referencing the class name directly. $anyArrayLiteralVars
+                    // already tracks any variable holding a flat array of plain string literals
+                    // (see its own declaration comment above); a two-element hit, immediately
+                    // followed by an invocation of that same variable, is routed through the
+                    // exact same recognizer a literal call already uses —
+                    // recordWpCliAddCommandDispatch() itself still gates on the receiver/method
+                    // pair actually being ('WP_CLI', 'add_command'), so this is safe to try for
+                    // any two-element aliased callable, not just a WP-CLI one. Real-world case
+                    // (circumflex-booking).
+                    $aliasedCallable = $anyArrayLiteralVars[$value] ?? null;
+                    if (
+                        $aliasedCallable !== null
+                        && count($aliasedCallable) === 2
+                        && $this->peekNextMeaningful($tokens, $i) === '('
+                    ) {
+                        $this->recordWpCliAddCommandDispatch(
+                            $aliasedCallable[0],
+                            $aliasedCallable[1],
+                            $tokens,
+                            $i,
+                            $currentNamespace,
+                            $useImports,
+                            $reflectionDispatchedClassNames,
+                        );
+                    }
+
                     $trackedClass = $varTypesStack[$scopeTop][$value] ?? null;
                     if ($trackedClass !== null) {
                         $target = $this->findScopedCallTarget($tokens, $i);
@@ -5064,12 +5097,18 @@ final class PhpTokenParser
     /**
      * $nameIndex points at a T_STRING call name (e.g. 'add_command'), already confirmed followed
      * by '('. Returns its second argument's class name when the call's first argument is a plain
-     * string literal and its second is either also a plain string literal —
-     * `add_command('astra abilities', 'Astra_Abilities_CLI')` — or the idiomatic modern-PHP
+     * string literal and its second is one of three shapes: also a plain string literal —
+     * `add_command('astra abilities', 'Astra_Abilities_CLI')` — the idiomatic modern-PHP
      * `Foo::class` form — `add_command('elementor experiments', WP_CLI::class)` (real-world
-     * shape, Elementor). Null for anything else (fewer than two arguments, a non-literal first
-     * argument, or a second argument that's neither shape). Same "only trust the simplest literal
-     * shape" stance as firstStringArgIndex — a concatenated or variable class name is left
+     * shape, Elementor) — or a fresh instance, `new Foo(...)` — `add_command('circumflex-booking
+     * database', new DatabaseCommand($this->database))` (real-world shape, circumflex-booking):
+     * equally idiomatic WP-CLI usage (WP-CLI's own docs show both the class-name and instance
+     * forms), and the class name is a literal identifier right after `new` either way — the same
+     * "only trust the simplest literal shape" stance as the other two branches, just not
+     * resolving `new $var(...)`/`new (expr)()` (see the separate "Dynamic instantiation" TODO
+     * item; that gap is structural to this token parser, not specific to this call site). Null
+     * for anything else (fewer than two arguments, a non-literal first argument, or a second
+     * argument that's none of these three shapes) — a concatenated or variable class name is left
      * unresolved rather than guessed at.
      *
      * @param list<Token> $tokens
@@ -5112,6 +5151,18 @@ final class PhpTokenParser
                 return null;
             }
             return $classNameToken;
+        }
+
+        // `new Foo(...)` / `new Foo\Bar(...)` — see this method's own docblock. Only a literal
+        // identifier right after `new` counts, same as captureClassNameAfter() elsewhere in this
+        // parser; the raw (unresolved) token text is returned, same contract as the other two
+        // branches above — the caller always resolves it via resolveFqcn() itself.
+        if (is_array($tokens[$j]) && $tokens[$j][0] === T_NEW) {
+            $k = $this->skipInsignificant($tokens, $j + 1);
+            if (isset($tokens[$k]) && is_array($tokens[$k]) && in_array($tokens[$k][0], self::CLASS_NAME_TOKENS, true)) {
+                return $tokens[$k][1];
+            }
+            return null;
         }
 
         if (!is_array($tokens[$j]) || $tokens[$j][0] !== T_CONSTANT_ENCAPSED_STRING) {
