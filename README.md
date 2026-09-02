@@ -28,6 +28,8 @@ wp-specter — WordPress unused code scanner
   Mode:   Classic theme
   Files:  247 PHP files scanned
 
+  Scanning    [████████████████████████] 100% (247/247)
+
 Unused Functions
 
   ✗  user_is_temporarly_banned
@@ -58,7 +60,7 @@ Unused Files
 Unused Classes
 
   ✗  WP_Page_List_Navwalker
-     /home/user/dev/my-site/wp-content/themes/mytheme/includes/wp_page_list_navwalker.php:3
+     /home/user/dev/my-site/wp-content/themes/mytheme/includes/wp_page_list_navwalker_2.php:3
 
 Unused Methods
 
@@ -111,14 +113,6 @@ wp-specter scan ./themes/my-theme
 
 # Scan a plugin
 wp-specter scan ./plugins/my-plugin
-```
-
-### Scan a Bedrock/Composer project
-
-Point to the project root to scan all themes and plugins:
-
-```bash
-wp-specter scan ./my-bedrock-site
 ```
 
 ### Common options
