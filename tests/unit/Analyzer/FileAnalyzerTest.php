@@ -403,6 +403,42 @@ PHP);
         self::assertEmpty($this->analyzer->analyze([$functions], $this->tmp));
     }
 
+    public function testGeneratedComposerAutoloadNestedUnderProjectSubdirectoryIsFound(): void
+    {
+        // Real-world shape (colibri-wp): the theme bundles its OWN, separately Composer-managed
+        // dependency tree under `inc/vendor/` instead of the scan root — `inc/vendor/composer/
+        // autoload_psr4.php` maps `ColibriWP\Theme\` to `inc/src`, the theme's own genuinely
+        // PSR-4-autoloaded class tree, not a dependency. Every one of its 106 classes was a false
+        // positive `UnusedFile` before this fix: loadGeneratedComposerAutoload() only ever looked
+        // at $rootDir . '/vendor/composer', never a nested vendor/ directory anywhere else.
+        $this->write('inc/vendor/composer/autoload_psr4.php', '<?php
+$vendorDir = dirname(__DIR__);
+$baseDir = dirname($vendorDir);
+return array(
+    "ColibriWP\\\\Theme\\\\" => array($baseDir . "/src"),
+);
+');
+        $class = $this->write('inc/src/View.php', '<?php namespace ColibriWP\Theme; class View {}');
+        $caller = $this->write('functions.php', '<?php use ColibriWP\Theme\View; new View();');
+
+        self::assertEmpty($this->analyzer->analyze([$class, $caller], $this->tmp));
+    }
+
+    public function testGeneratedComposerAutoloadNestedUnderProjectSubdirectoryStillReportsOutsideFiles(): void
+    {
+        $this->write('inc/vendor/composer/autoload_psr4.php', '<?php
+$vendorDir = dirname(__DIR__);
+$baseDir = dirname($vendorDir);
+return array(
+    "ColibriWP\\\\Theme\\\\" => array($baseDir . "/src"),
+);
+');
+        $orphan = $this->write('inc/orphan.php', '<?php // not under inc/src');
+
+        $names = array_column($this->analyzer->analyze([$orphan], $this->tmp), 'name');
+        self::assertContains('orphan.php', $names);
+    }
+
     public function testFileOutsideGeneratedComposerMapIsStillReported(): void
     {
         $this->writeGeneratedAutoload('autoload_psr4.php', <<<'PHP'
@@ -1050,6 +1086,95 @@ acf_get_view( "global/header" );
 
         self::assertNotContains('header.php', $names);
         self::assertContains('orphan.php', $names);
+    }
+
+    public function testRepeatedParameterOccurrenceInConcatenatedModuleLoaderResolvesLiteralPath(): void
+    {
+        // Real-world shape (Contact Form 7): load_modules() calls self::load_module('acceptance')
+        // at many literal call sites; load_module($mod) hands wpcf7_include_module_file() a
+        // concatenation where $mod appears TWICE ($mod . '/' . $mod . '.php'), building
+        // "acceptance/acceptance.php". resolveLiteralPathExpressionTokens's own one-dynamic-term
+        // rule previously bailed outright the moment it saw the same variable a second time,
+        // leaving every module file a false-positive "unused file".
+        $bootstrap = $this->write('load.php', '<?php
+class WPCF7 {
+    public static function load_modules() {
+        self::load_module( "acceptance" );
+    }
+    public static function load_module( $mod ) {
+        wpcf7_include_module_file( $mod . "/" . $mod . ".php" );
+    }
+}
+function wpcf7_include_module_file( $path ) {
+    include_once WPCF7_PLUGIN_MODULES_DIR . $path;
+}
+');
+        $module = $this->write('modules/acceptance/acceptance.php', '<?php // loaded through load_module()');
+        $orphan = $this->write('modules/acceptance/orphan.php', '<?php // no fixed path reaches this');
+
+        $names = array_column($this->analyzer->analyze([$bootstrap, $module, $orphan], $this->tmp), 'name');
+
+        self::assertNotContains('acceptance.php', $names);
+        self::assertContains('orphan.php', $names);
+
+        $resolved = LiteralPathPropagationResolver::resolve([(new PhpTokenParser())->parse($bootstrap)]);
+        self::assertContains('acceptance/acceptance.php', $resolved);
+    }
+
+    public function testInArrayGuardedDynamicViewDispatchResolvesEveryDomainValue(): void
+    {
+        // Real-world shape (Wordfence): `views/diagnostics/text.php` does `if (!in_array(
+        // $i['type'], $issueTypes)) { continue; }` (where `$issueTypes = wfIssues::
+        // validIssueTypes()`, DEFINED IN A SEPARATE FILE — cross-file resolution, same as
+        // functionArrayReturns' own established timing) right before `wfView::create('scanner/
+        // text/issue-' . $i['type'], ...)`. `$i['type']` is a database-sourced array's own key
+        // access, never itself a tracked node — but the in_array() guard bounds its domain to
+        // wfIssues::validIssueTypes()'s own literal array return. Every value in that domain
+        // must become its own resolved file reference. 12/12 real findings before this fix.
+        $lib = $this->write('lib/wfIssues.php', '<?php
+class wfIssues {
+    public static function validIssueTypes() {
+        return array( "checkGSB", "timelimit" );
+    }
+}
+');
+        $wfView = $this->write('lib/wfView.php', '<?php
+class wfView {
+    protected $view;
+    public static function create($view, $data = array()) {
+        return new self($view, $data);
+    }
+    public function __construct($view, $data = array()) {
+        $this->view = $view;
+    }
+    public function render() {
+        $view_path = "views/" . $this->view . ".php";
+        include $view_path;
+        return "";
+    }
+}
+');
+        $dispatch = $this->write('views/diagnostics/text.php', '<?php
+$issueTypes = wfIssues::validIssueTypes();
+foreach ( $issues["new"] as $i ) {
+    if ( !in_array( $i["type"], $issueTypes ) ) {
+        continue;
+    }
+    wfView::create( "scanner/text/issue-" . $i["type"], array() )->render();
+}
+');
+        $checkGsb = $this->write('views/scanner/text/issue-checkGSB.php', '<?php // reached via checkGSB domain value');
+        $timelimit = $this->write('views/scanner/text/issue-timelimit.php', '<?php // reached via timelimit domain value');
+        $orphan = $this->write('views/scanner/text/issue-orphan.php', '<?php // not in validIssueTypes(), still dead');
+
+        $names = array_column(
+            $this->analyzer->analyze([$lib, $wfView, $dispatch, $checkGsb, $timelimit, $orphan], $this->tmp),
+            'name',
+        );
+
+        self::assertNotContains('issue-checkGSB.php', $names);
+        self::assertNotContains('issue-timelimit.php', $names);
+        self::assertContains('issue-orphan.php', $names);
     }
 
     public function testBareParameterPassedToRequireDoesNotBecomeAFileReference(): void

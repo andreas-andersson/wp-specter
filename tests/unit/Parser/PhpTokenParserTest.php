@@ -2461,6 +2461,47 @@ function inner( $path ) {}
         self::assertSame('inner#param:0', $link->toNode);
     }
 
+    public function testCurlyInterpolatedCallArgumentWithRepeatedVariableLinksWithMiddleSegment(): void
+    {
+        // Real-world shape (Jetpack): `load_and_register_deferred_block( $feature )` builds
+        // "extensions/blocks/{$feature}/{$feature}.php" — the SAME variable interpolated twice,
+        // the interpolation counterpart to Contact Form 7's `$mod . '/' . $mod . '.php'`
+        // concatenation shape.
+        $result = $this->parse('<?php
+function outer( $feature ) {
+    inner( "extensions/blocks/{$feature}/{$feature}.php" );
+}
+function inner( $path ) {}
+');
+        $link = null;
+        foreach ($result->literalPathPropagationLinks as $candidate) {
+            if ($candidate->toNode === 'inner#param:0') {
+                $link = $candidate;
+            }
+        }
+        self::assertNotNull($link);
+        self::assertSame('outer#param:0', $link->fromNode);
+        self::assertSame('extensions/blocks/', $link->prefix);
+        self::assertSame(['/'], $link->middleSegments);
+        self::assertSame('.php', $link->suffix);
+    }
+
+    public function testCurlyInterpolatedCallArgumentWithTwoDifferentVariablesIsNotResolved(): void
+    {
+        // Two DIFFERENT interpolated variables remains rejected — only a REPEATED occurrence of
+        // the exact same source is special-cased, same restriction as the concatenation shape.
+        $result = $this->parse('<?php
+function outer( $feature, $variant ) {
+    inner( "extensions/blocks/{$feature}/{$variant}.php" );
+}
+function inner( $path ) {}
+');
+        self::assertEmpty(array_filter(
+            $result->literalPathPropagationLinks,
+            fn($link) => $link->toNode === 'inner#param:0',
+        ));
+    }
+
     public function testSelfReassigningBareWrapperCallResolvesThroughItsOwnArgument(): void
     {
         // The exact ACF shape: a function conditionally reassigns its own parameter to the result
@@ -2558,6 +2599,131 @@ include_file( "orphan" );
             $result->literalPathPropagationLinks,
             fn($link) => $link->prefix !== '' || $link->suffix !== '',
         ));
+    }
+
+    public function testLiteralPathPropagationResolvesRepeatedSourceOccurrenceWithMiddleLiteralSegment(): void
+    {
+        // Real-world shape (Contact Form 7): `$mod . '/' . $mod . '.php'` — the SAME parameter
+        // appears twice in one concatenation, with a fixed literal segment between the two
+        // occurrences. The one-dynamic-term rule previously rejected this outright the moment a
+        // second node term (even an identical one) was seen.
+        $result = $this->parse('<?php
+function load_module( $mod ) {
+    include_module_file( $mod . "/" . $mod . ".php" );
+}
+function include_module_file( $path ) {}
+');
+        $link = null;
+        foreach ($result->literalPathPropagationLinks as $candidate) {
+            if ($candidate->toNode === 'include_module_file#param:0') {
+                $link = $candidate;
+            }
+        }
+        self::assertNotNull($link);
+        self::assertSame('load_module#param:0', $link->fromNode);
+        self::assertSame('', $link->prefix);
+        self::assertSame(['/'], $link->middleSegments);
+        self::assertSame('.php', $link->suffix);
+    }
+
+    public function testLiteralPathPropagationRejectsRepeatedSourceOccurrenceWithUnresolvableMiddleSegment(): void
+    {
+        // The literal fragment between two occurrences of the same source must be fully known —
+        // an unresolvable term in between (here, an untracked `$sep`) must not silently drop out
+        // of the template, since that would misplace where the value actually falls.
+        $result = $this->parse('<?php
+function load_module( $mod ) {
+    include_module_file( $mod . $sep . $mod . ".php" );
+}
+function include_module_file( $path ) {}
+');
+        self::assertEmpty(array_filter(
+            $result->literalPathPropagationLinks,
+            fn($link) => $link->toNode === 'include_module_file#param:0',
+        ));
+    }
+
+    public function testLiteralPathPropagationStillRejectsTwoDistinctDynamicTerms(): void
+    {
+        // Two DIFFERENT dynamic values in one concatenation remains rejected — only a REPEATED
+        // occurrence of the exact same source is special-cased.
+        $result = $this->parse('<?php
+function load_module( $mod, $variant ) {
+    include_module_file( $mod . "/" . $variant . ".php" );
+}
+function include_module_file( $path ) {}
+');
+        self::assertEmpty(array_filter(
+            $result->literalPathPropagationLinks,
+            fn($link) => $link->toNode === 'include_module_file#param:0',
+        ));
+    }
+
+    public function testFunctionArrayReturnsCapturesADirectLiteralArrayReturn(): void
+    {
+        // Real-world shape (Wordfence): `wfIssues::validIssueTypes()` does `return
+        // array('checkGSB', 'timelimit', ...);` — a bare literal array with no intermediate
+        // variable at all. Previously only `return $var;` (a variable assigned an array literal
+        // earlier) was recognized.
+        $result = $this->parse('<?php
+class wfIssues {
+    public static function validIssueTypes() {
+        return array( "checkGSB", "timelimit" );
+    }
+}
+');
+        self::assertSame(['checkGSB', 'timelimit'], $result->functionArrayReturns['wfIssues::validIssueTypes'] ?? null);
+    }
+
+    public function testInArrayGuardedConcatenationRecordsPendingDomainInput(): void
+    {
+        // Real-world shape (Wordfence): `views/diagnostics/text.php` does `if
+        // (!in_array($i['type'], $issueTypes)) { continue; }` — where `$issueTypes =
+        // wfIssues::validIssueTypes();` was assigned earlier — right before `wfView::create(
+        // 'scanner/text/issue-' . $i['type'], ... )`. `$i['type']` isn't itself a tracked node
+        // (it's a database-sourced array's own key access), but the in_array() guard bounds its
+        // domain to a known, resolvable function's own literal array return.
+        $result = $this->parse('<?php
+$issueTypes = wfIssues::validIssueTypes();
+foreach ( $issues as $i ) {
+    if ( !in_array( $i["type"], $issueTypes ) ) {
+        continue;
+    }
+    wfView::create( "scanner/text/issue-" . $i["type"], array() );
+}
+');
+        self::assertCount(1, $result->pendingInArrayGuardedInputs);
+        $pending = $result->pendingInArrayGuardedInputs[0];
+        self::assertSame('wfView::create#param:0', $pending->targetNode);
+        self::assertSame('scanner/text/issue-', $pending->prefix);
+        self::assertSame('', $pending->suffix);
+        self::assertSame('wfIssues::validIssueTypes', $pending->domainFunctionKey);
+    }
+
+    public function testInArrayGuardedConcatenationResolvesDirectDomainCallWithoutIndirectionVariable(): void
+    {
+        // The simpler variant of the shape above: in_array()'s second argument is the domain
+        // call directly, not a variable assigned from it first.
+        $result = $this->parse('<?php
+foreach ( $issues as $i ) {
+    if ( in_array( $i["type"], wfIssues::validIssueTypes() ) ) {
+        wfView::create( "scanner/text/issue-" . $i["type"], array() );
+    }
+}
+');
+        self::assertCount(1, $result->pendingInArrayGuardedInputs);
+        self::assertSame('wfIssues::validIssueTypes', $result->pendingInArrayGuardedInputs[0]->domainFunctionKey);
+    }
+
+    public function testInArrayGuardedConcatenationRequiresAGuardToExist(): void
+    {
+        // No in_array() guard anywhere in the file — must not fabricate a domain.
+        $result = $this->parse('<?php
+foreach ( $issues as $i ) {
+    wfView::create( "scanner/text/issue-" . $i["type"], array() );
+}
+');
+        self::assertEmpty($result->pendingInArrayGuardedInputs);
     }
 
     public function testLiteralPathPropagationCapturesStaticAndKnownInstanceMethodHops(): void

@@ -75,6 +75,57 @@ runs at all).
   `✓ All clear`; a full `--type=all` sanity pass across the entire 28-project corpus (13 plugins,
   15 themes) shows no crashes and no other regressions.
 
+- [x] **A hand-rolled `spl_autoload_register()` autoloader whose search root is set from an opaque
+  bootstrap constant — not computed relative to the registering file's own directory at all — was
+  still only exempted for that file's own directory tree.** The `dirnameAncestorUpLevels` fix just
+  above generalizes "the root is N levels above the registering file," but doesn't cover "the root
+  has no fixed relationship to the registering file's location whatsoever." Found by a fresh
+  gap-hunting pass: **Elementor**'s `includes/autoloader.php` —
+  ```php
+  class Autoloader {
+      private static $default_path;
+      public static function run( $default_path = '', $default_namespace = '' ) {
+          if ( '' === $default_path ) {
+              $default_path = ELEMENTOR_PATH;  // the plugin's own root, defined in the top-level bootstrap file
+          }
+          self::$default_path = $default_path;
+          spl_autoload_register( [ __CLASS__, 'autoload' ] );
+      }
+      private static function load_class( $relative_class_name ) {
+          // ... self::$default_path . $filename . '.php' ...
+      }
+  }
+  ```
+  `includes/` (where the registering file lives, and thus the previously-trusted exempt scope) is
+  one level below the actual root every resolved class file sits under (`app/`, `core/`,
+  `modules/`, `includes/`, ...). This was **100% of Elementor's 962 `UnusedFile` findings** — every
+  class reached only through this autoloader, project-wide.
+
+  Fixed generally, not tied to Elementor's own names: `PhpTokenParser::hasBarePathConstantAssignment()`
+  scans a file's tokens (whole-file, same coarseness `maxDirnameAncestorUpLevels()` already
+  accepts) for ANY plain local/property assignment whose value is a single bare, unresolvable
+  constant identifier — the same shape `isLiteralPathIgnorableConstantExpression` already treats
+  as "a deterministic absolute bootstrap path/dir constant this parser can't (and doesn't need to)
+  resolve" for concatenation prefixes elsewhere in `LiteralPathPropagation` — excluding
+  `true`/`false`/`null`. Recorded on `ParseResult::$autoloadRootIsBareConstant`. `FileAnalyzer`
+  now exempts the *project root* (instead of `ascendRelativeDir($callerRelDir, ...)`) for a file
+  registering `spl_autoload_register()` when this flag is set; unset (the common case, e.g.
+  Kadence) reproduces the exact prior `dirnameAncestorUpLevels`-adjusted behavior unchanged.
+
+  **Scope limitation:** file-wide, not scoped to the exact registering function or the property the
+  callback actually reads — a bare-constant assignment anywhere else in the same file (unrelated to
+  the autoloader) also triggers project-root exemption, matching this exemption's existing
+  "co-occurrence, not proven causality" trade-off (see `$autoloadRegisterExemptDirs`'s own
+  docblock) rather than a stricter, harder-to-maintain per-property trace.
+
+  Verified: new `PhpTokenParser` unit test coverage for the bare-constant-assignment detector and a
+  new `FileAnalyzer` end-to-end regression (Elementor-shaped autoloader, root-scoped exemption).
+  Full suite (687 tests) and PHPStan clean. Real-world: Elementor's `--type=files` goes from 962
+  findings to `✓` (zero unused-file findings); a full corpus sweep (18 plugins, 16 themes) shows
+  no crashes and the ONLY two projects whose finding counts changed were Elementor (this fix) and
+  Contact Form 7 (the literal-path multi-hop fix documented in the File Detection section below) —
+  every other project's counts are byte-identical to the pre-fix baseline.
+
 # Parsing / Class & Method Detection — Open Issues
 
 Known gaps in `PhpTokenParser` and the class/method-unused analysis built on top of it
@@ -1697,6 +1748,43 @@ not shipped bugs.
   because `src/Autoloader.php`'s own hand-rolled `spl_autoload_register()` fallback separately
   blanket-exempts the whole `src/` tree (see the entry below) — a real, if narrow, gap where two
   independent exemption mechanisms happen to cover the same directory in the same plugin.
+
+- [x] **A theme/plugin that bundles its OWN, separately Composer-managed dependency tree under a
+  project subdirectory — not the scan root — was invisible to every mechanism above.**
+  `loadGeneratedComposerAutoload()` only ever read `$rootDir . '/vendor/composer'`; a
+  `vendor/composer/autoload_*.php` living anywhere else in the tree was never discovered.
+  Found by a fresh gap-hunting pass, **confirmed independently in two themes**: colibri-wp's
+  `inc/vendor/composer/autoload_psr4.php` maps `ColibriWP\Theme\` to `inc/src` (the theme's OWN
+  genuinely PSR-4-autoloaded class tree, not a dependency — **106 of colibri-wp's 106 `UnusedFile`
+  findings** were this exact `inc/src/**` tree); silverstorm bundles the same shared
+  `siteleads-integration` package under its own nested `vendor/`, accounting for **8 of its own
+  false positives**.
+
+  Fixed generally, not tied to either project's own names: `FileAnalyzer::findVendorDirs()` walks
+  the project tree (pruning `node_modules`/`.git`, same as `FileScanner`'s own walk) for every
+  directory literally named `vendor` that also contains its own `composer/` subdirectory — at any
+  depth, mirroring `FileScanner`'s existing "vendor at any depth" convention
+  (`isVendorPrefixedDirName`) for the identical directory-naming signal. `loadComposerAutoloadPaths()`
+  now calls `loadGeneratedComposerAutoload()` once per discovery instead of once, hardcoded, at
+  the scan root; `isVendorPath()` now checks against that specific vendor directory's own root
+  rather than always `$rootDir . '/vendor/'`, so a nested vendor tree's OWN genuine third-party
+  dependencies still route to `$vendorAutoloadDirs` (blanket-exempted, not proven) while the
+  bundling project's own code above it routes to `$projectAutoloadDirs`/`$projectAutoloadClassFiles`
+  (real-usage-proof required, per the entry above). Doesn't descend further once a vendor dir is
+  found — no real-world evidence yet of a vendor tree nested inside another vendor tree, and
+  skipping that keeps the walk bounded to the project's own code rather than every dependency's
+  full tree too.
+
+  Verified: two new `FileAnalyzer` end-to-end regressions (a nested-vendor PSR-4-mapped class is
+  exempted; a file outside that mapped directory is still reported) plus the three pre-existing
+  root-level Composer-autoload tests re-verified passing (a signature change to
+  `loadGeneratedComposerAutoload()`/`isVendorPath()` initially broke all three — caught
+  immediately by the existing suite, fixed before this landed). `composer check` clean (691 tests,
+  PHP-CS-Fixer, PHPStan). Real-world: colibri-wp's `UnusedFile` count drops from 106 to 20 (the
+  residual 20 are a separate, unrelated pattern — a two-independently-literal-parameter template
+  helper, documented further down as not yet fixed); silverstorm's drops from 16 to 7. Full corpus
+  sweep (18 plugins, 16 themes) shows no crashes, and colibri-wp/silverstorm were the ONLY two
+  projects whose counts changed — everything else is byte-identical to the pre-fix baseline.
 
 - [x] **Dynamic bulk-include loops are a blind spot.** Fixed: `PhpTokenParser` now recognizes
   `glob(...)` calls (`parseGlobDirRef`, sharing a `findTrailingStringLiteral` helper refactored
@@ -3433,6 +3521,81 @@ either back up; don't re-discover the same evidence from scratch.
   documented template count changed. Final `composer check` is clean (PHP-CS-Fixer, PHPStan,
   and PHPUnit).
 
+- [x] **The SAME source value appearing twice in one concatenation — a fixed-path wrapper built
+  as `prefix + $param + middle + $param + suffix`, not just `prefix + $param + suffix` — was
+  rejected outright as soon as the resolver saw a second dynamic term, even though it was the
+  exact same variable both times.** Confirmed real-world (Contact Form 7,
+  `load.php`/`includes/functions.php`): `WPCF7::load_module( $mod )` calls
+  `wpcf7_include_module_file( $mod . '/' . $mod . '.php' )` — 26 literal call sites
+  (`self::load_module('acceptance')`, `('akismet')`, ...) via `load_modules()`.
+  `wpcf7_include_module_file( $path )` then does `$path = path_join( $dir, ltrim( $path, '/' ) );
+  include_once $path;` — a SECOND hop through `path_join()`, a real WP-core function (not defined
+  in the plugin), nested around the already-recognized `ltrim($x, '/')` identity transform. Every
+  one of CF7's 24 `modules/*.php` files was a false-positive `UnusedFile`.
+
+  Fixed generally, not tied to CF7's own names, in two independent pieces:
+  - `resolveLiteralPathExpressionTokens()`'s term-scanning loop now collects every occurrence of a
+    dynamic term instead of bailing the moment a second one appears, accepting the concatenation
+    as long as every occurrence resolves to the exact same source node (two DIFFERENT dynamic
+    terms is still rejected, unchanged). `LiteralPathPropagationLink` gained `$middleSegments` — the
+    literal fragments between repeated occurrences (`['/'] ` for `$mod . '/' . $mod . '.php'`) —
+    alongside the existing `$prefix`/`$suffix`; `LiteralPathPropagationResolver` substitutes the
+    flowing value at every occurrence, not just once. Each gap between two occurrences must be a
+    FULLY known literal (no partial-then-stop tolerance like prefix/suffix have) — a partially
+    unresolved middle would misplace where the value actually falls, so the whole expression is
+    left unresolved instead of guessing.
+  - `path_join( $base, $relative )` is recognized as an identity transform for its second
+    (relative-path) argument — resolved *recursively* through the same function, so a nested
+    `ltrim()` call there still resolves as it would standalone — the same "real PHP/WP-core call,
+    not a project-specific wrapper" treatment `ltrim($x, '/')` already gets just above it; the base
+    directory argument is dropped entirely, consistent with how other ignorable directory prefixes
+    (`get_template_directory()`, a bare bootstrap constant) are already dropped elsewhere in this
+    exact mechanism.
+
+  **Scope limitation:** the repeated-occurrence case requires the SAME node value, not just two
+  resolvable dynamic terms — `$mod . $sep . $variant . '.php'` (two different variables) is still
+  rejected, by design. `path_join()`'s first argument is trusted unconditionally as "irrelevant for
+  matching purposes," same trade-off as every other ignorable-prefix case in this mechanism.
+
+  Verified: three new `PhpTokenParser` unit tests (repeated-occurrence resolution, rejects an
+  unresolvable middle segment, still rejects two distinct dynamic terms) and a new `FileAnalyzer`
+  end-to-end regression reproducing the exact CF7 shape end-to-end through
+  `LiteralPathPropagationResolver`. Full suite (687 tests) and PHPStan clean. Real-world: Contact
+  Form 7's `--type=files` goes from 24 findings to `✓` (zero unused-file findings); full corpus
+  sweep shows no crashes, and CF7 is one of only two projects whose counts changed (see the
+  Elementor autoloader fix in the File Scanning section above for the other).
+
+- [x] **The SAME repeated-source-value shape just above, but for curly-brace string
+  INTERPOLATION instead of concatenation.** `"prefix{$var}suffix"` only ever recognized exactly
+  one `{$var}` occurrence (`interpolatedPrefixCurlyVarSuffixAt()`); a second `{$var}` for the same
+  variable bailed the same way the concatenation form used to. Found by a fresh gap-hunting pass:
+  Jetpack's `load_and_register_deferred_block( $feature )` builds
+  `"extensions/blocks/{$feature}/{$feature}.php"` — the exact interpolation counterpart to CF7's
+  `$mod . '/' . $mod . '.php'`.
+
+  Fixed with a new `interpolatedRepeatedVarSegmentsAt()` — a strict generalization of the existing
+  single-occurrence parser, reusing the identical `[prefix, $middleSegments, suffix]` contract the
+  concatenation fix above already established, so `resolveLiteralPathExpressionTokens()`'s
+  interpolation branch needed no further changes beyond swapping which parser it calls. The
+  original `interpolatedPrefixCurlyVarSuffixAt()` is kept as-is and still used by its own other
+  caller (the class-name-transform-template capture) — that consumer has no real-world evidence of
+  a repeated variable, so it stays on the simpler parser rather than being switched over
+  speculatively. A second `{$var}` for a DIFFERENT variable is still rejected, same restriction as
+  the concatenation case.
+
+  **Caveat, not a scope limitation of the fix itself:** at Jetpack's own specific call site,
+  `$feature`'s value isn't literal-chain-reachable at all (resolved from a runtime block-name
+  parse, only *bounded* by a flat array) — so this fix, by itself, doesn't change Jetpack's finding
+  count. Landed anyway since it's a correct, low-risk, symmetric extension of infrastructure that
+  already exists, verified against the exact real-world shape via a dedicated unit test rather than
+  end-to-end scan-count deltas.
+
+  Verified: two new `PhpTokenParser` unit tests (repeated-occurrence resolution with a middle
+  segment; still rejects two distinct interpolated variables). Full suite (691 tests) and PHPStan
+  clean. Full corpus sweep shows no crashes and no finding-count changes anywhere (expected, per
+  the caveat above — this fix has no visible real-world instance in the current corpus yet, only
+  the confirmed-real Jetpack code shape it now correctly parses).
+
 - [ ] **A class-property array of literal-string entries, iterated by a shared trait/base method
   that registers `[$this, transform(literal)]` as an `add_action`/`add_filter` callback where
   `transform` is a known string function (`str_replace()`) applied to the literal, isn't
@@ -3460,3 +3623,171 @@ either back up; don't re-discover the same evidence from scratch.
   mechanism — this is a genuinely dynamic (user-configurable at runtime) value, structurally
   different from every other item in this section, which are all resolvable from static code
   alone.
+
+- [ ] **A static-property array literal, KEYED and NESTED (version → list of function-name
+  strings), read back through a getter method and dispatched via `call_user_func()` on a `foreach`
+  variable one or two hops (and, in one real path, one more file) away, isn't resolved.**
+  Real-world finding (WooCommerce, `includes/class-wc-install.php`): `self::$db_updates` maps each
+  version string to an array of `wc_update_*_db_version`/`wc_admin_update_*` function-name
+  literals; `get_db_update_callbacks()` returns it unchanged. Two independent real dispatch paths
+  both end in `call_user_func()` on a value that traces back to this table, neither a single hop:
+  - `class-wc-install.php`'s own `foreach ($updates as $version => $update_callbacks) { foreach
+    ($update_callbacks as $update_callback) { WC()->queue()->schedule_single(..., 'woocommerce_
+    run_update_callback', ['update_callback' => $update_callback], ...); } }` schedules an Action
+    Scheduler task; a *separate* `add_action('woocommerce_run_update_callback', [__CLASS__,
+    'run_update_callback'])` registers the handler, whose body does `call_user_func($update_
+    callback)`. The literal never reaches `call_user_func` directly in source — Action Scheduler
+    is the implicit relay, invoked outside any scanned code, at runtime.
+  - `includes/cli/class-wc-cli-update-command.php`'s WP-CLI command flattens the SAME nested table
+    into a fresh `$callbacks_to_run` array via a nested `foreach` + `$callbacks_to_run[] =
+    $update_callback;` accumulation, then a *separate, later* `foreach ($callbacks_to_run as
+    $update_callback) { call_user_func($update_callback); }` — single-function, no hook relay, but
+    still requires an accumulator-array tracking capability this parser doesn't have (only a
+    direct `$var = array(literal, ...)` assignment feeds a `foreach`'s known literal domain today,
+    not a loop that *builds* an array by repeated `[] =` pushes from another loop's variable).
+
+  12 confirmed false positives (`wc_update_354_db_version`, `wc_update_450_db_version`,
+  `wc_update_560_db_version`, `wc_update_670_delete_deprecated_remote_inbox_notifications_option`,
+  `wc_update_700_remove_recommended_marketing_plugins_transient`,
+  `wc_update_722_adjust_ukraine_states`,
+  `wc_update_750_disable_new_product_management_experience`,
+  `wc_update_830_rename_cart_template`, `wc_update_890_update_paypal_standard_load_eligibility`,
+  `wc_update_910_remove_obsolete_user_meta`,
+  `wc_update_930_migrate_user_meta_for_launch_your_store_tour`,
+  `wc_update_940_remove_help_panel_highlight_shown`). Deliberately not fixed: either path needs a
+  genuinely new capability (nested/keyed array-literal flattening feeding a project-wide,
+  cross-file "property/getter → array of literals" pool the way `functionArrayReturns` already
+  does for a flat one, PLUS either an Action-Scheduler-as-hook-relay recognition or a new
+  foreach-accumulator-array tracking primitive) stacked two-to-three deep, not a small extension
+  of an existing mechanism — the project's own "2+ independent instances plus a bounded, low-risk
+  implementation path" bar for "worth building" isn't cleared (this is the only confirmed
+  real-world instance, and the implementation path is the opposite of bounded). Re-read this
+  entry, including both dispatch paths above, before picking it back up.
+
+- [ ] **`$this->prop` read to build a path resolves only against a same-class/same-file
+  assignment — never against a property-DECLARATION default in a SUBCLASS.** Real-world
+  (Advanced Custom Fields): `ACF_Admin_Internal_Post_Type_List::get_not_found_html()` reads
+  `$this->post_type` to build `acf_get_view($this->post_type . '/list-empty')`; `$post_type` is
+  never assigned in this class at all — it only ever exists as `public $post_type =
+  'acf-field-group';`-style property-declaration defaults in 3 separate subclasses. 8 of ACF's 10
+  `UnusedFile` findings are this exact shape. Needs a genuinely new capability (resolving a
+  property read against every subclass's own declaration-default, which requires inheritance-
+  chain awareness this parser's per-file, per-class property tracking doesn't have) — deep, not a
+  small extension, comparable in shape to the WooCommerce table-dispatch gap above. 1 confirmed
+  instance so far.
+
+- [ ] **A `[$this, "method_{$key}"]` self-dispatch name interpolated from a `foreach` KEY (not a
+  value) over a function call's own returned array isn't resolved.** Real-world (Advanced Custom
+  Fields): `class-acf-field.php`, `foreach (acf_get_combined_field_type_settings_tabs() as $key =>
+  $val) { $this->add_field_action("...{$key}", [$this, "render_field_{$key}_settings"], ...); }`
+  — `acf_get_combined_field_type_settings_tabs()` (`includes/fields.php`) merges a literal array
+  with a filter result. Causes `render_field_validation_settings`/`render_field_presentation_
+  settings`-style methods to false-positive across 15+ field-type subclasses. Needs a new
+  capability in two parts: tracking a function's returned array KEYS project-wide (the existing
+  `functionArrayReturns` only tracks VALUES), plus a foreach-over-keys feeding an interpolated
+  self-dispatch method name. Deep, not a small extension. 1 confirmed instance (high finding
+  count, but still a single code shape).
+
+- [x] **CORRECTION to an earlier, WRONG assessment of this exact finding (see git history for the
+  original entry): a dynamic view/template dispatch's dynamic segment IS statically bounded here,
+  contrary to what a first pass concluded — it was misread as an unresolvable database
+  round-trip.** Real-world (Wordfence): `views/diagnostics/text.php` does `wfView::create(
+  'scanner/text/issue-' . $i['type'], ...)` where `$i['type']` comes from
+  `wfIssues::shared()->getIssues(...)` — records read back from the database, genuinely
+  unresolvable on its own. BUT the SAME file gates the whole dispatch with `$issueTypes =
+  wfIssues::validIssueTypes(); ... if (!in_array($i['type'], $issueTypes)) { continue; }` —
+  `wfIssues::validIssueTypes()` (`lib/wfIssues.php`) returns a plain flat literal array of ~30
+  issue-type slugs. That guard is a REAL, static, in-code vocabulary source; the "no code-level
+  chain connecting the two call sites" claim in the original entry was simply wrong — re-reading
+  the surrounding code (not just the one flagged line) found it. 34 of Wordfence's `UnusedFile`
+  findings were this exact shape.
+
+  Fixed generally, not tied to Wordfence's own names, as a genuinely new (but narrowly scoped)
+  capability: a concatenation's sole dynamic term, when unresolvable as a normal flowing node, is
+  now ALSO checked against `in_array($expr, ClassName::method())` guards found anywhere in the
+  same file (`PhpTokenParser::resolveInArrayGuardedConcatenation()`/`findInArrayGuardDomainCall()`)
+  — including through one variable-assignment hop (`$issueTypes = wfIssues::validIssueTypes();
+  ... in_array($x, $issueTypes)`, the far more common real shape, via
+  `findVariableAssignedScopedCallTarget()`). The domain call's own return values are resolved
+  project-wide via `$functionArrayReturns` — the SAME pool `functionNameTransformTemplates`
+  already cross-references, just for a file/template sink instead of a function name — once every
+  file is merged (`LiteralPathPropagationResolver::resolve()`, which now also merges
+  `$functionArrayReturns` and consumes a new `PendingInArrayGuardedInput` record: one synthetic
+  literal input per domain value, at the exact call-argument node it was found at, feeding the
+  SAME graph walk every other literal input already uses). A genuinely separate discovery made
+  getting there: `resolveReturnArrayLiterals()` had NEVER handled `return array(...);` directly —
+  only `return $var;` (a variable assigned an array literal earlier) — so `functionArrayReturns`
+  didn't even see `validIssueTypes()`'s own return at all until that was fixed too (a real,
+  foundational gap in an existing mechanism, not specific to this new capability).
+
+  **Scope limitation:** the guard's domain call must be an explicit `ClassName::method()` (never
+  `self::`/`static::`/`parent::` — this is a file-wide, context-free scan with no notion of
+  "current class" at the guard's own position to resolve those against); exactly one dynamic term
+  in the concatenation (two would make this an arbitrary correlation, not a bounded vocabulary);
+  and the guard is matched by exact token-text equality anywhere in the file, not proven to
+  actually execute before the usage (same "co-occurrence, not proven causality" trade-off this
+  mechanism already makes throughout). One real residual in Wordfence itself:
+  `issue-checkGSB.php` stays flagged — `'checkGSB'` is a real, used issue type (`addIssue(
+  'checkGSB', ...)` in `wfScanEngine.php`) but is NOT actually listed in `validIssueTypes()`'s own
+  returned array, an apparent inconsistency in Wordfence's own code, not a bug in this fix.
+
+  A separate, PRE-EXISTING gap surfaced while writing this fix's own test coverage (unrelated to
+  it, not fixed): `resolveLiteralPathIncludeSource()` never passes `$currentClass`/
+  `$trackedProperties` through to `resolveLiteralPathExpressionTokens()`, so a direct `include
+  "prefix" . $this->prop . "suffix";` — no intermediate local variable — never resolves
+  `$this->prop`, even when the property is otherwise tracked. Every real-world instance seen so
+  far (including Wordfence's own `wfView::render()`) happens to assign to a local variable first,
+  so this hasn't caused a visible false positive yet — noted here for whoever next touches this
+  area, not filed as its own entry since there's no real-world finding driving it.
+
+  Verified: five new `PhpTokenParser` unit tests (direct-literal-array return capture; guard
+  recorded via both the direct-call and variable-indirection shapes; no guard present records
+  nothing) and a new end-to-end `FileAnalyzer` regression (cross-file: the domain-returning class
+  and the guarded dispatch live in separate files, matching Wordfence's own layout) resolving both
+  domain values to real files while leaving a third, non-domain file correctly flagged. Full suite
+  (696 tests) and PHPStan/PHP-CS-Fixer clean. Real-world: Wordfence's `UnusedFile` count goes from
+  38 to 7 (the residual 6 are unrelated genuine orphans plus the `checkGSB` inconsistency above).
+  Full corpus sweep (18 plugins, 16 themes) shows no crashes, and Wordfence is the only project
+  whose counts changed.
+
+- [ ] **CORRECTION to an earlier, INCOMPLETE assessment of this finding: the real blocker isn't
+  just "two independently-literal parameters" (a genuinely buildable capability on its own) — it's
+  that BOTH parameters are also routed through an unmodelable project-local transform first,
+  which breaks the chain regardless of the two-parameter question.** Real-world (colibri-wp,
+  shared by the whole Colibri-page-builder theme family): `inc/src/View.php`'s
+  `View::partial( $category, $slug, $data )` does
+  ```php
+  $category = Utils::camel2dashed( $category );
+  $slug     = Utils::camel2dashed( $slug );
+  static::make( "template-parts/{$category}/{$slug}", $data );
+  ```
+  where `Utils::camel2dashed()` (`inc/src/Core/Utils.php`) is
+  `strtolower( preg_replace( '/([a-zA-Z])(?=[A-Z])/', '$1-', $string ) )` — a real regex transform,
+  not an identity no-op. Confirmed EVERY real call site in colibri-wp routes through `partial()`
+  (no bypass calling `View::make()` directly with literals) — **36 of colibri-wp's 37
+  `UnusedTemplate` findings** are this exact shape, all blocked by this same transform, not merely
+  by the two-parameter question.
+
+  Why this can't be safely generalized, unlike every other transform this mechanism already treats
+  as transparent (`basename()`, `ltrim($x, '/')`, `sanitize_file_name()`): those are all curated,
+  real PHP/WP-CORE builtins where "identity for matching purposes" is a documented, provably-safe
+  simplification (FileAnalyzer's own referenced-index already matches by basename/stem regardless).
+  `Utils::camel2dashed()` is Colibri's OWN theme-local utility — treating it (or "any unresolvable
+  project-local single-arg reassignment") as identity would be either (a) an unsafe BLANKET
+  assumption that could silently produce WRONG matches for a transform that genuinely changes
+  content elsewhere in the corpus (this exact mechanism explicitly rejects that trade-off already —
+  see the `str_replace()` test: "keeping its output unresolved prevents ordinary transformations
+  from suppressing unrelated unused-file findings"), or (b) an effectively plugin-specific special
+  case dressed up as a general rule (e.g. "curated case/separator-normalization regex shapes") that
+  would only ever actually match Colibri's own code in this corpus — squarely the thing
+  [[feedback-no-plugin-specific-fixes]] forbids. Neither option was implemented.
+
+  The two-parameter capability itself (record a literal PAIR at each call site, keyed to two
+  parameter positions, joined by the callee's own fixed separator) remains a real, buildable,
+  genuinely generalizable capability on its own — it's just NOT what colibri-wp actually needs, so
+  building it wouldn't move colibri-wp's own numbers at all. Confirmed present in the wider
+  Colibri-page-builder theme family (silverstorm, commerce-grove, go, variations use the same
+  `View`/`Utils` base — not independently verified whether their own call sites hit the same
+  `camel2dashed()` gate, but presumably yes, same shared code). Listed here as a real capability
+  gap distinct from colibri-wp's own blocker; worth a follow-up pass only if a DIFFERENT real-world
+  instance surfaces that doesn't route through an unmodelable transform first.

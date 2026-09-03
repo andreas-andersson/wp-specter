@@ -6,6 +6,7 @@ namespace WpSpecter\Analyzer;
 
 use WpSpecter\Parser\LiteralPathPropagationLink;
 use WpSpecter\Parser\ParseResult;
+use WpSpecter\Parser\PendingInArrayGuardedInput;
 
 /**
  * Resolves the deliberately small graph captured by PhpTokenParser for literal arguments that
@@ -31,6 +32,10 @@ final class LiteralPathPropagationResolver
         $fileExistenceGuards = [];
         /** @var list<array{string,string,bool,int}> $states */
         $states = [];
+        /** @var array<string,list<string>> $functionArrayReturns */
+        $functionArrayReturns = [];
+        /** @var list<PendingInArrayGuardedInput> $pendingInArrayGuardedInputs */
+        $pendingInArrayGuardedInputs = [];
 
         foreach ($parseResults as $result) {
             foreach ($result->literalPathPropagationLinks as $link) {
@@ -42,6 +47,27 @@ final class LiteralPathPropagationResolver
             foreach ($result->literalPathInputs as $input) {
                 if ($input->literal !== '') {
                     $states[] = [$input->targetNode, $input->literal, false, 0];
+                }
+            }
+            foreach ($result->functionArrayReturns as $key => $values) {
+                if (!isset($functionArrayReturns[$key])) {
+                    $functionArrayReturns[$key] = [];
+                }
+                array_push($functionArrayReturns[$key], ...$values);
+            }
+            array_push($pendingInArrayGuardedInputs, ...$result->pendingInArrayGuardedInputs);
+        }
+
+        // See PendingInArrayGuardedInput's own docblock: each one becomes one seeded literal
+        // input per value its domain call is now known (project-wide) to return — the same
+        // "coarse net" cross-product $functionNameTransformTemplates × $functionArrayReturns
+        // already makes in FunctionAnalyzer, applied here to a file/template sink instead of a
+        // function name.
+        foreach ($pendingInArrayGuardedInputs as $pending) {
+            foreach ($functionArrayReturns[$pending->domainFunctionKey] ?? [] as $value) {
+                $resolvedValue = $pending->prefix . $value . $pending->suffix;
+                if ($resolvedValue !== '') {
+                    $states[] = [$pending->targetNode, $resolvedValue, false, 0];
                 }
             }
         }
@@ -66,8 +92,12 @@ final class LiteralPathPropagationResolver
                 ) {
                     continue;
                 }
-                $resolvedPath = $link->prefix . $path . $link->suffix;
-                $hasPathFragment = $hasFixedPathFragment || $link->prefix !== '' || $link->suffix !== '';
+                $resolvedPath = $link->prefix . $path;
+                foreach ($link->middleSegments as $middleSegment) {
+                    $resolvedPath .= $middleSegment . $path;
+                }
+                $resolvedPath .= $link->suffix;
+                $hasPathFragment = $hasFixedPathFragment || $link->prefix !== '' || $link->suffix !== '' || $link->middleSegments !== [];
 
                 if ($link->isSink) {
                     // A direct `require $param` is too broad by itself. At least one wrapper

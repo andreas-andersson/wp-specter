@@ -19,6 +19,11 @@ final class LiteralPathPropagationLink
     /**
      * @param list<string> $fileExistenceGuardKeys Any one of these exact guard keys must have
      *                                             been recorded for this link to be traversable.
+     * @param list<string> $middleSegments Literal fragments between repeated occurrences of the
+     *                                     same source value (Contact Form 7's `$mod . '/' . $mod
+     *                                     . '.php'` module-loader shape: the resolved path is
+     *                                     `prefix . value . middleSegments[0] . value . ... .
+     *                                     suffix`). Empty for the common single-occurrence case.
      */
     public function __construct(
         public readonly string $fromNode,
@@ -27,5 +32,6 @@ final class LiteralPathPropagationLink
         public readonly string $suffix = '',
         public readonly bool $isSink = false,
         public readonly array $fileExistenceGuardKeys = [],
+        public readonly array $middleSegments = [],
     ) {}
 }

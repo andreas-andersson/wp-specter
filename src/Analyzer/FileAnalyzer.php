@@ -334,12 +334,59 @@ final class FileAnalyzer
             }
         }
 
-        $this->loadGeneratedComposerAutoload($rootDir);
+        foreach ($this->findVendorDirs($rootDir) as $vendorDir) {
+            $this->loadGeneratedComposerAutoload($vendorDir);
+        }
     }
 
-    private function isVendorPath(string $path, string $rootDir): bool
+    /**
+     * A theme/plugin can bundle its OWN, separately Composer-managed dependency tree under a
+     * project subdirectory instead of the scan root — the root-only `$rootDir . '/vendor/composer'`
+     * this used to hardcode never found it. Real-world shape (colibri-wp): `inc/vendor/composer/
+     * autoload_psr4.php` maps `ColibriWP\Theme\` to `inc/src` — the theme's OWN genuinely
+     * PSR-4-autoloaded class tree, not a dependency at all, invisible to loadGeneratedComposerAutoload()
+     * because it never looked there. Every directory literally named "vendor" that also contains
+     * its own `composer/` subdirectory (i.e., a real Composer-generated tree, not just a
+     * coincidentally-named directory) is a hit, at any depth — mirroring FileScanner's own
+     * "vendor at any depth" pruning (`isVendorPrefixedDirName`) for the same directory-name
+     * convention. Doesn't descend further once a vendor dir is found: no real-world evidence yet
+     * of a vendor tree nested inside another vendor tree, and skipping that keeps this bounded to
+     * one filesystem walk of the project's OWN code rather than every dependency's full tree too.
+     *
+     * @return list<string> absolute paths to each vendor directory found (including
+     *                      $rootDir . '/vendor' itself, the pre-existing single-root case)
+     */
+    private function findVendorDirs(string $rootDir): array
     {
-        return str_starts_with($path, $rootDir . '/vendor/');
+        if (!is_dir($rootDir)) {
+            return [];
+        }
+
+        $found = [];
+        $filtered = new \RecursiveCallbackFilterIterator(
+            new \RecursiveDirectoryIterator($rootDir, \FilesystemIterator::SKIP_DOTS),
+            function (\SplFileInfo $current) use (&$found): bool {
+                if (!$current->isDir()) {
+                    return false;
+                }
+                $name = $current->getFilename();
+                if ($name === 'vendor' && is_dir($current->getPathname() . '/composer')) {
+                    $found[] = $current->getPathname();
+                    return false;
+                }
+                return $name !== 'node_modules' && $name !== '.git';
+            },
+        );
+        foreach (new \RecursiveIteratorIterator($filtered) as $_) {
+            // Traversal only — $found is populated by the filter callback above.
+        }
+
+        return $found;
+    }
+
+    private function isVendorPath(string $path, string $vendorDir): bool
+    {
+        return str_starts_with($path, $vendorDir . '/');
     }
 
     /**
@@ -371,9 +418,9 @@ final class FileAnalyzer
      * ($vendorDir/$baseDir) from its own location and nothing else — safe to `include`
      * directly rather than needing a JSON parse or PhpTokenParser.
      */
-    private function loadGeneratedComposerAutoload(string $rootDir): void
+    private function loadGeneratedComposerAutoload(string $vendorDir): void
     {
-        $composerDir = $rootDir . '/vendor/composer';
+        $composerDir = $vendorDir . '/composer';
 
         foreach ($this->includeGeneratedAutoloadFile($composerDir . '/autoload_files.php') as $path) {
             if (is_string($path) && $path !== '') {
@@ -390,7 +437,7 @@ final class FileAnalyzer
             if (!is_string($path) || $path === '' || !is_string($className)) {
                 continue;
             }
-            if ($this->isVendorPath($path, $rootDir)) {
+            if ($this->isVendorPath($path, $vendorDir)) {
                 $this->vendorAutoloadFiles[] = $path;
             } else {
                 $this->projectAutoloadClassFiles[$path] = $this->shortClassName($className);
@@ -407,7 +454,7 @@ final class FileAnalyzer
                         continue;
                     }
                     $dir = rtrim($dir, '/') . '/';
-                    if ($isVendorPrefixed || $this->isVendorPath($dir, $rootDir)) {
+                    if ($isVendorPrefixed || $this->isVendorPath($dir, $vendorDir)) {
                         $this->vendorAutoloadDirs[] = $dir;
                     } else {
                         $this->projectAutoloadDirs[] = $dir;
@@ -744,7 +791,15 @@ final class FileAnalyzer
                     // plugin_dir_path(dirname(__DIR__)) before descending back into the resolved
                     // class subpath). Ascend that many levels from the caller's own directory
                     // before exempting; 0 levels (the common case) is exactly the prior behavior.
-                    $this->autoloadRegisterExemptDirs[] = $this->ascendRelativeDir($callerRelDir, $result->dirnameAncestorUpLevels);
+                    //
+                    // A DIFFERENT real-world shape (Elementor) computes the search root from an
+                    // opaque bootstrap constant instead of the registering file's own location at
+                    // all — see ParseResult::$autoloadRootIsBareConstant's own docblock. There,
+                    // the registering file's directory is the wrong scope entirely (its classes
+                    // span the whole plugin, not just `includes/`), so exempt the project root.
+                    $this->autoloadRegisterExemptDirs[] = $result->autoloadRootIsBareConstant
+                        ? ''
+                        : $this->ascendRelativeDir($callerRelDir, $result->dirnameAncestorUpLevels);
                     break;
                 }
             }

@@ -375,6 +375,8 @@ final class PhpTokenParser
         $literalPathInputs = [];
         /** @var array<string,true> $literalPathFileExistenceGuards */
         $literalPathFileExistenceGuards = [];
+        /** @var list<PendingInArrayGuardedInput> $pendingInArrayGuardedInputs */
+        $pendingInArrayGuardedInputs = [];
         // Each named wrapper scope maps its currently-known local values to graph nodes. A
         // reassignment creates a fresh node, so `$path = root() . '/x/' . $path . '.php'` keeps
         // the parameter's incoming value distinct from the constructed output path. WPForms'
@@ -957,6 +959,7 @@ final class PhpTokenParser
                                 false,
                                 $literalPathPropagationLinks,
                                 $literalPathInputs,
+                                $pendingInArrayGuardedInputs,
                             );
                         }
                     }
@@ -1115,12 +1118,13 @@ final class PhpTokenParser
                         $literalPathNodeStack[$literalPathScopeTop],
                     );
                     if ($returnSource !== null) {
-                        [$sourceNode, $prefix, $suffix] = $returnSource;
+                        [$sourceNode, $prefix, $middleSegments, $suffix] = $returnSource;
                         $literalPathPropagationLinks[] = new LiteralPathPropagationLink(
                             $sourceNode,
                             $this->literalPathReturnNode($literalPathFunctionKey),
                             $prefix,
                             $suffix,
+                            middleSegments: $middleSegments,
                         );
                     }
                 }
@@ -1424,6 +1428,7 @@ final class PhpTokenParser
                                 false,
                                 $literalPathPropagationLinks,
                                 $literalPathInputs,
+                                $pendingInArrayGuardedInputs,
                             );
 
                             // $this->get_section( 'colors' ) — a scoped call with a plain
@@ -1623,6 +1628,7 @@ final class PhpTokenParser
                                 false,
                                 $literalPathPropagationLinks,
                                 $literalPathInputs,
+                                $pendingInArrayGuardedInputs,
                             );
                             $i = $methodNameIndex;
                         } else {
@@ -1696,6 +1702,7 @@ final class PhpTokenParser
                             false,
                             $literalPathPropagationLinks,
                             $literalPathInputs,
+                            $pendingInArrayGuardedInputs,
                         );
                         $i = $methodNameIndex;
                     }
@@ -1760,6 +1767,7 @@ final class PhpTokenParser
                                 false,
                                 $literalPathPropagationLinks,
                                 $literalPathInputs,
+                                $pendingInArrayGuardedInputs,
                             );
 
                             // Foo::bulkLoad('inc') — a scoped call with a plain string-literal
@@ -1860,6 +1868,7 @@ final class PhpTokenParser
                     $this->isLiteralPathSinkFunction($name),
                     $literalPathPropagationLinks,
                     $literalPathInputs,
+                    $pendingInArrayGuardedInputs,
                 );
                 $this->captureHookPassThroughParam(
                     $name,
@@ -1914,6 +1923,7 @@ final class PhpTokenParser
                                 false,
                                 $literalPathPropagationLinks,
                                 $literalPathInputs,
+                                $pendingInArrayGuardedInputs,
                             );
 
                             // \WP_CLI::add_command(...) — the exact same reflection-dispatch
@@ -2009,6 +2019,7 @@ final class PhpTokenParser
                         $this->isLiteralPathSinkFunction($shortName),
                         $literalPathPropagationLinks,
                         $literalPathInputs,
+                        $pendingInArrayGuardedInputs,
                     );
                     $this->captureHookPassThroughParam(
                         $shortName,
@@ -2404,12 +2415,13 @@ final class PhpTokenParser
                         $literalPathNodeStack[$literalPathScopeTop],
                     );
                     if ($includeSource !== null) {
-                        [$sourceNode, $prefix, $suffix] = $includeSource;
+                        [$sourceNode, $prefix, $middleSegments, $suffix] = $includeSource;
                         $literalPathPropagationLinks[] = new LiteralPathPropagationLink(
                             $sourceNode,
                             prefix: $prefix,
                             suffix: $suffix,
                             isSink: true,
+                            middleSegments: $middleSegments,
                         );
                     }
                 }
@@ -2437,6 +2449,7 @@ final class PhpTokenParser
         }
 
         $dirnameAncestorUpLevels = $this->maxDirnameAncestorUpLevels($tokens);
+        $autoloadRootIsBareConstant = $this->hasBarePathConstantAssignment($tokens);
 
         return new ParseResult(
             file: $file,
@@ -2481,6 +2494,8 @@ final class PhpTokenParser
             functionArrayReturns: $functionArrayReturns,
             functionNameTransformTemplates: $functionNameTransformTemplates,
             dirnameAncestorUpLevels: $dirnameAncestorUpLevels,
+            autoloadRootIsBareConstant: $autoloadRootIsBareConstant,
+            pendingInArrayGuardedInputs: $pendingInArrayGuardedInputs,
         );
     }
 
@@ -2667,7 +2682,7 @@ final class PhpTokenParser
             return;
         }
 
-        [$sourceNode, $prefix, $suffix, $guardKey] = $source;
+        [$sourceNode, $prefix, $middleSegments, $suffix, $guardKey] = $source;
         if ($guardKey !== null && !isset($fileExistenceGuards[$guardKey])) {
             $this->invalidateLiteralPathAddress($nodes, $address);
             return;
@@ -2679,6 +2694,7 @@ final class PhpTokenParser
             $prefix,
             $suffix,
             fileExistenceGuardKeys: $guardKey === null ? [] : [$guardKey],
+            middleSegments: $middleSegments,
         );
         $nodes[$address] = $targetNode;
     }
@@ -2776,7 +2792,7 @@ final class PhpTokenParser
             unset($trackedProperties[$currentClass][$propName]);
             return;
         }
-        [$sourceNode, $prefix, $suffix, $guardKey] = $source;
+        [$sourceNode, $prefix, $middleSegments, $suffix, $guardKey] = $source;
         if ($guardKey !== null && !isset($fileExistenceGuards[$guardKey])) {
             unset($trackedProperties[$currentClass][$propName]);
             return;
@@ -2787,6 +2803,7 @@ final class PhpTokenParser
             $prefix,
             $suffix,
             fileExistenceGuardKeys: $guardKey === null ? [] : [$guardKey],
+            middleSegments: $middleSegments,
         );
         $trackedProperties[$currentClass][$propName] = true;
     }
@@ -2874,8 +2891,10 @@ final class PhpTokenParser
      * @param array<string,array<string,string>> $propertyLiteralDefaults
      * @param list<LiteralPathPropagationLink> $links
      * @param list<LiteralPathInput> $inputs
-     * @return array{string,string,string,?string}|null [source node, fixed prefix, fixed suffix,
-     *                                                   required file-existence guard key]
+     * @return array{string,string,list<string>,string,?string}|null [source node, fixed prefix,
+     *                                                   literal fragments between repeated source
+     *                                                   occurrences, fixed suffix, required
+     *                                                   file-existence guard key]
      */
     private function resolveLiteralPathAssignmentSource(
         array $tokens,
@@ -2916,15 +2935,15 @@ final class PhpTokenParser
             }
             $callee = $this->literalPathScopedCallTarget($valueTokens, $currentNamespace, $useImports, $currentClass, $currentParent);
             if ($callee !== null) {
-                return [$this->literalPathReturnNode($callee), '', '', null];
+                return [$this->literalPathReturnNode($callee), '', [], '', null];
             }
             $bareCallee = $this->literalPathBareCallTarget($valueTokens);
-            return $bareCallee === null ? null : [$this->literalPathReturnNode($bareCallee), '', '', null];
+            return $bareCallee === null ? null : [$this->literalPathReturnNode($bareCallee), '', [], '', null];
         }
 
         $callee = $this->literalPathScopedCallTarget($rhsTokens, $currentNamespace, $useImports, $currentClass, $currentParent);
         if ($callee !== null) {
-            return [$this->literalPathReturnNode($callee), '', '', null];
+            return [$this->literalPathReturnNode($callee), '', [], '', null];
         }
 
         $resolved = $this->resolveLiteralPathExpressionTokens($rhsTokens, $nodes, true, $functionKey, $functionLiteralReturns, $currentClass, $currentParent, $currentNamespace, $useImports, $trackedProperties, $propertyLiteralDefaults);
@@ -2961,7 +2980,7 @@ final class PhpTokenParser
             $inputs,
         );
 
-        return [$this->literalPathReturnNode($bareCallee), '', '', null];
+        return [$this->literalPathReturnNode($bareCallee), '', [], '', null];
     }
 
     /**
@@ -3020,8 +3039,10 @@ final class PhpTokenParser
     /**
      * @param list<Token> $tokens
      * @param array<string,string> $nodes
-     * @return array{string,string,string,?string}|null [source node, fixed prefix, fixed suffix,
-     *                                                   required file-existence guard key]
+     * @return array{string,string,list<string>,string,?string}|null [source node, fixed prefix,
+     *                                                   literal fragments between repeated source
+     *                                                   occurrences, fixed suffix, required
+     *                                                   file-existence guard key]
      */
     private function resolveLiteralPathIncludeSource(array $tokens, int $includeIndex, array $nodes): ?array
     {
@@ -3038,8 +3059,10 @@ final class PhpTokenParser
     /**
      * @param list<Token> $tokens
      * @param array<string,string> $nodes
-     * @return array{string,string,string,?string}|null [source node, fixed prefix, fixed suffix,
-     *                                                   required file-existence guard key]
+     * @return array{string,string,list<string>,string,?string}|null [source node, fixed prefix,
+     *                                                   literal fragments between repeated source
+     *                                                   occurrences, fixed suffix, required
+     *                                                   file-existence guard key]
      */
     private function resolveLiteralPathReturnSource(array $tokens, int $returnIndex, array $nodes): ?array
     {
@@ -3107,8 +3130,10 @@ final class PhpTokenParser
      * @param array<string,string> $useImports
      * @param array<string,array<string,true>> $trackedProperties
      * @param array<string,array<string,string>> $propertyLiteralDefaults
-     * @return array{string,string,string,?string}|null [source node, fixed prefix, fixed suffix,
-     *                                                   required file-existence guard key]
+     * @return array{string,string,list<string>,string,?string}|null [source node, fixed prefix,
+     *                                                   literal fragments between repeated source
+     *                                                   occurrences, fixed suffix, required
+     *                                                   file-existence guard key]
      */
     private function resolveLiteralPathExpressionTokens(
         array $expression,
@@ -3125,27 +3150,26 @@ final class PhpTokenParser
     ): ?array {
         $sourceNode = $this->literalPathNodeFromTokens($expression, $nodes, $currentClass, $trackedProperties);
         if ($sourceNode !== null) {
-            return [$sourceNode, '', '', null];
+            return [$sourceNode, '', [], '', null];
         }
 
         // `"includes/admin/views/{$view_path}.php"` (ACF's own acf_get_view() call argument) —
         // curly-brace complex string interpolation, not `.`-concatenation at all, so
         // literalPathConcatenationTerms() below never applies to it (no top-level `.` token to
-        // split on). Reuses the same interpolated-string parser
-        // $classNameTransformTemplates/$functionNameTransformTemplates already rely on elsewhere
-        // in this file, rather than teaching this mechanism its own separate interpolation
-        // parsing. Only the exact "prefix{$var}suffix" shape is recognized (see
-        // interpolatedPrefixCurlyVarSuffixAt's own docblock) — a bare `"$var"`/`"prefix$var"`
-        // interpolation without curly braces isn't reachable here since interpolatedPrefixVarAt()
-        // requires a trailing `;`, a statement-terminator constraint that never holds for a call
-        // argument (no real-world evidence yet for that simpler shape appearing as one).
+        // split on). Only the "prefix{$var}middle{$var}...suffix" shape is recognized (see
+        // interpolatedRepeatedVarSegmentsAt's own docblock — the interpolation counterpart to the
+        // repeated-concatenation-term handling above, same $middleSegments contract) — a bare
+        // `"$var"`/`"prefix$var"` interpolation without curly braces isn't reachable here since
+        // interpolatedPrefixVarAt() requires a trailing `;`, a statement-terminator constraint
+        // that never holds for a call argument (no real-world evidence yet for that simpler shape
+        // appearing as one).
         if (($expression[0] ?? null) === '"') {
-            $interpolated = $this->interpolatedPrefixCurlyVarSuffixAt($expression, 0);
+            $interpolated = $this->interpolatedRepeatedVarSegmentsAt($expression, 0);
             if ($interpolated !== null) {
-                [$interpPrefix, $interpVarName, $interpSuffix] = $interpolated;
+                [$interpVarName, $interpPrefix, $interpMiddleSegments, $interpSuffix] = $interpolated;
                 $varNode = $nodes[$interpVarName] ?? null;
                 if ($varNode !== null) {
-                    return [$varNode, $interpPrefix, $interpSuffix, null];
+                    return [$varNode, $interpPrefix, $interpMiddleSegments, $interpSuffix, null];
                 }
             }
         }
@@ -3158,7 +3182,37 @@ final class PhpTokenParser
             $args = $this->literalPathCallArguments($expression);
             $inputNode = isset($args[0]) ? $this->literalPathNodeFromTokens($args[0], $nodes, $currentClass, $trackedProperties) : null;
             if ($inputNode !== null && isset($args[1]) && $this->literalPathStringLiteral($args[1]) === '/') {
-                return [$inputNode, '', '', null];
+                return [$inputNode, '', [], '', null];
+            }
+        }
+
+        // Contact Form 7's wpcf7_include_module_file() normalizes its input with
+        // `path_join( $dir, ltrim( $path, '/' ) )` before including it. `path_join()` is a real
+        // WP-core function (like ltrim() just above), not a project-specific wrapper — the base
+        // directory it's given is irrelevant for matching purposes (FileAnalyzer already matches
+        // by basename/suffix; other ignorable directory prefixes are already dropped the same
+        // way elsewhere in this mechanism), so only its second (relative-path) argument is
+        // resolved — recursively, so a nested ltrim() call there still resolves as it would on
+        // its own.
+        if ($this->literalPathFunctionNameFromTokens($expression) === 'path_join') {
+            $args = $this->literalPathCallArguments($expression);
+            if (isset($args[1])) {
+                $resolved = $this->resolveLiteralPathExpressionTokens(
+                    $args[1],
+                    $nodes,
+                    $allowGuardedUnknownVariable,
+                    $guardScope,
+                    $functionLiteralReturns,
+                    $currentClass,
+                    $currentParent,
+                    $currentNamespace,
+                    $useImports,
+                    $trackedProperties,
+                    $propertyLiteralDefaults,
+                );
+                if ($resolved !== null) {
+                    return $resolved;
+                }
             }
         }
 
@@ -3166,10 +3220,17 @@ final class PhpTokenParser
         if ($terms === null) {
             return null;
         }
-        $sourceTermIndex = null;
+        // A single source node MAY appear more than once (Contact Form 7's `$mod . '/' . $mod .
+        // '.php'` module-loader shape) as long as every occurrence resolves to the exact same
+        // node and every term between two occurrences is a fully known literal fragment — see
+        // the $middleSegments build-out below. Two DIFFERENT dynamic terms is still rejected
+        // outright, same as before.
+        $sourceTermIndices = [];
+        $sourceNode = null;
         $unknownVariableTerms = 0;
         foreach ($terms as $index => $term) {
-            if ($this->literalPathNodeFromTokens($term, $nodes, $currentClass, $trackedProperties) === null) {
+            $node = $this->literalPathNodeFromTokens($term, $nodes, $currentClass, $trackedProperties);
+            if ($node === null) {
                 if (
                     $this->literalPathStringLiteralOrMethodReturn($term, $functionLiteralReturns, $currentClass, $currentParent, $currentNamespace, $useImports, $propertyLiteralDefaults) === null
                     && !$this->isLiteralPathRootDirectoryExpression($term)
@@ -3183,30 +3244,29 @@ final class PhpTokenParser
                 }
                 continue;
             }
-            if ($sourceTermIndex !== null) {
-                return null; // More than one dynamic value is not a bounded path template.
+            if ($sourceNode === null) {
+                $sourceNode = $node;
+            } elseif ($node !== $sourceNode) {
+                return null; // More than one distinct dynamic value is not a bounded path template.
             }
-            $sourceTermIndex = $index;
+            $sourceTermIndices[] = $index;
         }
-        if ($sourceTermIndex === null) {
-            return null;
-        }
-
-        $sourceNode = $this->literalPathNodeFromTokens($terms[$sourceTermIndex], $nodes, $currentClass, $trackedProperties);
-        if ($sourceNode === null) {
+        if ($sourceTermIndices === [] || $sourceNode === null) {
             return null;
         }
         if (
             $unknownVariableTerms > 0
-            && (!$allowGuardedUnknownVariable || $unknownVariableTerms !== 1 || $guardScope === null)
+            && (count($sourceTermIndices) > 1 || !$allowGuardedUnknownVariable || $unknownVariableTerms !== 1 || $guardScope === null)
         ) {
             return null;
         }
         $guardKey = $unknownVariableTerms === 1
             ? $this->literalPathExpressionGuardKey($guardScope, $expression)
             : null;
+        $firstIndex = $sourceTermIndices[0];
+        $lastIndex = $sourceTermIndices[count($sourceTermIndices) - 1];
         $prefix = '';
-        for ($index = $sourceTermIndex - 1; $index >= 0; $index--) {
+        for ($index = $firstIndex - 1; $index >= 0; $index--) {
             $literal = $this->literalPathStringLiteralOrMethodReturn($terms[$index], $functionLiteralReturns, $currentClass, $currentParent, $currentNamespace, $useImports, $propertyLiteralDefaults);
             if ($literal === null) {
                 break;
@@ -3214,17 +3274,33 @@ final class PhpTokenParser
             $prefix = $literal . $prefix;
         }
         $suffix = '';
-        for ($index = $sourceTermIndex + 1, $count = count($terms); $index < $count; $index++) {
+        for ($index = $lastIndex + 1, $count = count($terms); $index < $count; $index++) {
             $literal = $this->literalPathStringLiteralOrMethodReturn($terms[$index], $functionLiteralReturns, $currentClass, $currentParent, $currentNamespace, $useImports, $propertyLiteralDefaults);
             if ($literal === null) {
                 break;
             }
             $suffix .= $literal;
         }
+        // Each gap between two occurrences of the same source node must be a fully known literal
+        // fragment (no break-and-stop tolerance like prefix/suffix above): a partially-unresolved
+        // middle would misplace where the value actually falls in the resulting string.
+        $middleSegments = [];
+        for ($occurrence = 0, $occurrenceCount = count($sourceTermIndices) - 1; $occurrence < $occurrenceCount; $occurrence++) {
+            $between = '';
+            for ($index = $sourceTermIndices[$occurrence] + 1; $index < $sourceTermIndices[$occurrence + 1]; $index++) {
+                $literal = $this->literalPathStringLiteralOrMethodReturn($terms[$index], $functionLiteralReturns, $currentClass, $currentParent, $currentNamespace, $useImports, $propertyLiteralDefaults);
+                if ($literal === null) {
+                    return null;
+                }
+                $between .= $literal;
+            }
+            $middleSegments[] = $between;
+        }
 
         return [
             $sourceNode,
             $prefix,
+            $middleSegments,
             $suffix,
             $guardKey,
         ];
@@ -3625,7 +3701,7 @@ final class PhpTokenParser
         if ($source === null) {
             return;
         }
-        [, , , $expressionGuardKey] = $source;
+        [, , , , $expressionGuardKey] = $source;
         if ($expressionGuardKey !== null) {
             $guards[$expressionGuardKey] = true;
         }
@@ -3775,6 +3851,12 @@ final class PhpTokenParser
      * @param array<string,string> $sourceNodes
      * @param list<LiteralPathPropagationLink> $links
      * @param list<LiteralPathInput> $inputs
+     * @param list<PendingInArrayGuardedInput> $pendingInArrayGuardedInputs Optional: only the
+     *   main per-call-site capture sites pass a real accumulator through — see
+     *   PendingInArrayGuardedInput's own docblock. A caller that doesn't care (the rarer
+     *   assignment-RHS-forwarded-bare-call path) simply leaves this at its default and nothing is
+     *   lost, the same "not every capture site needs every signal" trade-off already made
+     *   elsewhere in this file.
      */
     private function captureLiteralPathCall(
         array $targetFunctionKeys,
@@ -3785,6 +3867,7 @@ final class PhpTokenParser
         bool $isSink,
         array &$links,
         array &$inputs,
+        array &$pendingInArrayGuardedInputs = [],
     ): void {
         for ($argumentPosition = 0; ; $argumentPosition++) {
             $argument = $this->literalPathCallArgumentTokensAt($tokens, $callNameIndex, $argumentPosition);
@@ -3793,21 +3876,34 @@ final class PhpTokenParser
             }
             $source = $this->resolveLiteralPathExpressionTokens($argument, $sourceNodes);
             $literal = $this->literalPathStringLiteral($argument);
+            $guarded = $source === null && $literal === null
+                ? $this->resolveInArrayGuardedConcatenation($tokens, $argument)
+                : null;
 
             foreach ($targetFunctionKeys as $targetFunctionKey) {
                 if ($source !== null && $sourceFunctionKey !== null) {
-                    [$sourceNode, $prefix, $suffix] = $source;
+                    [$sourceNode, $prefix, $middleSegments, $suffix] = $source;
                     $links[] = new LiteralPathPropagationLink(
                         $sourceNode,
                         $this->literalPathParameterNode($targetFunctionKey, $argumentPosition),
                         $prefix,
                         $suffix,
+                        middleSegments: $middleSegments,
                     );
                 }
                 if ($literal !== null) {
                     $inputs[] = new LiteralPathInput(
                         $this->literalPathParameterNode($targetFunctionKey, $argumentPosition),
                         $literal,
+                    );
+                }
+                if ($guarded !== null) {
+                    [$guardedPrefix, $guardedSuffix, $domainFunctionKey] = $guarded;
+                    $pendingInArrayGuardedInputs[] = new PendingInArrayGuardedInput(
+                        $this->literalPathParameterNode($targetFunctionKey, $argumentPosition),
+                        $guardedPrefix,
+                        $guardedSuffix,
+                        $domainFunctionKey,
                     );
                 }
                 foreach ($this->literalPathKeyedArrayLiterals($argument) as $key => $values) {
@@ -3821,15 +3917,189 @@ final class PhpTokenParser
             }
 
             if ($isSink && $argumentPosition === 0 && $source !== null && $sourceFunctionKey !== null) {
-                [$sourceNode, $prefix, $suffix] = $source;
+                [$sourceNode, $prefix, $middleSegments, $suffix] = $source;
                 $links[] = new LiteralPathPropagationLink(
                     $sourceNode,
                     prefix: $prefix,
                     suffix: $suffix,
                     isSink: true,
+                    middleSegments: $middleSegments,
                 );
             }
         }
+    }
+
+    /**
+     * `'scanner/text/issue-' . $i['type']` (Wordfence) — a concatenation whose sole dynamic term
+     * isn't a tracked node (`$i['type']` is a database-sourced array's own key access, nothing
+     * this parser assigns a node to), but IS guarded earlier in the same file by
+     * `in_array($i['type'], $issueTypes)`/`in_array($i['type'], wfIssues::validIssueTypes())` —
+     * every value `SomeClass::someMethod()` can return (resolved project-wide via
+     * $functionArrayReturns once every file is merged) is a value $i['type'] could hold at this
+     * exact call site. Deliberately narrow: exactly one dynamic term (two would make this an
+     * arbitrary correlation, not a bounded vocabulary), and the guard's domain must be a bare
+     * zero-arg `ClassName::method()` call using the LITERAL class name — no self/static/parent,
+     * since this file-wide scan has no notion of "current class" at the guard's own position to
+     * resolve those against.
+     *
+     * @param list<Token> $tokens whole-file tokens, for the file-wide guard scan
+     * @param list<Token> $argument the call argument's own tokens
+     * @return array{string,string,string}|null [prefix, suffix, domain function key]
+     */
+    private function resolveInArrayGuardedConcatenation(array $tokens, array $argument): ?array
+    {
+        $terms = $this->literalPathConcatenationTerms($argument);
+        if ($terms === null) {
+            return null;
+        }
+        $dynamicIndex = null;
+        foreach ($terms as $index => $term) {
+            if ($this->literalPathStringLiteral($term) !== null) {
+                continue;
+            }
+            if ($dynamicIndex !== null) {
+                return null; // more than one dynamic term — not a single bounded vocabulary
+            }
+            $dynamicIndex = $index;
+        }
+        if ($dynamicIndex === null) {
+            return null;
+        }
+
+        $domainFunctionKey = $this->findInArrayGuardDomainCall($tokens, $terms[$dynamicIndex]);
+        if ($domainFunctionKey === null) {
+            return null;
+        }
+
+        $prefix = '';
+        for ($index = $dynamicIndex - 1; $index >= 0; $index--) {
+            $literal = $this->literalPathStringLiteral($terms[$index]);
+            if ($literal === null) {
+                break;
+            }
+            $prefix = $literal . $prefix;
+        }
+        $suffix = '';
+        for ($index = $dynamicIndex + 1, $count = count($terms); $index < $count; $index++) {
+            $literal = $this->literalPathStringLiteral($terms[$index]);
+            if ($literal === null) {
+                break;
+            }
+            $suffix .= $literal;
+        }
+
+        return [$prefix, $suffix, $domainFunctionKey];
+    }
+
+    /**
+     * Scans the WHOLE file (same file-wide coarseness as maxDirnameAncestorUpLevels()/
+     * hasBarePathConstantAssignment() above — the guard is routinely a few lines above its own
+     * usage, not necessarily inside a strictly delimitable block this token-based parser tracks)
+     * for `in_array( <exact same expression as $exprTokens>, ClassName::method() )`, returning
+     * that call's resolved function key (`ClassName::method`, the same key format
+     * $functionArrayReturns is already keyed by) — or null if no such guard exists anywhere in
+     * the file. Expression equality is textual (reusing literalPathExpressionGuardKey()'s own
+     * token-to-string canonicalization — token type/text only, line numbers stripped), the same
+     * comparison the file_exists()-guard mechanism already relies on elsewhere in this file.
+     *
+     * @param list<Token> $tokens
+     * @param list<Token> $exprTokens
+     */
+    private function findInArrayGuardDomainCall(array $tokens, array $exprTokens): ?string
+    {
+        $exprKey = $this->literalPathExpressionGuardKey('', $exprTokens);
+
+        foreach ($tokens as $i => $token) {
+            if (!is_array($token) || $token[0] !== T_STRING || strtolower($token[1]) !== 'in_array') {
+                continue;
+            }
+            if ($this->peekNextMeaningful($tokens, $i) !== '(') {
+                continue;
+            }
+            $arg0 = $this->argTokensAt($tokens, $i, 0);
+            if ($arg0 === null || $this->literalPathExpressionGuardKey('', $arg0) !== $exprKey) {
+                continue;
+            }
+            $arg1 = $this->argTokensAt($tokens, $i, 1);
+            if ($arg1 === null) {
+                continue;
+            }
+            $domainFunctionKey = $this->literalPathBareZeroArgScopedCallTarget($arg1)
+                // `$issueTypes = wfIssues::validIssueTypes(); ... in_array($x, $issueTypes)` —
+                // the far more common real-world shape (Wordfence's own): the domain call's
+                // result is assigned to a variable first, not passed to in_array() directly.
+                ?? (
+                    count($arg1) === 1 && is_array($arg1[0]) && $arg1[0][0] === T_VARIABLE
+                        ? $this->findVariableAssignedScopedCallTarget($tokens, $arg1[0][1])
+                        : null
+                );
+            if ($domainFunctionKey !== null) {
+                return $domainFunctionKey;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * File-wide (same coarseness as findInArrayGuardDomainCall()'s own caller) scan for
+     * `$varName = ClassName::method();` — the indirection findInArrayGuardDomainCall() falls back
+     * to when in_array()'s own second argument is a plain variable rather than the domain call
+     * directly. Doesn't care about statement ORDER relative to the in_array() call (a real
+     * assignment almost always precedes its use in practice; verifying that here would need
+     * position-comparing token indices across two different call sites for no real-world-evidenced
+     * benefit) — the same "co-occurrence, not proven causality" trade-off this file already makes
+     * throughout.
+     *
+     * @param list<Token> $tokens
+     */
+    private function findVariableAssignedScopedCallTarget(array $tokens, string $varName): ?string
+    {
+        foreach ($tokens as $i => $token) {
+            if (!is_array($token) || $token[0] !== T_VARIABLE || $token[1] !== $varName) {
+                continue;
+            }
+            $equalsIndex = $this->peekNextMeaningfulIndex($tokens, $i);
+            if ($equalsIndex === null || $tokens[$equalsIndex] !== '=') {
+                continue;
+            }
+            $rhsIndex = $this->peekNextMeaningfulIndex($tokens, $equalsIndex);
+            if ($rhsIndex === null) {
+                continue;
+            }
+            $target = $this->literalPathBareZeroArgScopedCallTarget($this->literalPathStatementTokens($tokens, $rhsIndex));
+            if ($target !== null) {
+                return $target;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * `ClassName::method()` — a zero-argument call on an EXPLICIT, literal class name (never
+     * self/static/parent: this is used from a file-wide scan with no "current class" context at
+     * the matched position to resolve those against). Returns the same `ShortClassName::method`
+     * key format $functionArrayReturns is keyed by (FunctionDef::$ownerClass is the declaring
+     * class's short name, not its FQCN — see that field's own docblock), so a lookup against that
+     * pool can use this key directly without any further resolution.
+     *
+     * @param list<Token> $tokens
+     */
+    private function literalPathBareZeroArgScopedCallTarget(array $tokens): ?string
+    {
+        if (
+            count($tokens) !== 5
+            || !is_array($tokens[0]) || !in_array($tokens[0][0], self::CLASS_NAME_TOKENS, true)
+            || !$this->isLiteralPathScopeResolutionOperator($tokens[1])
+            || !is_array($tokens[2]) || $tokens[2][0] !== T_STRING
+            || $tokens[3] !== '('
+            || $tokens[4] !== ')'
+        ) {
+            return null;
+        }
+
+        return $this->shortClassName($tokens[0][1]) . '::' . $tokens[2][1];
     }
 
     /**
@@ -4903,6 +5173,54 @@ final class PhpTokenParser
             }
         }
         return $max;
+    }
+
+    /**
+     * A file-wide, "co-occurrence not proven causality" signal for FileAnalyzer's own hand-rolled
+     * `spl_autoload_register()` exemption (see its own $autoloadRegisterExemptDirs docblock):
+     * whether ANY plain local/property assignment in this file sets its target directly from a
+     * single bare, unresolvable constant identifier — the same shape
+     * isLiteralPathIgnorableConstantExpression already treats as "a deterministic absolute
+     * bootstrap path/dir constant this parser can't (and doesn't need to) resolve" for
+     * concatenation prefixes. Real-world shape (Elementor): `Autoloader::run( $default_path = '' )`
+     * does `if ( '' === $default_path ) { $default_path = ELEMENTOR_PATH; }` before registering
+     * the autoloader in that SAME method — the class-loading callback's actual search root is the
+     * plugin's own top-level directory, not `includes/` (where the registering file itself lives,
+     * the scope FileAnalyzer would otherwise trust). Deliberately file-wide rather than scoped to
+     * the exact registering function/property, matching maxDirnameAncestorUpLevels()'s own
+     * established coarseness for this identical exemption computation. `true`/`false`/`null` are
+     * excluded — common defensive default values, not root-path constants, and (unlike a curated
+     * bootstrap `_PATH`/`_DIR` constant) would trigger on completely unrelated code.
+     *
+     * @param list<Token> $tokens
+     */
+    private function hasBarePathConstantAssignment(array $tokens): bool
+    {
+        foreach ($tokens as $i => $token) {
+            if ($token !== '=') {
+                continue;
+            }
+            $prevIndex = $this->peekPrevMeaningfulIndex($tokens, $i);
+            if (
+                $prevIndex === null
+                || !is_array($tokens[$prevIndex])
+                || ($tokens[$prevIndex][0] !== T_VARIABLE && $tokens[$prevIndex][0] !== T_STRING)
+            ) {
+                continue;
+            }
+            $valueIndex = $this->peekNextMeaningfulIndex($tokens, $i);
+            if ($valueIndex === null || !is_array($tokens[$valueIndex]) || !in_array($tokens[$valueIndex][0], self::CLASS_NAME_TOKENS, true)) {
+                continue;
+            }
+            if (in_array(strtolower($tokens[$valueIndex][1]), ['true', 'false', 'null'], true)) {
+                continue;
+            }
+            $terminatorIndex = $this->peekNextMeaningfulIndex($tokens, $valueIndex);
+            if ($terminatorIndex !== null && $tokens[$terminatorIndex] === ';') {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -6837,10 +7155,14 @@ final class PhpTokenParser
      *    $anyArrayLiteralVars/parseAnyStringLiteralArray).
      *  - `return apply_filters('tag', $var, ...);` — same, read from the filter's own
      *    documented "value" position.
-     * Anything else resolves to [] — no guessing beyond these two shapes. Mirrors
-     * resolveReturnLiterals()'s own two shapes, just array- instead of scalar-valued; doesn't
-     * also attempt a bare literal return (`return array(...);` directly with no intermediate
-     * variable) — no evidence for that shape yet.
+     *  - `return array(...);`/`return [...];` directly — a bare literal array with no
+     *    intermediate variable at all. Real-world shape (Wordfence): `wfIssues::validIssueTypes()`
+     *    does exactly `return array('checkGSB', 'checkSpamIP', ..., 'wfLoginSecPresent');` — a
+     *    ~30-entry vocabulary consulted elsewhere via `in_array()`. Reuses
+     *    parseStringLiteralArrayAt() (same bail rules: no keys, no nesting, no calls/variables, at
+     *    least two elements) rather than teaching this its own separate array-literal parser.
+     * Anything else resolves to [] — no guessing beyond these three shapes. Mirrors
+     * resolveReturnLiterals()'s own two shapes, just array- instead of scalar-valued.
      *
      * @param list<Token> $tokens
      * @param array<string,list<string>> $anyArrayLiteralVars
@@ -6849,7 +7171,16 @@ final class PhpTokenParser
     private function resolveReturnArrayLiterals(array $tokens, int $i, array $anyArrayLiteralVars): array
     {
         $j = $this->skipInsignificant($tokens, $i + 1);
-        if (!isset($tokens[$j]) || !is_array($tokens[$j])) {
+        if (!isset($tokens[$j])) {
+            return [];
+        }
+
+        $direct = $this->parseStringLiteralArrayAt($tokens, $j);
+        if ($direct !== null) {
+            return $direct;
+        }
+
+        if (!is_array($tokens[$j])) {
             return [];
         }
         $t = $tokens[$j];
@@ -6959,6 +7290,77 @@ final class PhpTokenParser
         }
 
         return null;
+    }
+
+    /**
+     * $quoteIndex points at (what might be) the raw `"` opening a double-quoted string. The
+     * interpolation counterpart to resolveLiteralPathExpressionTokens's own repeated-
+     * concatenation-term handling (see its own docblock): recognizes
+     * "prefix{$var}middle{$var}...suffix" — one or more `{$var}` curly-brace interpolations
+     * separated by literal text, as long as EVERY occurrence is the exact same variable. A
+     * strict generalization of interpolatedPrefixCurlyVarSuffixAt() (which this doesn't replace —
+     * that one's own caller, the class-name-transform-template capture, has no real-world
+     * evidence of a repeated variable and stays on the simpler single-occurrence parser): the
+     * single-occurrence case produces an identical result here, just via `list<string>
+     * $middleSegments` empty instead of a bare `$suffix` string. Real-world shape (Jetpack):
+     * `"extensions/blocks/{$feature}/{$feature}.php"` in
+     * `load_and_register_deferred_block( $feature )`. A second `{$var}` for a DIFFERENT variable
+     * still isn't accepted — bails (null) the same as resolveLiteralPathExpressionTokens's own
+     * "more than one distinct dynamic value" rule.
+     *
+     * @param list<Token> $tokens
+     * @return array{string, string, list<string>, string}|null [variable name, fixed prefix,
+     *                                                            literal fragments between
+     *                                                            repeated occurrences, fixed
+     *                                                            suffix]
+     */
+    private function interpolatedRepeatedVarSegmentsAt(array $tokens, int $quoteIndex): ?array
+    {
+        if (!isset($tokens[$quoteIndex]) || $tokens[$quoteIndex] !== '"') {
+            return null;
+        }
+
+        $j = $quoteIndex + 1;
+        $varName = null;
+        $prefix = '';
+        $middleSegments = [];
+
+        while (true) {
+            $text = '';
+            if (isset($tokens[$j]) && is_array($tokens[$j]) && $tokens[$j][0] === T_ENCAPSED_AND_WHITESPACE) {
+                $text = $tokens[$j][1];
+                $j++;
+            }
+            if (!isset($tokens[$j])) {
+                return null;
+            }
+
+            if ($tokens[$j] === '"') {
+                return $varName === null ? null : [$varName, $prefix, $middleSegments, $text];
+            }
+            if (!is_array($tokens[$j]) || $tokens[$j][0] !== T_CURLY_OPEN) {
+                return null;
+            }
+            $j++;
+            if (!isset($tokens[$j]) || !is_array($tokens[$j]) || $tokens[$j][0] !== T_VARIABLE) {
+                return null;
+            }
+            $thisVarName = $tokens[$j][1];
+            $j++;
+            if (!isset($tokens[$j]) || $tokens[$j] !== '}') {
+                return null;
+            }
+            $j++;
+
+            if ($varName === null) {
+                $varName = $thisVarName;
+                $prefix = $text;
+            } elseif ($thisVarName === $varName) {
+                $middleSegments[] = $text;
+            } else {
+                return null; // a second, DIFFERENT variable — not the repeated-same-source shape
+            }
+        }
     }
 
     /**

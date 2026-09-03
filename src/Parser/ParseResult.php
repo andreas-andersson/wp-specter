@@ -257,6 +257,20 @@ final class ParseResult
      *                                           0 when none found. Consulted only by
      *                                           FileAnalyzer, only for a file that also registers
      *                                           a hand-rolled spl_autoload_register() callback.
+     * @param bool $autoloadRootIsBareConstant Whether this file assigns a bare, unresolvable
+     *                                           constant identifier directly into a local/
+     *                                           property variable anywhere — see
+     *                                           PhpTokenParser::hasBarePathConstantAssignment().
+     *                                           Consulted only by FileAnalyzer, only for a file
+     *                                           that also registers a hand-rolled
+     *                                           spl_autoload_register() callback: signals that
+     *                                           the callback's real search root is an opaque
+     *                                           bootstrap constant (almost always the project
+     *                                           root), not the registering file's own directory.
+     * @param list<PendingInArrayGuardedInput> $pendingInArrayGuardedInputs See
+     *                                           PendingInArrayGuardedInput's own docblock.
+     *                                           Resolved by LiteralPathPropagationResolver once
+     *                                           every file's $functionArrayReturns is merged.
      */
     public function __construct(
         public readonly string $file,
@@ -296,6 +310,9 @@ final class ParseResult
         public readonly array $functionArrayReturns = [],
         public readonly array $functionNameTransformTemplates = [],
         public readonly int $dirnameAncestorUpLevels = 0,
+        public readonly bool $autoloadRootIsBareConstant = false,
+        /** @var list<PendingInArrayGuardedInput> */
+        public readonly array $pendingInArrayGuardedInputs = [],
         public readonly ?string $error = null,
     ) {}
 }
